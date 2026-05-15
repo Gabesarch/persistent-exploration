@@ -62,6 +62,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
+from verl.utils.debug.comprehensive_logging import get_debug_options, to_jsonable
 from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.lazy_multi_modal import lazy_multi_modal_inputs_enabled
 from verl.utils.metric import reduce_metrics
@@ -301,6 +302,7 @@ class RayPPOTrainer:
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
         )
+        self.comprehensive_debug_options = get_debug_options(self.config)
         self.image_key = None
         self._esi_force_saved = False
 
@@ -449,7 +451,17 @@ class RayPPOTrainer:
     def _collect_image_references(self, extra_infos):
         return [self._extract_image_reference_from_extra_info(extra_info) for extra_info in extra_infos]
 
-    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, image_paths=None):
+    def _dump_generations(
+        self,
+        inputs,
+        outputs,
+        gts,
+        scores,
+        reward_extra_infos_dict,
+        dump_path,
+        image_paths=None,
+        extra_payloads=None,
+    ):
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
@@ -470,16 +482,56 @@ class RayPPOTrainer:
             normalized_image_paths = [self._normalize_image_reference(path) for path in image_paths]
             if any(path is not None for path in normalized_image_paths):
                 base_data[self.image_key or "images"] = normalized_image_paths
+        if extra_payloads is not None and len(extra_payloads) == n:
+            base_data["debug"] = extra_payloads
 
         lines = []
         for i in range(n):
             entry = {k: v[i] for k, v in base_data.items()}
-            lines.append(json.dumps(entry, ensure_ascii=False))
+            lines.append(
+                json.dumps(
+                    to_jsonable(entry, max_text_chars=self.comprehensive_debug_options.get("max_text_chars")),
+                    ensure_ascii=False,
+                )
+            )
 
         with open(filename, "w") as f:
             f.write("\n".join(lines) + "\n")
 
         print(f"Dumped generations to {filename}")
+
+    def _debug_enabled(self) -> bool:
+        return bool(self.comprehensive_debug_options.get("enabled"))
+
+    def _collect_debug_payloads(self, batch: DataProto, reward_extra_infos_dict: dict | None = None) -> list[dict]:
+        payloads = []
+        keys = [
+            "uid",
+            "data_source",
+            "reward_model",
+            "extra_info",
+            "raw_prompt",
+            "__num_turns__",
+            "comprehensive_debug",
+            "tool_rewards",
+            "turn_scores",
+            "request_id",
+        ]
+        reward_extra_infos_dict = reward_extra_infos_dict or {}
+        for i in range(len(batch)):
+            payload = {}
+            for key in keys:
+                values = batch.non_tensor_batch.get(key)
+                if values is not None and len(values) == len(batch):
+                    payload[key] = values[i]
+            reward_info = {}
+            for key, values in reward_extra_infos_dict.items():
+                if hasattr(values, "__len__") and len(values) == len(batch):
+                    reward_info[key] = values[i]
+            if reward_info:
+                payload["reward_extra_info"] = reward_info
+            payloads.append(payload)
+        return payloads
 
     def _log_rollout_data(
         self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
@@ -506,6 +558,11 @@ class RayPPOTrainer:
                     "request_id",
                     batch.non_tensor_batch["request_id"].tolist(),
                 )
+            extra_payloads = (
+                self._collect_debug_payloads(batch, reward_extra_infos_dict=reward_extra_infos_to_dump)
+                if self._debug_enabled()
+                else None
+            )
 
             self._dump_generations(
                 inputs=inputs,
@@ -515,6 +572,7 @@ class RayPPOTrainer:
                 reward_extra_infos_dict=reward_extra_infos_to_dump,
                 dump_path=rollout_data_dir,
                 image_paths=image_paths,
+                extra_payloads=extra_payloads,
             )
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
@@ -588,6 +646,7 @@ class RayPPOTrainer:
         sample_scores = []
         sample_turns = []
         sample_uids = []
+        sample_debug_payloads = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -663,6 +722,10 @@ class RayPPOTrainer:
 
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
+            if self._debug_enabled():
+                sample_debug_payloads.extend(
+                    self._collect_debug_payloads(test_batch, reward_extra_infos_dict=reward_extra_info)
+                )
 
             reward_extra_infos_dict["reward"].extend(scores)
             for key, values in reward_extra_info.items():
@@ -692,6 +755,7 @@ class RayPPOTrainer:
                 reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=val_data_dir,
                 image_paths=sample_image_paths,
+                extra_payloads=sample_debug_payloads if self._debug_enabled() else None,
             )
 
         for key_info, lst in reward_extra_infos_dict.items():

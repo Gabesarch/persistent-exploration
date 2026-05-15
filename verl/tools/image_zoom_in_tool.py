@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import logging
+import math
 import os
 import threading
 from contextlib import ExitStack
@@ -24,6 +25,7 @@ from uuid import uuid4
 
 import ray
 import ray.actor
+from PIL import Image
 from qwen_vl_utils import fetch_image
 
 from .base_tool import BaseTool
@@ -126,7 +128,10 @@ class ImageZoomInTool(BaseTool):
         release: Release the tool instance
     """
 
-    MIN_DIMENSION = 28
+    MIN_DIMENSION = 32
+    SMART_RESIZE_FACTOR = 32
+    SMART_RESIZE_MIN_PIXELS = 256 * 32 * 32
+    SMART_RESIZE_MAX_PIXELS = 12845056
 
     def __init__(self, config: dict, tool_schema: OpenAIFunctionToolSchema):
         """
@@ -153,10 +158,14 @@ class ImageZoomInTool(BaseTool):
                         },
                         "label": {
                             "type": "string",
-                            "description": "The name or label of the object in the specified bounding box (optional).",
+                            "description": "The name or label of the object in the specified bounding box.",
+                        },
+                        "img_idx": {
+                            "type": "number",
+                            "description": "The index of the zoomed-in image (starting from 0).",
                         },
                     },
-                    "required": ["bbox_2d"],
+                    "required": ["bbox_2d", "label", "img_idx"],
                 },
             }
         })
@@ -168,6 +177,11 @@ class ImageZoomInTool(BaseTool):
         self.num_workers = config.get("num_workers", 20)
         self.rate_limit = config.get("rate_limit", 50)
         self.timeout = config.get("timeout", 30)
+        self.coordinate_system = config.get("coordinate_system", "pixel")
+        self.cropped_min_pixels = int(config.get("cropped_min_pixels", self.SMART_RESIZE_MIN_PIXELS))
+        self.cropped_max_pixels = int(
+            config.get("cropped_max_pixels", config.get("max_pixels", self.SMART_RESIZE_MAX_PIXELS))
+        )
 
         self.enable_global_rate_limit = config.get("enable_global_rate_limit", True)
         self.execution_pool = init_visual_execution_pool(
@@ -178,123 +192,69 @@ class ImageZoomInTool(BaseTool):
         )
         logger.info(f"Initialized ImageZoomInTool with config: {config}")
 
-    def _validate_bbox(self, left: float, top: float, right: float, bottom: float) -> bool:
-        """Validate the bounding box dimensions and aspect ratio."""
-        try:
-            if not (left < right and top < bottom):
-                logger.warning(f"Invalid bbox shape: left={left}, top={top}, right={right}, bottom={bottom}")
-                return False
+    def round_by_factor(self, number: int, factor: int) -> int:
+        return round(number / factor) * factor
 
-            height = bottom - top
-            width = right - left
+    def ceil_by_factor(self, number: int, factor: int) -> int:
+        return math.ceil(number / factor) * factor
 
-            # Prevent division by zero for zero-sized boxes
-            if min(height, width) == 0:
-                logger.warning(f"Bbox has zero width or height: left={left}, top={top}, right={right}, bottom={bottom}")
-                return False
+    def floor_by_factor(self, number: int, factor: int) -> int:
+        return math.floor(number / factor) * factor
 
-            if max(height, width) / min(height, width) > 100:
-                logger.warning(f"Bbox aspect ratio > 100: left={left}, top={top}, right={right}, bottom={bottom}")
-                return False
+    def smart_resize(
+        self,
+        height: int,
+        width: int,
+        factor: int = SMART_RESIZE_FACTOR,
+        min_pixels: int = SMART_RESIZE_MIN_PIXELS,
+        max_pixels: int = SMART_RESIZE_MAX_PIXELS,
+    ) -> tuple[int, int]:
+        h_bar = max(factor, self.round_by_factor(height, factor))
+        w_bar = max(factor, self.round_by_factor(width, factor))
+        if h_bar * w_bar > max_pixels:
+            beta = math.sqrt((height * width) / max_pixels)
+            h_bar = self.floor_by_factor(height / beta, factor)
+            w_bar = self.floor_by_factor(width / beta, factor)
+        elif h_bar * w_bar < min_pixels:
+            beta = math.sqrt(min_pixels / (height * width))
+            h_bar = self.ceil_by_factor(height * beta, factor)
+            w_bar = self.ceil_by_factor(width * beta, factor)
+        return h_bar, w_bar
 
-            return True
-        except Exception as e:
-            logger.warning(f"Bbox validation error: {e}")
-            return False
-
-    def _maybe_resize_bbox(self, bbox_2d: list[float], image_width: int, image_height: int) -> Optional[list[float]]:
-        """
-        Clamp, validate, and potentially resize a bounding box.
-
-        This function ensures the final bounding box is within image bounds and meets the minimum
-        dimension requirements. If the initial box is too small, it attempts to expand it
-        from its center. It performs a final check to guarantee the output dimensions are valid.
-
-        Returns:
-            A valid bounding box as a list of coordinates, or None if validation fails.
-        """
+    def _maybe_resize_bbox(self, bbox_2d: list[float], image_width: int, image_height: int) -> list[float]:
+        """Clamp and resize bbox using Qwen-Agent Qwen3-VL behavior."""
         left, top, right, bottom = bbox_2d
 
-        # 1. Clamp the initial bounding box to the image dimensions.
-        left = max(0.0, float(left))
-        top = max(0.0, float(top))
-        right = min(float(image_width), float(right))
-        bottom = min(float(image_height), float(bottom))
+        left = max(0, left)
+        top = max(0, top)
+        right = min(image_width, right)
+        bottom = min(image_height, bottom)
 
-        # 2. If clamped bbox is invalid, return immediately.
-        if not self._validate_bbox(left, top, right, bottom):
-            return None
-
-        current_bbox = [left, top, right, bottom]
         height = bottom - top
         width = right - left
-
-        # 3. If the box is too small, attempt to resize it.
         if height < self.MIN_DIMENSION or width < self.MIN_DIMENSION:
-            logger.info(f"Bbox {width}x{height} is smaller than {self.MIN_DIMENSION}, attempting resize.")
             center_x = (left + right) / 2.0
             center_y = (top + bottom) / 2.0
+            ratio = self.MIN_DIMENSION / min(height, width)
+            new_half_height = ceil(height * ratio * 0.5)
+            new_half_width = ceil(width * ratio * 0.5)
+            new_left = floor(center_x - new_half_width)
+            new_right = ceil(center_x + new_half_width)
+            new_top = floor(center_y - new_half_height)
+            new_bottom = ceil(center_y + new_half_height)
 
-            min_dim = min(height, width)
-            if min_dim == 0:  # Safeguard for zero-area boxes
-                return None
+            new_left = max(0, new_left)
+            new_top = max(0, new_top)
+            new_right = min(image_width, new_right)
+            new_bottom = min(image_height, new_bottom)
 
-            # 1. Calculate the target dimensions to make the smallest side MIN_DIMENSION.
-            ratio = self.MIN_DIMENSION / min_dim
-            target_width = width * ratio
-            target_height = height * ratio
+            new_height = new_bottom - new_top
+            new_width = new_right - new_left
 
-            # 2. If the target size is larger than the image, scale it down to fit.
-            #    This preserves the aspect ratio while respecting image boundaries.
-            if target_width > image_width:
-                scale_down = image_width / target_width
-                target_width = image_width
-                target_height *= scale_down
+            if new_height > self.MIN_DIMENSION and new_width > self.MIN_DIMENSION:
+                return [new_left, new_top, new_right, new_bottom]
 
-            if target_height > image_height:
-                scale_down = image_height / target_height
-                target_height = image_height
-                target_width *= scale_down
-
-            # 3. Determine the coordinates for the box centered on the original center.
-            new_half_width = target_width / 2.0
-            new_half_height = target_height / 2.0
-            new_left = center_x - new_half_width
-            new_top = center_y - new_half_height
-
-            # 4. Shift the box if it extends beyond the image boundaries to keep its size.
-            if new_left < 0:
-                new_left = 0
-            if new_top < 0:
-                new_top = 0
-            if new_left + target_width > image_width:
-                new_left = image_width - target_width
-            if new_top + target_height > image_height:
-                new_top = image_height - target_height
-
-            new_right = new_left + target_width
-            new_bottom = new_top + target_height
-
-            # Use floor and ceil for final integer coordinates.
-            current_bbox = [floor(new_left), floor(new_top), ceil(new_right), ceil(new_bottom)]
-
-        # 4. Final validation on the resulting bounding box (either original or resized).
-        final_left, final_top, final_right, final_bottom = current_bbox
-        if not self._validate_bbox(final_left, final_top, final_right, final_bottom):
-            logger.warning(f"Final bbox is invalid after processing: {current_bbox}")
-            return None
-
-        final_height = floor(final_bottom) - floor(final_top)
-        final_width = floor(final_right) - floor(final_left)
-
-        if final_height < self.MIN_DIMENSION or final_width < self.MIN_DIMENSION:
-            logger.warning(
-                f"Final bbox size ({final_width}x{final_height}) are still smaller than minimum ({self.MIN_DIMENSION})."
-                f"Original bbox: {bbox_2d}, original image size: {image_width}x{image_height}"
-            )
-            return None
-
-        return current_bbox
+        return [left, top, right, bottom]
 
     def get_openai_tool_schema(self) -> OpenAIFunctionToolSchema:
         return self.tool_schema
@@ -329,12 +289,10 @@ class ImageZoomInTool(BaseTool):
         if create_kwargs:
             kwargs.update(create_kwargs)
 
-        # Get image from kwargs
+        # Get image from kwargs. If omitted, execute() can fall back to the
+        # original prompt image in agent_data.
         image = kwargs.get("image")
-        if image is None:
-            raise ValueError("Missing required 'image' parameter in kwargs")
-
-        img = fetch_image({"image": image})
+        img = fetch_image({"image": image}) if image is not None else None
         self._instance_dict[instance_id] = {
             "image": img,
             "response": "",
@@ -342,41 +300,105 @@ class ImageZoomInTool(BaseTool):
         }
         return instance_id, ToolResponse()
 
+    def _get_source_image(self, instance_id: str, img_idx: int, agent_data: Any = None) -> Any:
+        instance_data = self._instance_dict[instance_id]
+
+        if agent_data is not None and agent_data.image_data is not None:
+            image_data = agent_data.image_data
+            if not isinstance(image_data, list):
+                image_data = [image_data]
+            if img_idx >= len(image_data):
+                raise IndexError(f"img_idx={img_idx} is out of range for {len(image_data)} images.")
+            return image_data[img_idx]
+
+        image = instance_data.get("image")
+        if image is not None:
+            if img_idx != 0:
+                raise IndexError(f"img_idx={img_idx} is out of range for 1 fallback image.")
+            return image
+
+        raise ValueError("Missing source image: provide agent_data.image_data or create_kwargs.image.")
+
+    def _parse_img_idx(self, parameters: dict[str, Any]) -> int:
+        if "img_idx" not in parameters:
+            raise ValueError("img_idx parameter is missing.")
+        img_idx = parameters["img_idx"]
+        if isinstance(img_idx, bool) or not isinstance(img_idx, (int, float)) or int(img_idx) != img_idx:
+            raise ValueError(f"img_idx must be an integer image index, got {img_idx!r}.")
+        img_idx = int(img_idx)
+        if img_idx < 0:
+            raise ValueError(f"img_idx must be non-negative, got {img_idx}.")
+        return img_idx
+
+    def _convert_bbox_to_pixels(self, bbox_2d: list[float], image_width: int, image_height: int) -> list[float]:
+        if self.coordinate_system in ("pixel", "pixels", None):
+            return bbox_2d
+        if self.coordinate_system == "normalized_1000":
+            left, top, right, bottom = [float(value) for value in bbox_2d]
+            return [
+                left / 1000.0 * image_width,
+                top / 1000.0 * image_height,
+                right / 1000.0 * image_width,
+                bottom / 1000.0 * image_height,
+            ]
+        raise ValueError(f"Unsupported coordinate_system: {self.coordinate_system}")
+
     async def execute(self, instance_id: str, parameters: dict[str, Any], **kwargs) -> tuple[ToolResponse, float, dict]:
         bbox_2d = parameters.get("bbox_2d")
-        label = parameters.get("label", "")
+        label = parameters.get("label")
+        debug_info = {
+            "tool": "image_zoom_in_tool",
+            "parameters": parameters,
+            "bbox_2d": bbox_2d,
+            "label": label,
+            "coordinate_system": self.coordinate_system,
+        }
 
         if not bbox_2d or len(bbox_2d) != 4:
+            debug_info["success"] = False
+            debug_info["error"] = "bbox_2d parameter is missing or not a list of 4 numbers."
             return (
                 ToolResponse(text="Error: bbox_2d parameter is missing or not a list of 4 numbers."),
                 -0.05,
-                {"success": False},
+                debug_info,
             )
-
-        instance_data = self._instance_dict[instance_id]
-        image = instance_data["image"]
-        image_width, image_height = image.size
+        if "label" not in parameters:
+            debug_info["success"] = False
+            debug_info["error"] = "label parameter is missing."
+            return ToolResponse(text="Error: label parameter is missing."), -0.05, debug_info
 
         try:
-            resized_bbox = self._maybe_resize_bbox(bbox_2d, image_width=image_width, image_height=image_height)
-
-            if resized_bbox is None:
-                error_msg = (
-                    f"Error: The specified bounding box {bbox_2d} is invalid or results in a crop smaller than "
-                    f"the minimum size of {self.MIN_DIMENSION}x{self.MIN_DIMENSION}."
-                )
-                logger.warning(f"Tool execution failed: {error_msg}")
-                return ToolResponse(text=error_msg), -0.05, {"success": False}
+            img_idx = self._parse_img_idx(parameters)
+            debug_info["img_idx"] = img_idx
+            image = self._get_source_image(instance_id, img_idx, kwargs.get("agent_data"))
+            image_width, image_height = image.size
+            debug_info["source_image_size"] = [image_width, image_height]
+            pixel_bbox = self._convert_bbox_to_pixels(bbox_2d, image_width=image_width, image_height=image_height)
+            debug_info["pixel_bbox"] = pixel_bbox
+            resized_bbox = self._maybe_resize_bbox(pixel_bbox, image_width=image_width, image_height=image_height)
+            debug_info["resized_bbox"] = resized_bbox
 
             cropped_image = image.crop(resized_bbox)
+            left, top, right, bottom = resized_bbox
+            new_width, new_height = self.smart_resize(
+                right - left,
+                bottom - top,
+                factor=self.SMART_RESIZE_FACTOR,
+                min_pixels=self.cropped_min_pixels,
+                max_pixels=self.cropped_max_pixels,
+            )
+            cropped_image = cropped_image.resize((new_width, new_height), resample=Image.BICUBIC)
+            debug_info["cropped_image_size"] = [new_width, new_height]
+            debug_info["success"] = True
             logger.info(f"Cropped image size: {cropped_image.size}")
         except Exception as e:
             logger.error(f"Error processing image zoom-in: {e}")
-            return ToolResponse(text=f"Error processing image zoom-in: {e}"), -0.05, {"success": False}
+            debug_info["success"] = False
+            debug_info["error"] = str(e)
+            return ToolResponse(text=f"Error processing image zoom-in: {e}"), -0.05, debug_info
 
         response_text = f"Zoomed in on the image to the region {bbox_2d}."
-        if label:
-            response_text = f"Zoomed in on the image to the region {bbox_2d} with label {label}."
+        response_text = f"Zoomed in on the image to the region {bbox_2d} with label {label}."
 
         return (
             ToolResponse(
@@ -384,7 +406,7 @@ class ImageZoomInTool(BaseTool):
                 text=response_text,
             ),
             0.0,
-            {"success": True},
+            debug_info,
         )
 
     async def release(self, instance_id: str, **kwargs) -> None:

@@ -317,6 +317,7 @@ class TaskRunner:
         print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
+        self._maybe_initialize_comprehensive_debug_logging(config)
 
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
         self.add_critic_worker(config)
@@ -390,6 +391,52 @@ class TaskRunner:
 
         # Start the training process.
         trainer.fit()
+
+    def _maybe_initialize_comprehensive_debug_logging(self, config):
+        try:
+            from verl.utils.debug.comprehensive_logging import (
+                ensure_debug_dir,
+                is_enabled,
+                process_metadata,
+                write_config_yaml,
+                write_json,
+            )
+
+            if not is_enabled(config):
+                return
+            debug_dir = ensure_debug_dir(config)
+            if not debug_dir:
+                return
+            write_config_yaml(os.path.join(debug_dir, "config_resolved.yaml"), config)
+            write_json(
+                os.path.join(debug_dir, "run_metadata.json"),
+                {
+                    **process_metadata(),
+                    "trainer": {
+                        "project_name": config.trainer.get("project_name", None),
+                        "experiment_name": config.trainer.get("experiment_name", None),
+                        "default_local_dir": config.trainer.get("default_local_dir", None),
+                        "validation_data_dir": config.trainer.get("validation_data_dir", None),
+                        "rollout_data_dir": config.trainer.get("rollout_data_dir", None),
+                    },
+                    "data": {
+                        "train_files": config.data.get("train_files", None),
+                        "val_files": config.data.get("val_files", None),
+                        "image_root": config.data.get("image_root", None),
+                        "system_prompt": config.data.get("system_prompt", None),
+                        "tool_config_path": config.data.get("tool_config_path", None),
+                    },
+                    "model": {
+                        "path": config.actor_rollout_ref.model.get("path", None),
+                        "rollout_name": config.actor_rollout_ref.rollout.get("name", None),
+                    },
+                    "reward": config.reward,
+                    "debug_logging": config.trainer.get("comprehensive_debug_logging", {}),
+                },
+            )
+            print(f"Comprehensive debug logging enabled: {debug_dir}")
+        except Exception as e:
+            print(f"Warning: failed to initialize comprehensive debug logging: {e}")
 
 
 def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True, max_samples: int = -1):

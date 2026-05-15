@@ -17,6 +17,7 @@ import inspect
 from verl import DataProto
 from verl.experimental.reward_loop.reward_manager import register
 from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
+from verl.utils.debug.comprehensive_logging import append_jsonl, get_debug_options, path_join
 from verl.utils.reward_score import default_compute_score
 
 
@@ -35,6 +36,7 @@ class DAPORewardManager(RewardManagerBase):
         self.max_resp_len = config.reward.get("reward_kwargs", {}).get("max_resp_len", None)
         self.reward_router_address = reward_router_address
         self.reward_model_tokenizer = reward_model_tokenizer
+        self.debug_options = get_debug_options(config)
 
         if self.overlong_buffer_cfg is not None:
             assert self.max_resp_len is not None, (
@@ -116,4 +118,66 @@ class DAPORewardManager(RewardManagerBase):
                 reward_extra_info["overlong_reward"] = overlong_reward
                 reward_extra_info["overlong"] = overlong_reward < 0
 
+        self._maybe_log_reward_assignment(
+            data_item=data_item,
+            data_source=data_source,
+            response_str=response_str,
+            ground_truth=ground_truth,
+            extra_info=extra_info,
+            raw_result=result,
+            reward_extra_info=reward_extra_info,
+            final_reward=reward,
+            valid_response_length=valid_response_length,
+        )
         return {"reward_score": reward, "reward_extra_info": reward_extra_info}
+
+    def _maybe_log_reward_assignment(
+        self,
+        data_item: DataProto,
+        data_source,
+        response_str,
+        ground_truth,
+        extra_info,
+        raw_result,
+        reward_extra_info,
+        final_reward,
+        valid_response_length,
+    ) -> None:
+        debug_dir = self.debug_options.get("dir")
+        if not self.debug_options.get("enabled") or not debug_dir:
+            return
+        reward_type = extra_info.get("reward_type") if isinstance(extra_info, dict) else None
+        tolerance = extra_info.get("tolerance") if isinstance(extra_info, dict) else None
+        record = {
+            "event": "reward_assignment",
+            "data_source": data_source,
+            "uid": data_item.non_tensor_batch.get("uid"),
+            "request_id": self._extract_request_id(data_item),
+            "ground_truth": ground_truth,
+            "reward_type": reward_type,
+            "tolerance": tolerance,
+            "extra_info": extra_info,
+            "response": response_str,
+            "valid_response_length": valid_response_length,
+            "raw_result": raw_result,
+            "reward_extra_info": reward_extra_info,
+            "score": reward_extra_info.get("score"),
+            "accuracy": reward_extra_info.get("accuracy"),
+            "format": reward_extra_info.get("format"),
+            "final_reward": final_reward,
+        }
+        append_jsonl(
+            path_join(debug_dir, "reward_assignments.jsonl"),
+            record,
+            max_text_chars=self.debug_options.get("max_text_chars"),
+        )
+
+    @staticmethod
+    def _extract_request_id(data_item) -> str | None:
+        request_id = data_item.non_tensor_batch.get("request_id")
+        if request_id is not None:
+            return request_id
+        tool_extra_fields = data_item.non_tensor_batch.get("tool_extra_fields")
+        if isinstance(tool_extra_fields, dict):
+            return tool_extra_fields.get("request_id")
+        return None

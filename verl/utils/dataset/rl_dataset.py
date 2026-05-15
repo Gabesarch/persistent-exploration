@@ -934,21 +934,18 @@ class RLHFDataset(Dataset):
     def _image_to_content_block(self, image: Any) -> dict:
         if isinstance(image, Image.Image):
             block = {"type": "image", "image": image.convert("RGB")}
-            if self.max_pixels is not None:
-                block["max_pixels"] = self.max_pixels
+            self._cap_image_max_pixels(block, self.max_pixels)
             return block
         if isinstance(image, str):
             block = {"type": "image", "image": self._resolve_image_path(image)}
-            if self.max_pixels is not None:
-                block["max_pixels"] = self.max_pixels
+            self._cap_image_max_pixels(block, self.max_pixels)
             return block
         if isinstance(image, dict):
             block = dict(image)
             if "bytes" in block:
                 block["image"] = Image.open(BytesIO(block["bytes"]))
             block.setdefault("type", "image")
-            if self.max_pixels is not None:
-                block.setdefault("max_pixels", self.max_pixels)
+            self._cap_image_max_pixels(block, self.max_pixels)
             return block
         raise TypeError(f"image must be str, dict or PIL.Image, unsupported image type: {type(image)}")
 
@@ -1170,6 +1167,19 @@ class RLHFDataset(Dataset):
         return row_dict
 
     @staticmethod
+    def _cap_image_max_pixels(block: dict, max_pixels: Optional[int]) -> None:
+        if max_pixels is None:
+            return
+        existing_max_pixels = block.get("max_pixels")
+        if existing_max_pixels is None:
+            block["max_pixels"] = max_pixels
+            return
+        try:
+            block["max_pixels"] = min(int(existing_max_pixels), int(max_pixels))
+        except (TypeError, ValueError):
+            block["max_pixels"] = max_pixels
+
+    @staticmethod
     def _apply_default_image_max_pixels(messages: list[dict], max_pixels: Optional[int]) -> list[dict]:
         if max_pixels is None:
             return messages
@@ -1184,12 +1194,12 @@ class RLHFDataset(Dataset):
                     if isinstance(block, dict):
                         block = dict(block)
                         if block.get("type") == "image" or "image" in block:
-                            block.setdefault("max_pixels", max_pixels)
+                            RLHFDataset._cap_image_max_pixels(block, max_pixels)
                     updated_content.append(block)
                 updated_message["content"] = updated_content
             elif isinstance(content, dict) and (content.get("type") == "image" or "image" in content):
                 content = dict(content)
-                content.setdefault("max_pixels", max_pixels)
+                RLHFDataset._cap_image_max_pixels(content, max_pixels)
                 updated_message["content"] = content
             updated_messages.append(updated_message)
         return updated_messages

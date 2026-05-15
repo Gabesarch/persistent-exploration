@@ -2,40 +2,42 @@
 
 ### Prerequisites
 - Linux with CUDA-capable GPUs (tested on Princeton Della cluster).
-- Python 3.10 (3.9 works but 3.10 recommended).
+- Python 3.12.
 - Git, Conda/Miniconda.
 
 ### Clone Repositories
 ```bash
-git clone https://github.com/nb0564/backfill.git
+git clone https://github.com/gabesarch/vero2
 ```
 
 ### Create / Update Conda Environment
-We use a single environment:
+We use a single environment matching `docker/Dockerfile.stable.vllm`:
 ```bash
-conda create -n gaze-vlm python=3.11 -y
-conda create -p /scratch/gpfs/ZHUANGL/gs1693/conda/reason-vlm-gemma4-new python=3.11 -y
+conda create -p /scratch/gpfs/ZHUANGL/gs1693/conda/vero2 python=3.12 -y
 
-conda activate gaze-vlm
+conda activate /scratch/gpfs/ZHUANGL/gs1693/conda/vero2
 pip install uv
-module load cudatoolkit/12.8
+module load cudatoolkit/12.9
 module load gcc/11
-# uv pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 --index-url https://download.pytorch.org/whl/cu129
-python -m pip install --no-cache-dir --force-reinstall torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
-cd gaze-rl
-pip install -e ".[verl]"
+python -m pip install --no-cache-dir --force-reinstall \
+  torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 \
+  --index-url https://download.pytorch.org/whl/cu129
+
+uv pip install -e ".[verl]"
 
 bash scripts/setup_qwen35.sh
 
-uv pip install "transformers>=5.0.0" accelerate datasets peft safetensors "flash-linear-attention>=0.4.0" "qwen-vl-utils==0.0.14"
+# uv pip install "transformers>=5.0.0" accelerate datasets peft safetensors "flash-linear-attention>=0.4.0" "qwen-vl-utils==0.0.14"
 
+uv pip install safetensors "qwen-vl-utils==0.0.14" "flash-linear-attention>=0.4.0"
 
 # pip install causal-conv1d --no-build-isolation --no-cache-dir
-# pip install -U packaging psutil ninja
-git clone https://github.com/Dao-AILab/flash-attention
-cd flash-attention
-python setup.py install
+python -m pip install -U packaging psutil ninja wheel
+FLASH_ATTENTION_FORCE_BUILD=TRUE \
+FLASH_ATTENTION_FORCE_CXX11_ABI=TRUE \
+MAX_JOBS=2 \
+python -m pip install --no-build-isolation flash-attn==2.8.3
 
 uv pip install pybase64 msgspec math_verify langdetect nltk latex2sympy2_extended 
 uv pip install liger-kernel
@@ -117,4 +119,3 @@ To queue it up in slurm (adjust sbatch params as needed)
 sbatch run_scripts/model_runs/run_gspo_qwen3vl_instruct_condition_grounded_fixations_thinkaloud.sh
 ```
 Recommended atleast 8 H100s or 4 H200s (more the better). And atleast 700-900GB cpu memory.
-

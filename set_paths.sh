@@ -2,19 +2,16 @@
 # Environment-specific paths for gaze RL runs in this verl clone.
 
 source "$HOME/miniconda3/etc/profile.d/conda.sh"
-conda activate /scratch/gpfs/ZHUANGL/gs1693/conda/gaze-rl-verl
-module load cudatoolkit/12.8
+conda activate /scratch/gpfs/ZHUANGL/gs1693/conda/vero2
+module load cudatoolkit/12.9
 module load gcc/11
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-export VERL_ROOT="/home/gs1693/repo/gaze-vlm/verl"
+export VERL_ROOT="/home/gs1693/repo/vero2"
 
 export ROOT_PATH="${ROOT_PATH:-/scratch/gpfs/ZHUANGL/gs1693}"
-export SAVE_PATH="${SAVE_PATH:-$ROOT_PATH/verl_gaze_rl}"
+export SAVE_PATH="${SAVE_PATH:-$ROOT_PATH/vero2}"
 export IMAGE_ROOT="${IMAGE_ROOT:-}"
-
-export TRAIN_DATA="${TRAIN_DATA:-$ROOT_PATH/gaze_rl_data/vero_data/vero_chart_ocr_cgs_train_balanced.jsonl}"
-export VAL_DATA="${VAL_DATA:-$ROOT_PATH/gaze_rl_data/vero_data/vero_chart_ocr_cgs_val_balanced.jsonl}"
 
 export HF_HOME="${HF_HOME:-$ROOT_PATH/hf_cache}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$HF_HOME/datasets}"

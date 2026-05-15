@@ -34,6 +34,13 @@ from verl.interactions.utils.interaction_registry import initialize_interactions
 from verl.tools.schemas import ToolResponse
 from verl.tools.utils.tool_registry import initialize_tools_from_config
 from verl.utils.profiler import simple_timer
+from verl.utils.debug.comprehensive_logging import (
+    append_jsonl,
+    get_debug_options,
+    path_join,
+    save_image,
+    to_jsonable,
+)
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput
 
@@ -90,6 +97,7 @@ class AgentData:
 
         # Extra fields for dynamic addition, e.g., tool session data
         self.extra_fields: dict[str, Any] = {}
+        self.debug_events: list[dict[str, Any]] = []
 
 
 @register("tool_agent")
@@ -109,6 +117,7 @@ class ToolAgentLoop(AgentLoopBase):
         self.tool_schemas = [tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tool_list]
         self.tool_parser = ToolParser.get_tool_parser(self.rollout_config.multi_turn.format, self.tokenizer)
         self.tool_parser_name = self.rollout_config.multi_turn.format
+        self.debug_options = get_debug_options(self.config)
 
         self.prompt_length = self.rollout_config.prompt_length
         self.response_length = self.rollout_config.response_length
@@ -123,6 +132,7 @@ class ToolAgentLoop(AgentLoopBase):
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
+        debug_trajectory = kwargs.get("_debug_trajectory", {})
 
         # extract images and videos from messages
         multi_modal_data = await self.process_vision_info(messages)
@@ -159,6 +169,9 @@ class ToolAgentLoop(AgentLoopBase):
             interaction=interaction,
             interaction_kwargs=interaction_kwargs,
         )
+        if self.debug_options["enabled"]:
+            agent_data.extra_fields["debug_trajectory"] = debug_trajectory
+            await self._debug_log_sample_start(agent_data, kwargs, debug_trajectory, sampling_params)
 
         # State machine loop
         state = AgentState.PENDING
@@ -197,7 +210,15 @@ class ToolAgentLoop(AgentLoopBase):
             routed_experts=agent_data.routed_experts,
             extra_fields=agent_data.extra_fields,
         )
-        output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})
+        output.extra_fields.update(
+            {
+                "request_id": agent_data.request_id,
+                "turn_scores": agent_data.turn_scores,
+                "tool_rewards": agent_data.tool_rewards,
+            }
+        )
+        if self.debug_options["enabled"]:
+            await self._debug_log_sample_final(output, agent_data, kwargs, debug_trajectory)
         return output
 
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
@@ -250,6 +271,20 @@ class ToolAgentLoop(AgentLoopBase):
         if output.routed_experts is not None:
             agent_data.routed_experts = output.routed_experts
 
+        if self.debug_options["enabled"]:
+            assistant_message = await self.loop.run_in_executor(
+                None, lambda: self.tokenizer.decode(agent_data.response_ids, skip_special_tokens=True)
+            )
+            event = {
+                "event": "assistant_turn",
+                "request_id": agent_data.request_id,
+                "assistant_turn": agent_data.assistant_turns,
+                "text": assistant_message,
+                "num_tokens": len(agent_data.response_ids),
+            }
+            agent_data.debug_events.append(event)
+            self._debug_append_event(event)
+
         # Check termination conditions
         if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
             return AgentState.TERMINATED
@@ -285,8 +320,9 @@ class ToolAgentLoop(AgentLoopBase):
 
         tasks = []
         tool_call_names = []
-        for tool_call in agent_data.tool_calls[: self.max_parallel_calls]:
-            tasks.append(self._call_tool(tool_call, agent_data.tools_kwargs, agent_data))
+        active_tool_calls = agent_data.tool_calls[: self.max_parallel_calls]
+        for tool_index, tool_call in enumerate(active_tool_calls):
+            tasks.append(self._call_tool(tool_call, agent_data.tools_kwargs, agent_data, tool_index=tool_index))
             tool_call_names.append(tool_call.name)
 
         with simple_timer("tool_calls", agent_data.metrics):
@@ -294,7 +330,20 @@ class ToolAgentLoop(AgentLoopBase):
 
         # Process tool responses and update multi_modal_data
         # Removed: agent_data.new_images_this_turn = []
-        for tool_response, tool_reward, _ in responses:
+        for tool_call, (tool_response, tool_reward, tool_info) in zip(active_tool_calls, responses, strict=False):
+            if self.debug_options["enabled"]:
+                event = {
+                    "event": "tool_response",
+                    "request_id": agent_data.request_id,
+                    "assistant_turn": agent_data.assistant_turns,
+                    "tool_name": tool_call.name,
+                    "tool_arguments": tool_call.arguments,
+                    "tool_response_text": tool_response.text,
+                    "tool_reward": tool_reward,
+                    "tool_info": tool_info,
+                }
+                agent_data.debug_events.append(event)
+                self._debug_append_event(event)
             # Create message from tool response
             if tool_response.image or tool_response.video:
                 # Multi-modal content with structured format
@@ -419,22 +468,44 @@ class ToolAgentLoop(AgentLoopBase):
             return AgentState.GENERATING
 
     async def _call_tool(
-        self, tool_call: FunctionCall, tools_kwargs: dict[str, Any], agent_data: AgentData
+        self, tool_call: FunctionCall, tools_kwargs: dict[str, Any], agent_data: AgentData, tool_index: int = 0
     ) -> tuple[ToolResponse, float, dict]:
         """Call tool and return tool response."""
         tool, instance_id = None, None
+        res = {}
         try:
             # TODO: append malformed tool_call to the prompt: invalid function name or arguments
             tool_name = tool_call.name
             tool_args = json.loads(tool_call.arguments)
+            if self.debug_options["enabled"]:
+                event = {
+                    "event": "tool_call",
+                    "request_id": agent_data.request_id,
+                    "assistant_turn": agent_data.assistant_turns,
+                    "tool_index": tool_index,
+                    "tool_name": tool_name,
+                    "tool_arguments": tool_args,
+                }
+                agent_data.debug_events.append(event)
+                self._debug_append_event(event)
             tool = self.tools[tool_name]
             kwargs = tools_kwargs.get(tool_name, {})
             instance_id, _ = await tool.create(create_kwargs=kwargs.get("create_kwargs", {}))
             tool_execution_response, tool_reward, res = await tool.execute(
                 instance_id, tool_args, agent_data=agent_data
             )
+            if self.debug_options["enabled"]:
+                res.setdefault("debug_context", agent_data.extra_fields.get("debug_trajectory", {}))
+            if self.debug_options["enabled"]:
+                self._debug_save_tool_images(
+                    agent_data=agent_data,
+                    tool_response=tool_execution_response,
+                    tool_info=res,
+                    tool_index=tool_index,
+                )
         except Exception as e:
             logger.warning(f"Error when executing tool: {e}")
+            res = {"success": False, "error": str(e)}
             return (
                 ToolResponse(
                     text=f"Error when executing tool: {e}",
@@ -467,6 +538,174 @@ class ToolAgentLoop(AgentLoopBase):
                     tool_response_kwargs[attr_name] = attr_value
 
         return ToolResponse(**tool_response_kwargs), tool_reward, res
+
+    def _debug_dir(self) -> str | None:
+        return self.debug_options.get("dir")
+
+    def _debug_max_text_chars(self) -> int | None:
+        return self.debug_options.get("max_text_chars")
+
+    def _debug_append_event(self, event: dict[str, Any]) -> None:
+        debug_dir = self._debug_dir()
+        if not debug_dir:
+            return
+        append_jsonl(path_join(debug_dir, "agent_events.jsonl"), event, max_text_chars=self._debug_max_text_chars())
+
+    def _debug_base_record(self, agent_data: AgentData, kwargs: dict[str, Any], trajectory: dict[str, Any]) -> dict:
+        reward_model = kwargs.get("reward_model") or {}
+        extra_info = kwargs.get("extra_info") or {}
+        return {
+            "request_id": agent_data.request_id,
+            "trajectory": trajectory,
+            "uid": kwargs.get("uid"),
+            "index": kwargs.get("index"),
+            "data_source": kwargs.get("data_source"),
+            "ground_truth": reward_model.get("ground_truth") if isinstance(reward_model, dict) else None,
+            "reward_model": reward_model,
+            "extra_info": extra_info,
+            "image_references": self._debug_extract_image_references(kwargs["raw_prompt"], extra_info),
+            "question": self._debug_extract_question(kwargs["raw_prompt"]),
+        }
+
+    async def _debug_log_sample_start(
+        self,
+        agent_data: AgentData,
+        kwargs: dict[str, Any],
+        trajectory: dict[str, Any],
+        sampling_params: dict[str, Any],
+    ) -> None:
+        debug_dir = self._debug_dir()
+        if not debug_dir:
+            return
+        source_image_paths = []
+        if self.debug_options.get("save_source_images") and agent_data.image_data:
+            images = agent_data.image_data if isinstance(agent_data.image_data, list) else [agent_data.image_data]
+            step = trajectory.get("step", "unknown")
+            for image_index, image in enumerate(images):
+                path = path_join(
+                    debug_dir,
+                    "source_images",
+                    f"step_{step}",
+                    f"request_{agent_data.request_id}_image_{image_index}.png",
+                )
+                saved_path = save_image(image, path)
+                if saved_path:
+                    source_image_paths.append(saved_path)
+
+        record = {
+            "event": "sample_start",
+            **self._debug_base_record(agent_data, kwargs, trajectory),
+            "raw_prompt": kwargs["raw_prompt"],
+            "system_prompt": self._debug_extract_system_prompt(kwargs["raw_prompt"]),
+            "tool_prompt": self.tool_schemas,
+            "tool_config_path": self.rollout_config.multi_turn.tool_config_path,
+            "sampling_params": sampling_params,
+            "source_image_paths": source_image_paths,
+        }
+        agent_data.debug_events.append(record)
+        append_jsonl(path_join(debug_dir, "sample_traces.jsonl"), record, max_text_chars=self._debug_max_text_chars())
+        self._debug_append_event(record)
+
+    async def _debug_log_sample_final(
+        self,
+        output: AgentLoopOutput,
+        agent_data: AgentData,
+        kwargs: dict[str, Any],
+        trajectory: dict[str, Any],
+    ) -> None:
+        debug_dir = self._debug_dir()
+        if not debug_dir:
+            return
+        final_response = await self.loop.run_in_executor(
+            None, lambda: self.tokenizer.decode(output.response_ids, skip_special_tokens=True)
+        )
+        record = {
+            "event": "sample_final",
+            **self._debug_base_record(agent_data, kwargs, trajectory),
+            "raw_prompt": kwargs["raw_prompt"],
+            "messages": agent_data.messages,
+            "final_response": final_response,
+            "num_turns": output.num_turns,
+            "turn_scores": agent_data.turn_scores,
+            "tool_rewards": agent_data.tool_rewards,
+            "debug_events": agent_data.debug_events,
+            "metrics": output.metrics.model_dump(),
+        }
+        output.extra_fields["comprehensive_debug"] = to_jsonable(
+            record, max_text_chars=self._debug_max_text_chars()
+        )
+        append_jsonl(path_join(debug_dir, "sample_traces.jsonl"), record, max_text_chars=self._debug_max_text_chars())
+        self._debug_append_event({"event": "sample_final", **record})
+
+    def _debug_save_tool_images(
+        self,
+        agent_data: AgentData,
+        tool_response: ToolResponse,
+        tool_info: dict[str, Any],
+        tool_index: int,
+    ) -> None:
+        debug_dir = self._debug_dir()
+        if not debug_dir or not self.debug_options.get("save_cropped_images"):
+            return
+        images = tool_response.image
+        if images is None:
+            return
+        if not isinstance(images, list):
+            images = [images]
+        step = "unknown"
+        context = tool_info.get("debug_context") if isinstance(tool_info, dict) else None
+        if isinstance(context, dict):
+            step = context.get("step", step)
+        for image_index, image in enumerate(images):
+            path = path_join(
+                debug_dir,
+                "crops",
+                f"step_{step}",
+                f"request_{agent_data.request_id}_turn_{agent_data.assistant_turns}_tool_{tool_index}_{image_index}.png",
+            )
+            saved_path = save_image(image, path)
+            if saved_path:
+                tool_info.setdefault("saved_images", []).append(saved_path)
+
+    @staticmethod
+    def _debug_extract_system_prompt(raw_prompt: list[dict[str, Any]]) -> Any:
+        for message in raw_prompt:
+            if message.get("role") == "system":
+                return message.get("content")
+        return None
+
+    @staticmethod
+    def _debug_extract_question(raw_prompt: list[dict[str, Any]]) -> str | None:
+        user_texts = []
+        for message in raw_prompt:
+            if message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                user_texts.append(content)
+            elif isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and "text" in item:
+                        user_texts.append(str(item["text"]))
+        return "\n".join(user_texts) if user_texts else None
+
+    def _debug_extract_image_references(self, raw_prompt: list[dict[str, Any]], extra_info: Any) -> list[Any]:
+        references = []
+        if isinstance(extra_info, dict):
+            for key in (self.data_config.get("image_key", "images"), "images", "image"):
+                if key in extra_info:
+                    references.append(extra_info[key])
+        for message in raw_prompt:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                for key in ("image", "image_url", "path"):
+                    if key in item:
+                        references.append(item[key])
+        return references
 
     def _initialize_interactions(self, interaction_config_file):
         """Initialize interactions from configuration.
