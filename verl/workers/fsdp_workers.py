@@ -51,6 +51,8 @@ from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.activation_offload import enable_activation_offloading
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.dataset.rl_dataset import get_dataset_class
+from verl.utils.debug.comprehensive_logging import gpu_memory_context_from_batch, gpu_memory_stage, log_gpu_memory_event
 from verl.utils.device import (
     get_device_id,
     get_device_name,
@@ -80,7 +82,6 @@ from verl.utils.fsdp_utils import (
     replace_lora_wrapper,
 )
 from verl.utils.import_utils import import_external_libs
-from verl.utils.dataset.rl_dataset import get_dataset_class
 from verl.utils.lazy_multi_modal import lazy_multi_modal_inputs_enabled
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.model import convert_weight_keys
@@ -101,6 +102,56 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
+
+
+def _worker_global_step(data: DataProto | None = None, explicit: int | None = None) -> int | None:
+    if explicit is not None:
+        return explicit
+    try:
+        return data.meta_info.get("global_steps")
+    except Exception:
+        return None
+
+
+def _worker_context(data: DataProto | None = None, extra: dict | None = None) -> dict:
+    context = {}
+    if data is not None:
+        context.update(gpu_memory_context_from_batch(data))
+    if extra:
+        context.update(extra)
+    return context
+
+
+def _worker_gpu_stage(config, stage: str, data: DataProto | None = None, *, role: str, extra: dict | None = None):
+    return gpu_memory_stage(
+        config,
+        stage,
+        global_step=_worker_global_step(data),
+        role=role,
+        context=_worker_context(data, extra),
+        worker=True,
+    )
+
+
+def _worker_gpu_event(
+    config,
+    stage: str,
+    phase: str,
+    data: DataProto | None = None,
+    *,
+    role: str,
+    extra: dict | None = None,
+    global_step: int | None = None,
+) -> None:
+    log_gpu_memory_event(
+        config,
+        stage,
+        phase,
+        global_step=_worker_global_step(data, global_step),
+        role=role,
+        context=_worker_context(data, extra),
+        worker=True,
+    )
 
 
 def create_device_mesh(world_size, fsdp_size):
@@ -1047,184 +1098,201 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):
-        assert self._is_actor
-        if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.actor_module_fsdp)
-        if self._is_offload_optimizer:
-            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
+        with _worker_gpu_stage(self.config, "update_actor", data, role="actor"):
+            assert self._is_actor
+            if self._is_offload_param:
+                with _worker_gpu_stage(self.config, "update_actor_load_model", data, role="actor"):
+                    load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            if self._is_offload_optimizer:
+                with _worker_gpu_stage(self.config, "update_actor_load_optimizer", data, role="actor"):
+                    load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
 
-        with self.ulysses_sharding_manager:
-            data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
-            data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
-            # perform training
-            with Timer(name="update_policy", logger=None) as timer:
-                metrics = self.actor.update_policy(data=data)
-            delta_time = timer.last
-            global_num_tokens = data.meta_info["global_token_num"]
-            images_seqlens = data.meta_info.get("images_seqlens", None)
-            estimated_flops, promised_flops = self.flops_counter.estimate_flops(
-                global_num_tokens, delta_time, images_seqlens=images_seqlens
-            )
-            metrics["perf/mfu/actor"] = (
-                estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
-            )
-            metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
-            metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
-            metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+            with self.ulysses_sharding_manager:
+                data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
+                data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
+                # perform training
+                with _worker_gpu_stage(self.config, "update_actor_policy", data, role="actor"):
+                    with Timer(name="update_policy", logger=None) as timer:
+                        metrics = self.actor.update_policy(data=data)
+                delta_time = timer.last
+                global_num_tokens = data.meta_info["global_token_num"]
+                images_seqlens = data.meta_info.get("images_seqlens", None)
+                estimated_flops, promised_flops = self.flops_counter.estimate_flops(
+                    global_num_tokens, delta_time, images_seqlens=images_seqlens
+                )
+                metrics["perf/mfu/actor"] = (
+                    estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
+                )
+                metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
+                metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
+                metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
 
-            lr = self.actor_lr_scheduler.get_last_lr()[0]
-            metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr
-            self.actor_lr_scheduler.step()
+                lr = self.actor_lr_scheduler.get_last_lr()[0]
+                metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr
+                self.actor_lr_scheduler.step()
 
-            # TODO: here, we should return all metrics
-            output = DataProto(meta_info={"metrics": metrics})
+                # TODO: here, we should return all metrics
+                output = DataProto(meta_info={"metrics": metrics})
 
-            output = output.to("cpu")
+                output = output.to("cpu")
 
-        if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-            log_gpu_memory_usage("After offload actor model during update_actor", logger=logger)
-        if self._is_offload_optimizer:
-            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
-            log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
+            if self._is_offload_param:
+                with _worker_gpu_stage(self.config, "update_actor_offload_model", data, role="actor"):
+                    offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+                log_gpu_memory_usage("After offload actor model during update_actor", logger=logger)
+            if self._is_offload_optimizer:
+                with _worker_gpu_stage(self.config, "update_actor_offload_optimizer", data, role="actor"):
+                    offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+                log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
 
-        return output
+            return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
     @DistProfiler.annotate(color="red", role="rollout_generate")
     def generate_sequences(self, prompts: DataProto):
-        # Support all hardwares
-        assert self._is_rollout
-        prompts = prompts.to(get_device_id())
+        with _worker_gpu_stage(self.config, "generate_sequences", prompts, role="rollout"):
+            # Support all hardwares
+            assert self._is_rollout
+            prompts = prompts.to(get_device_id())
 
-        meta_info = {
-            "eos_token_id": self.generation_config.eos_token_id
-            if self.generation_config is not None
-            else self.tokenizer.eos_token_id,
-            "pad_token_id": self.generation_config.pad_token_id
-            if self.generation_config is not None
-            else self.tokenizer.pad_token_id,
-        }
-        prompts.meta_info.update(meta_info)
-
-        timing_generate = {}
-        if self._is_actor:  # For rollout only, we do not switch context.
-            loop = get_event_loop()
-            loop.run_until_complete(self.rollout_mode())
-            log_gpu_memory_usage("After switch to rollout mode", logger=logger)
-
-        with simple_timer("generate_sequences", timing_generate):
-            output = self.rollout.generate_sequences(prompts=prompts)
-
-        if self._is_actor:
-            loop.run_until_complete(self.trainer_mode())
-            log_gpu_memory_usage("After switch to trainer mode", logger=logger)
-
-        # We calculate the average timing across all ranks
-        # to make sure meta_info["timing"] is the same
-        timing_generate_topk_ratio, timing_generate_min, timing_generate_max = topk_reduce_ratio_min_max(
-            timing_generate["generate_sequences"]
-        )
-        timing_generate = reduce_timing(timing_generate)
-        timing_generate.update(
-            {
-                "generation_timing/max": timing_generate_max,
-                "generation_timing/min": timing_generate_min,
-                "generation_timing/topk_ratio": timing_generate_topk_ratio,
+            meta_info = {
+                "eos_token_id": self.generation_config.eos_token_id
+                if self.generation_config is not None
+                else self.tokenizer.eos_token_id,
+                "pad_token_id": self.generation_config.pad_token_id
+                if self.generation_config is not None
+                else self.tokenizer.pad_token_id,
             }
-        )
-        output.meta_info["timing"] = timing_generate
-        output = output.to("cpu")
+            prompts.meta_info.update(meta_info)
 
-        # clear kv cache
-        get_torch_device().empty_cache()
-        return output
+            timing_generate = {}
+            if self._is_actor:  # For rollout only, we do not switch context.
+                loop = get_event_loop()
+                with _worker_gpu_stage(self.config, "generate_sequences_rollout_mode", prompts, role="rollout"):
+                    loop.run_until_complete(self.rollout_mode())
+                log_gpu_memory_usage("After switch to rollout mode", logger=logger)
+
+            with simple_timer("generate_sequences", timing_generate):
+                with _worker_gpu_stage(self.config, "rollout_generate_sequences", prompts, role="rollout"):
+                    output = self.rollout.generate_sequences(prompts=prompts)
+
+            if self._is_actor:
+                with _worker_gpu_stage(self.config, "generate_sequences_trainer_mode", prompts, role="rollout"):
+                    loop.run_until_complete(self.trainer_mode())
+                log_gpu_memory_usage("After switch to trainer mode", logger=logger)
+
+            # We calculate the average timing across all ranks
+            # to make sure meta_info["timing"] is the same
+            timing_generate_topk_ratio, timing_generate_min, timing_generate_max = topk_reduce_ratio_min_max(
+                timing_generate["generate_sequences"]
+            )
+            timing_generate = reduce_timing(timing_generate)
+            timing_generate.update(
+                {
+                    "generation_timing/max": timing_generate_max,
+                    "generation_timing/min": timing_generate_min,
+                    "generation_timing/topk_ratio": timing_generate_topk_ratio,
+                }
+            )
+            output.meta_info["timing"] = timing_generate
+            output = output.to("cpu")
+
+            # clear kv cache
+            with _worker_gpu_stage(self.config, "generate_sequences_empty_cache", output, role="rollout"):
+                get_torch_device().empty_cache()
+            return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
     def compute_log_prob(self, data: DataProto):
-        # when is_lora is True, we use the actor without lora applied to calculate the log_prob
-        # which is mostly used for ref log_prob calculation
-        assert self._is_actor
-        if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        with _worker_gpu_stage(self.config, "compute_log_prob", data, role="actor"):
+            # when is_lora is True, we use the actor without lora applied to calculate the log_prob
+            # which is mostly used for ref log_prob calculation
+            assert self._is_actor
+            if self._is_offload_param:
+                with _worker_gpu_stage(self.config, "compute_log_prob_load_model", data, role="actor"):
+                    load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
-        # Support all hardwares
-        from contextlib import nullcontext
+            # Support all hardwares
+            from contextlib import nullcontext
 
-        is_lora = data.meta_info.pop("is_lora", False)
-        adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
-        # we should always recompute old_log_probs when it is HybridEngine
-        config_source = self.config.ref if is_lora else self.config.rollout
-        data.meta_info["micro_batch_size"] = config_source.log_prob_micro_batch_size_per_gpu
-        data.meta_info["max_token_len"] = config_source.log_prob_max_token_len_per_gpu
-        data.meta_info["use_dynamic_bsz"] = config_source.log_prob_use_dynamic_bsz
-        data.meta_info["temperature"] = self.config.rollout.temperature
-        data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
-        # perform recompute log_prob
-        calculate_entropy = not is_lora
-        with self.ulysses_sharding_manager:
-            with adapter_ctx:
-                outputs = self.actor.compute_log_prob(data=data, calculate_entropy=calculate_entropy)
-            if not is_lora:
-                tensors = {"old_log_probs": outputs["log_probs"]}
-            else:
-                tensors = {"ref_log_prob": outputs["log_probs"]}
-            if calculate_entropy:
-                tensors["entropys"] = outputs["entropys"]
-            if "sum_pi_squared" in outputs:
-                tensors["sum_pi_squared"] = outputs["sum_pi_squared"]
-            output = DataProto.from_dict(
-                tensors=tensors,
-                meta_info={"temperature": self.config.rollout.temperature},
-            )
+            is_lora = data.meta_info.pop("is_lora", False)
+            adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
+            # we should always recompute old_log_probs when it is HybridEngine
+            config_source = self.config.ref if is_lora else self.config.rollout
+            data.meta_info["micro_batch_size"] = config_source.log_prob_micro_batch_size_per_gpu
+            data.meta_info["max_token_len"] = config_source.log_prob_max_token_len_per_gpu
+            data.meta_info["use_dynamic_bsz"] = config_source.log_prob_use_dynamic_bsz
+            data.meta_info["temperature"] = self.config.rollout.temperature
+            data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
+            # perform recompute log_prob
+            calculate_entropy = not is_lora
+            with self.ulysses_sharding_manager:
+                with adapter_ctx:
+                    with _worker_gpu_stage(self.config, "actor_compute_log_prob_forward", data, role="actor"):
+                        outputs = self.actor.compute_log_prob(data=data, calculate_entropy=calculate_entropy)
+                if not is_lora:
+                    tensors = {"old_log_probs": outputs["log_probs"]}
+                else:
+                    tensors = {"ref_log_prob": outputs["log_probs"]}
+                if calculate_entropy:
+                    tensors["entropys"] = outputs["entropys"]
+                if "sum_pi_squared" in outputs:
+                    tensors["sum_pi_squared"] = outputs["sum_pi_squared"]
+                output = DataProto.from_dict(
+                    tensors=tensors,
+                    meta_info={"temperature": self.config.rollout.temperature},
+                )
 
-        output = output.to("cpu")
+            output = output.to("cpu")
 
-        # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
-        # unshard the root FSDP module
-        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
-            self.actor.actor_module._handle.reshard(True)
+            # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
+            # unshard the root FSDP module
+            if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+                self.actor.actor_module._handle.reshard(True)
 
-        if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-            log_gpu_memory_usage("After offload actor model during compute_log_prob", logger=logger)
+            if self._is_offload_param:
+                with _worker_gpu_stage(self.config, "compute_log_prob_offload_model", data, role="actor"):
+                    offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+                log_gpu_memory_usage("After offload actor model during compute_log_prob", logger=logger)
 
-        return output
+            return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     def compute_ref_log_prob(self, data: DataProto):
-        if self._is_lora:
-            # if _is_lora, actor without lora applied is the ref
-            data.meta_info["is_lora"] = True
-            return self.compute_log_prob(data)
-        assert self._is_ref
-        # else:
-        # otherwise, the class have a standalone ref model
+        with _worker_gpu_stage(self.config, "compute_ref_log_prob", data, role="ref"):
+            if self._is_lora:
+                # if _is_lora, actor without lora applied is the ref
+                data.meta_info["is_lora"] = True
+                return self.compute_log_prob(data)
+            assert self._is_ref
+            # else:
+            # otherwise, the class have a standalone ref model
 
-        micro_batch_size = self.config.ref.log_prob_micro_batch_size_per_gpu
-        data.meta_info["micro_batch_size"] = micro_batch_size
-        data.meta_info["temperature"] = self.config.rollout.temperature
-        data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
-        data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
-        data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
-        with self.ulysses_sharding_manager:
-            data = data.to("cpu")  # data will to device with each micro batch on ref.compute_log_prob
-            outputs = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
-            output = DataProto.from_dict(tensors={"ref_log_prob": outputs["log_probs"]})
+            micro_batch_size = self.config.ref.log_prob_micro_batch_size_per_gpu
+            data.meta_info["micro_batch_size"] = micro_batch_size
+            data.meta_info["temperature"] = self.config.rollout.temperature
+            data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
+            data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
+            data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
+            with self.ulysses_sharding_manager:
+                data = data.to("cpu")  # data will to device with each micro batch on ref.compute_log_prob
+                with _worker_gpu_stage(self.config, "ref_compute_log_prob_forward", data, role="ref"):
+                    outputs = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+                output = DataProto.from_dict(tensors={"ref_log_prob": outputs["log_probs"]})
 
-        output = output.to("cpu")
+            output = output.to("cpu")
 
-        # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
-        # unshard the root FSDP module
-        if self.world_size > 1:
-            if fsdp_version(self.ref_policy.actor_module) == 1:
-                self.ref_policy.actor_module._handle.reshard(True)
-            elif fsdp_version(self.ref_policy.actor_module) == 2:
-                self.ref_policy.actor_module.reshard()
+            # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
+            # unshard the root FSDP module
+            if self.world_size > 1:
+                if fsdp_version(self.ref_policy.actor_module) == 1:
+                    self.ref_policy.actor_module._handle.reshard(True)
+                elif fsdp_version(self.ref_policy.actor_module) == 2:
+                    self.ref_policy.actor_module.reshard()
 
-        return output
+            return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
@@ -1696,55 +1764,65 @@ class CriticWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="critic"))
     @DistProfiler.annotate(color="cyan", role="compute_values")
     def compute_values(self, data: DataProto):
-        if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.critic_module)
-        micro_batch_size = self.config.forward_micro_batch_size_per_gpu
-        data.meta_info["micro_batch_size"] = micro_batch_size
-        data.meta_info["max_token_len"] = self.config.forward_max_token_len_per_gpu
-        data.meta_info["use_dynamic_bsz"] = self.config.use_dynamic_bsz
-        # perform forward computation
-        with self.ulysses_sharding_manager:
-            data = data.to("cpu")  # data will to device with each micro batch on critic.compute_values
-            values = self.critic.compute_values(data=data)
-            output = DataProto.from_dict(tensors={"values": values})
+        with _worker_gpu_stage(self.config, "compute_values", data, role="critic"):
+            if self._is_offload_param:
+                with _worker_gpu_stage(self.config, "compute_values_load_model", data, role="critic"):
+                    load_fsdp_model_to_gpu(self.critic_module)
+            micro_batch_size = self.config.forward_micro_batch_size_per_gpu
+            data.meta_info["micro_batch_size"] = micro_batch_size
+            data.meta_info["max_token_len"] = self.config.forward_max_token_len_per_gpu
+            data.meta_info["use_dynamic_bsz"] = self.config.use_dynamic_bsz
+            # perform forward computation
+            with self.ulysses_sharding_manager:
+                data = data.to("cpu")  # data will to device with each micro batch on critic.compute_values
+                with _worker_gpu_stage(self.config, "critic_compute_values_forward", data, role="critic"):
+                    values = self.critic.compute_values(data=data)
+                output = DataProto.from_dict(tensors={"values": values})
 
-        output = output.to("cpu")
-        if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.critic_module)
-        return output
+            output = output.to("cpu")
+            if self._is_offload_param:
+                with _worker_gpu_stage(self.config, "compute_values_offload_model", data, role="critic"):
+                    offload_fsdp_model_to_cpu(self.critic_module)
+            return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="critic"))
     @DistProfiler.annotate(color="pink", role="critic_update")
     def update_critic(self, data: DataProto):
-        if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.critic_module)
-        if self._is_offload_optimizer:
-            load_fsdp_optimizer(optimizer=self.critic_optimizer, device_id=get_device_id())
+        with _worker_gpu_stage(self.config, "update_critic", data, role="critic"):
+            if self._is_offload_param:
+                with _worker_gpu_stage(self.config, "update_critic_load_model", data, role="critic"):
+                    load_fsdp_model_to_gpu(self.critic_module)
+            if self._is_offload_optimizer:
+                with _worker_gpu_stage(self.config, "update_critic_load_optimizer", data, role="critic"):
+                    load_fsdp_optimizer(optimizer=self.critic_optimizer, device_id=get_device_id())
 
-        # perform forward computation
-        with self.ulysses_sharding_manager:
-            data = data.to("cpu")  # data will to device with each micro batch on critic.update_critic
-            with Timer(name="update_critic", logger=None) as timer:
-                metrics = self.critic.update_critic(data=data)
-            delta_time = timer.last
+            # perform forward computation
+            with self.ulysses_sharding_manager:
+                data = data.to("cpu")  # data will to device with each micro batch on critic.update_critic
+                with _worker_gpu_stage(self.config, "critic_update_forward_backward", data, role="critic"):
+                    with Timer(name="update_critic", logger=None) as timer:
+                        metrics = self.critic.update_critic(data=data)
+                delta_time = timer.last
 
-            global_num_tokens = data.meta_info["global_token_num"]
-            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
-            metrics["perf/mfu/critic"] = estimated_flops * self.config.ppo_epochs / promised_flops / self.world_size
+                global_num_tokens = data.meta_info["global_token_num"]
+                estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+                metrics["perf/mfu/critic"] = estimated_flops * self.config.ppo_epochs / promised_flops / self.world_size
 
-            lr = self.critic_lr_scheduler.get_last_lr()[0]
-            metrics["critic/lr"] = lr
-            self.critic_lr_scheduler.step()
+                lr = self.critic_lr_scheduler.get_last_lr()[0]
+                metrics["critic/lr"] = lr
+                self.critic_lr_scheduler.step()
 
-            output = DataProto(batch=None, meta_info={"metrics": metrics})
+                output = DataProto(batch=None, meta_info={"metrics": metrics})
 
-        if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.critic_module)
-        if self._is_offload_optimizer:
-            offload_fsdp_optimizer(optimizer=self.critic_optimizer)
+            if self._is_offload_param:
+                with _worker_gpu_stage(self.config, "update_critic_offload_model", data, role="critic"):
+                    offload_fsdp_model_to_cpu(self.critic_module)
+            if self._is_offload_optimizer:
+                with _worker_gpu_stage(self.config, "update_critic_offload_optimizer", data, role="critic"):
+                    offload_fsdp_optimizer(optimizer=self.critic_optimizer)
 
-        output = output.to("cpu")
-        return output
+            output = output.to("cpu")
+            return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
@@ -1784,5 +1862,19 @@ class CriticWorker(Worker, DistProfilerExtension):
 class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None):
-        await self.rollout_mode()
+        _worker_gpu_event(self.config, "update_weights", "before", role="rollout", global_step=global_steps)
+        try:
+            await self.rollout_mode()
+        except Exception as exc:
+            log_gpu_memory_event(
+                self.config,
+                "update_weights",
+                "exception",
+                global_step=global_steps,
+                role="rollout",
+                exception=exc,
+                worker=True,
+            )
+            raise
+        _worker_gpu_event(self.config, "update_weights", "after", role="rollout", global_step=global_steps)
         return True

@@ -23,6 +23,7 @@ from uuid import uuid4
 import ray
 
 from verl.tools.base_tool import BaseTool
+from verl.tools.utils.ray_actor_utils import make_tool_actor_name
 from verl.utils.reward_score.sandbox_fusion.utils import _process_single_case
 from verl.utils.rollout_trace import rollout_trace_op
 
@@ -62,18 +63,22 @@ class TokenBucketWorker:
 
 
 class ExecutionWorker:
-    def __init__(self, enable_global_rate_limit=True, rate_limit=10):
+    def __init__(self, enable_global_rate_limit=True, rate_limit=10, rate_limiter_actor_name="rate-limiter"):
+        self.rate_limiter_actor_name = rate_limiter_actor_name
         self.rate_limit_worker = self._init_rate_limit(rate_limit) if enable_global_rate_limit else None
+        self.enable_global_rate_limit = enable_global_rate_limit
 
     def _init_rate_limit(self, rate_limit):
         # TODO validation for rate_limit
         # A Singleton Rate Limitor
-        return TokenBucketWorker.options(name="rate-limiter", get_if_exists=True).remote(rate_limit)
+        return TokenBucketWorker.options(name=self.rate_limiter_actor_name, get_if_exists=True).remote(rate_limit)
 
     def ping(self):
         return True
 
     def execute(self, fn: Callable[..., T], *fn_args, **fn_kwargs) -> T:
+        if not self.rate_limit_worker:
+            return fn(*fn_args, **fn_kwargs)
         with ExitStack() as stack:
             stack.callback(self.rate_limit_worker.release.remote)
             ray.get(self.rate_limit_worker.acquire.remote())
@@ -85,13 +90,35 @@ class ExecutionWorker:
 
 
 def init_execution_pool(
-    num_workers: int, enable_global_rate_limit=True, rate_limit=10, mode: PoolMode = PoolMode.ThreadMode
+    num_workers: int,
+    enable_global_rate_limit=True,
+    rate_limit=10,
+    mode: PoolMode = PoolMode.ThreadMode,
+    tool_name="sandbox-fusion",
 ):
     if mode == PoolMode.ThreadMode:
+        execution_pool_actor_name = make_tool_actor_name(
+            tool_name=tool_name,
+            pool_kind="execution-pool",
+            num_workers=num_workers,
+            rate_limit=rate_limit,
+            enable_global_rate_limit=enable_global_rate_limit,
+        )
+        rate_limiter_actor_name = make_tool_actor_name(
+            tool_name=tool_name,
+            pool_kind="rate-limiter",
+            num_workers=num_workers,
+            rate_limit=rate_limit,
+            enable_global_rate_limit=enable_global_rate_limit,
+        )
         return (
             ray.remote(ExecutionWorker)
-            .options(max_concurrency=num_workers)
-            .remote(enable_global_rate_limit=enable_global_rate_limit, rate_limit=rate_limit)
+            .options(name=execution_pool_actor_name, get_if_exists=True, max_concurrency=num_workers)
+            .remote(
+                enable_global_rate_limit=enable_global_rate_limit,
+                rate_limit=rate_limit,
+                rate_limiter_actor_name=rate_limiter_actor_name,
+            )
         )
     else:
         raise NotImplementedError("Process mode is not implemented yet")
@@ -141,6 +168,7 @@ class SandboxFusionTool(BaseTool):
             enable_global_rate_limit=self.enable_global_rate_limit,
             rate_limit=self.rate_limit,
             mode=PoolMode.ThreadMode,
+            tool_name=self.name,
         )
         self.sandbox_fusion_url = config.get("sandbox_fusion_url", "")
         self.memory_limit_mb = config.get("memory_limit_mb", 1024)

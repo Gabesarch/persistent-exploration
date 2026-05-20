@@ -8,6 +8,7 @@ import base64
 import json
 import mimetypes
 import os
+import random
 from html import escape
 from pathlib import Path
 from typing import Any
@@ -136,6 +137,55 @@ def find_sample(
         return sorted(samples, key=lambda s: (len(s.get("tool_rewards") or []), sample_score(s)), reverse=True)[0]
     if select == "longest":
         return sorted(samples, key=sample_score, reverse=True)[0]
+    if select == "random":
+        return random.choice(samples)
+    raise SystemExit(f"Unsupported --select value: {select}")
+
+
+def find_samples(
+    sample_path: Path,
+    request_id: str | None,
+    sample_index: int | None,
+    rollout_n: int | None,
+    select: str,
+    num_samples: int,
+) -> list[dict[str, Any]]:
+    samples = [r for r in read_jsonl(sample_path) if r.get("event") == "sample_final"]
+    if not samples:
+        raise SystemExit(f"No sample_final records found in {sample_path}")
+
+    if request_id:
+        matches = [sample for sample in samples if sample.get("request_id") == request_id]
+        if not matches:
+            raise SystemExit(f"request_id not found: {request_id}")
+        return matches[:1]
+
+    if sample_index is not None:
+        matches = [
+            s
+            for s in samples
+            if s.get("index") == sample_index
+            or s.get("trajectory", {}).get("sample_index") == sample_index
+        ]
+        if rollout_n is not None:
+            matches = [s for s in matches if s.get("trajectory", {}).get("rollout_n") == rollout_n]
+        if not matches:
+            raise SystemExit(f"No sample found for sample_index={sample_index}, rollout_n={rollout_n}")
+        return sorted(matches, key=sample_score, reverse=True)[: max(1, num_samples)]
+
+    if select == "first":
+        return samples[: max(1, num_samples)]
+    if select == "last":
+        return samples[-max(1, num_samples) :]
+    if select == "most-tools":
+        return sorted(samples, key=lambda s: (len(s.get("tool_rewards") or []), sample_score(s)), reverse=True)[
+            : max(1, num_samples)
+        ]
+    if select == "longest":
+        return sorted(samples, key=sample_score, reverse=True)[: max(1, num_samples)]
+    if select == "random":
+        count = min(max(1, num_samples), len(samples))
+        return random.sample(samples, count)
     raise SystemExit(f"Unsupported --select value: {select}")
 
 
@@ -316,6 +366,75 @@ def build_html(
     )
 
 
+def build_multi_sample_html(
+    samples: list[dict[str, Any]],
+    events_by_request_id: dict[str, list[dict[str, Any]]],
+    debug_dir: Path,
+    embed_images: bool,
+    max_text_chars: int | None,
+) -> str:
+    if len(samples) == 1:
+        request_id = str(samples[0].get("request_id"))
+        return build_html(samples[0], events_by_request_id.get(request_id, []), debug_dir, embed_images, max_text_chars)
+
+    sections = []
+    nav_items = []
+    for idx, sample in enumerate(samples, start=1):
+        request_id = str(sample.get("request_id"))
+        anchor = f"sample-{idx}"
+        traj = sample.get("trajectory") or {}
+        sample_index = sample.get("index") or traj.get("sample_index")
+        rollout_n = traj.get("rollout_n")
+        tool_count = len(sample.get("tool_rewards") or [])
+        nav_items.append(
+            f'<li><a href="#{anchor}">Sample {idx}: '
+            f'{escape(str(sample_index))} / rollout {escape(str(rollout_n))} '
+            f'({tool_count} tools)</a></li>'
+        )
+        sample_html = build_html(
+            sample,
+            events_by_request_id.get(request_id, []),
+            debug_dir,
+            embed_images,
+            max_text_chars,
+        )
+        inner = sample_html.split("<main>", 1)[1].rsplit("</main>", 1)[0]
+        sections.append(f'<section id="{anchor}" class="sample-section">{inner}</section>')
+
+    css = """
+    body { color: #1f2933; font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; background: #f6f8fa; }
+    main { max-width: 1180px; margin: 0 auto; padding: 24px; }
+    h1 { font-size: 24px; margin: 0 0 16px; }
+    .sample-nav, .sample-section { background: white; border: 1px solid #d0d7de; border-radius: 8px; padding: 14px; margin: 14px 0 28px; }
+    .sample-section { background: #f6f8fa; }
+    .sample-section > h1 { border-top: 3px solid #0969da; padding-top: 18px; }
+    h2 { border-top: 1px solid #d0d7de; margin-top: 28px; padding-top: 20px; }
+    h3 { margin: 0 0 10px; text-transform: uppercase; letter-spacing: .04em; font-size: 12px; color: #57606a; }
+    table { border-collapse: collapse; width: 100%; background: white; margin: 12px 0 20px; }
+    th, td { border: 1px solid #d0d7de; padding: 8px 10px; vertical-align: top; text-align: left; }
+    th { width: 160px; background: #f0f3f6; }
+    .message { background: white; border: 1px solid #d0d7de; border-radius: 8px; margin: 14px 0; padding: 14px; }
+    .system { border-left: 5px solid #6e7781; }
+    .user { border-left: 5px solid #0969da; }
+    .assistant, .final_response { border-left: 5px solid #1a7f37; }
+    .tool, .tool\\ response, .tool\\ call { border-left: 5px solid #bc4c00; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .images { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; margin-top: 12px; }
+    figure { margin: 0; border: 1px solid #d0d7de; border-radius: 6px; overflow: hidden; background: #f6f8fa; }
+    img { display: block; max-width: 100%; max-height: 620px; margin: 0 auto; object-fit: contain; background: #111; }
+    figcaption { border-top: 1px solid #d0d7de; padding: 8px; color: #57606a; font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+    .missing { color: #cf222e; }
+    """
+    return (
+        "<!doctype html><html><head><meta charset=\"utf-8\">"
+        f"<title>Trajectory Samples</title><style>{css}</style></head><body><main>"
+        f"<h1>Trajectory Samples ({len(samples)})</h1>"
+        f'<nav class="sample-nav"><ol>{"".join(nav_items)}</ol></nav>'
+        + "\n".join(sections)
+        + "</main></body></html>\n"
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--debug-log-dir", type=Path, required=True, help="Directory containing sample_traces.jsonl and agent_events.jsonl")
@@ -324,12 +443,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rollout-n", type=int, help="Disambiguate --sample-index by rollout number")
     parser.add_argument(
         "--select",
-        choices=("longest", "most-tools", "first", "last"),
+        choices=("longest", "most-tools", "first", "last", "random"),
         default="most-tools",
         help="Selection strategy when --request-id is omitted",
     )
     parser.add_argument("--output", type=Path, help="Output HTML path")
     parser.add_argument("--max-text-chars", type=int, default=0, help="Truncate long text blocks; 0 means no truncation")
+    parser.add_argument("--num-samples", type=int, default=1, help="Number of samples to render when not selecting an exact request")
     parser.add_argument("--embed-images", action="store_true", help="Embed images as base64 data URIs; produces large HTML")
     return parser.parse_args()
 
@@ -342,25 +462,39 @@ def main() -> None:
     if not sample_path.exists():
         raise SystemExit(f"Missing {sample_path}")
 
-    sample = find_sample(sample_path, args.request_id, args.sample_index, args.rollout_n, args.select)
-    request_id = str(sample.get("request_id"))
-    events = events_for_request(agent_path, request_id)
+    samples = find_samples(
+        sample_path,
+        args.request_id,
+        args.sample_index,
+        args.rollout_n,
+        args.select,
+        args.num_samples,
+    )
+    events_by_request_id = {
+        str(sample.get("request_id")): events_for_request(agent_path, str(sample.get("request_id")))
+        for sample in samples
+    }
 
     output = args.output
     if output is None:
+        sample = samples[0]
+        request_id = str(sample.get("request_id"))
         output = debug_dir / f"trajectory_{request_id}.html"
     output = output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
 
     max_text_chars = args.max_text_chars if args.max_text_chars > 0 else None
-    html = build_html(sample, events, debug_dir, args.embed_images, max_text_chars)
+    html = build_multi_sample_html(samples, events_by_request_id, debug_dir, args.embed_images, max_text_chars)
     output.write_text(html, encoding="utf-8")
 
     print(f"Wrote {output}")
-    print(f"request_id={request_id}")
-    print(f"sample_index={sample.get('index') or sample.get('trajectory', {}).get('sample_index')}")
-    print(f"rollout_n={sample.get('trajectory', {}).get('rollout_n')}")
-    print(f"tool_calls={len(sample.get('tool_rewards') or [])}")
+    print(f"num_samples={len(samples)}")
+    for sample in samples:
+        request_id = str(sample.get("request_id"))
+        print(f"request_id={request_id}")
+        print(f"sample_index={sample.get('index') or sample.get('trajectory', {}).get('sample_index')}")
+        print(f"rollout_n={sample.get('trajectory', {}).get('rollout_n')}")
+        print(f"tool_calls={len(sample.get('tool_rewards') or [])}")
 
 
 if __name__ == "__main__":

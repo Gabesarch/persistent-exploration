@@ -163,7 +163,7 @@ trainer:
   test_freq: 40
   nnodes: 1
   n_gpus_per_node: 8
-  project_name: verl
+  project_name: verl_vero2
   total_epochs: 20
   total_training_steps: 1000
   log_val_generations: 0

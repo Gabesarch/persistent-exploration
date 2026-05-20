@@ -33,7 +33,7 @@ from verl.interactions.base import BaseInteraction
 from verl.interactions.utils.interaction_registry import initialize_interactions_from_config
 from verl.tools.schemas import ToolResponse
 from verl.tools.utils.tool_registry import initialize_tools_from_config
-from verl.utils.profiler import simple_timer
+from verl.utils.crop_cache import CROP_IMAGE_REFS_KEY, resolve_crop_cache_root
 from verl.utils.debug.comprehensive_logging import (
     append_jsonl,
     get_debug_options,
@@ -41,6 +41,7 @@ from verl.utils.debug.comprehensive_logging import (
     save_image,
     to_jsonable,
 )
+from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput
 
@@ -68,12 +69,18 @@ class AgentData:
         metrics: dict[str, Any],
         request_id: str,
         tools_kwargs: dict[str, Any],
+        original_prompt_image_sources: Optional[list[Any]] = None,
+        crop_cache_root: Optional[str] = None,
+        crop_cache_step: Optional[int | str] = None,
         interaction: Optional[BaseInteraction] = None,
         interaction_kwargs: Optional[dict[str, Any]] = None,
     ):
         self.messages = messages
         self.image_data = image_data
         self.video_data = video_data
+        self.original_prompt_image_sources = original_prompt_image_sources or []
+        self.crop_cache_root = crop_cache_root
+        self.crop_cache_step = crop_cache_step
         self.metrics = metrics
         self.request_id = request_id
         self.tools_kwargs = tools_kwargs
@@ -98,6 +105,7 @@ class AgentData:
         # Extra fields for dynamic addition, e.g., tool session data
         self.extra_fields: dict[str, Any] = {}
         self.debug_events: list[dict[str, Any]] = []
+        self.crop_image_refs: list[dict[str, Any]] = []
 
 
 @register("tool_agent")
@@ -118,6 +126,8 @@ class ToolAgentLoop(AgentLoopBase):
         self.tool_parser = ToolParser.get_tool_parser(self.rollout_config.multi_turn.format, self.tokenizer)
         self.tool_parser_name = self.rollout_config.multi_turn.format
         self.debug_options = get_debug_options(self.config)
+        lazy_multi_modal_config = self.rollout_config.get("lazy_multi_modal_inputs", {})
+        self.crop_cache_root = str(resolve_crop_cache_root(lazy_multi_modal_config.get("crop_cache_root")))
 
         self.prompt_length = self.rollout_config.prompt_length
         self.response_length = self.rollout_config.response_length
@@ -129,10 +139,24 @@ class ToolAgentLoop(AgentLoopBase):
                 self.interaction_config_file
             )
 
+    @staticmethod
+    def _collect_original_prompt_image_sources(messages: list[dict[str, Any]]) -> list[Any]:
+        sources = []
+        for message in messages:
+            content = message.get("content") if isinstance(message, dict) else None
+            content_items = content if isinstance(content, list) else [content]
+            for item in content_items:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "image" or "image" in item or "image_url" in item:
+                    sources.append(dict(item))
+        return sources
+
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
         debug_trajectory = kwargs.get("_debug_trajectory", {})
+        original_prompt_image_sources = self._collect_original_prompt_image_sources(messages)
 
         # extract images and videos from messages
         multi_modal_data = await self.process_vision_info(messages)
@@ -166,6 +190,9 @@ class ToolAgentLoop(AgentLoopBase):
             metrics=metrics,
             request_id=request_id,
             tools_kwargs=tools_kwargs,
+            original_prompt_image_sources=original_prompt_image_sources,
+            crop_cache_root=self.crop_cache_root,
+            crop_cache_step=debug_trajectory.get("step"),
             interaction=interaction,
             interaction_kwargs=interaction_kwargs,
         )
@@ -215,6 +242,7 @@ class ToolAgentLoop(AgentLoopBase):
                 "request_id": agent_data.request_id,
                 "turn_scores": agent_data.turn_scores,
                 "tool_rewards": agent_data.tool_rewards,
+                CROP_IMAGE_REFS_KEY: agent_data.crop_image_refs,
             }
         )
         if self.debug_options["enabled"]:
@@ -355,7 +383,7 @@ class ToolAgentLoop(AgentLoopBase):
                     )
                 content = []
                 if tool_response.image:
-                    content.append({"type": "image"})
+                    content.extend([{"type": "image"} for _ in tool_response.image])
                 if tool_response.video:
                     content.append({"type": "video"})
                 if tool_response.text:
@@ -367,17 +395,35 @@ class ToolAgentLoop(AgentLoopBase):
 
             add_messages.append(message)
 
+            crop_refs = list(tool_response.crop_image_refs or [])
+
             # Handle image data
             if tool_response.image:
                 # Add new image data
                 if isinstance(tool_response.image, list):
                     # Ensure all elements in the list are valid image objects
-                    for img in tool_response.image:
+                    for img_idx, img in enumerate(tool_response.image):
                         if img is not None:  # Add a check to ensure the image is not None
+                            crop_ref = dict(crop_refs[img_idx]) if img_idx < len(crop_refs) else {}
+                            if crop_ref:
+                                crop_ref["image_index"] = (
+                                    len(agent_data.image_data or []) + len(new_images_this_turn)
+                                )
+                                crop_ref["order"] = len(agent_data.crop_image_refs)
+                                crop_ref["assistant_turn"] = agent_data.assistant_turns
+                                crop_ref["tool_name"] = tool_call.name
+                                agent_data.crop_image_refs.append(crop_ref)
                             new_images_this_turn.append(img)  # Using local variable
                 else:
                     # Ensure the image is not None
                     if tool_response.image is not None:
+                        if crop_refs:
+                            crop_ref = dict(crop_refs[0])
+                            crop_ref["image_index"] = len(agent_data.image_data or []) + len(new_images_this_turn)
+                            crop_ref["order"] = len(agent_data.crop_image_refs)
+                            crop_ref["assistant_turn"] = agent_data.assistant_turns
+                            crop_ref["tool_name"] = tool_call.name
+                            agent_data.crop_image_refs.append(crop_ref)
                         new_images_this_turn.append(tool_response.image)  # Using local variable
 
             # Handle video data
@@ -536,6 +582,8 @@ class ToolAgentLoop(AgentLoopBase):
                 attr_value = getattr(tool_execution_response, attr_name)
                 if attr_value is not None:
                     tool_response_kwargs[attr_name] = attr_value
+        if tool_execution_response.crop_image_refs:
+            tool_response_kwargs["crop_image_refs"] = tool_execution_response.crop_image_refs
 
         return ToolResponse(**tool_response_kwargs), tool_reward, res
 

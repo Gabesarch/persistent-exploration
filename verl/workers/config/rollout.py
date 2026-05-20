@@ -110,6 +110,8 @@ class AgentLoopConfig(BaseConfig):
 class LazyMultiModalInputsConfig(BaseConfig):
     enabled: bool = False
     assert_metadata_match: bool = True
+    crop_cache_root: Optional[str] = None
+    cleanup_crop_cache: bool = True
 
 
 @dataclass

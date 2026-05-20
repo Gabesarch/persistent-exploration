@@ -20,6 +20,8 @@ from typing import Any
 import numpy as np
 import torch
 
+from verl.utils.crop_cache import load_crop_images, normalize_crop_image_refs
+
 HEAVY_MULTI_MODAL_INPUT_KEYS = {
     "pixel_values",
     "pixel_values_videos",
@@ -76,6 +78,7 @@ def rehydrate_multi_modal_inputs(
     dataset_cls: Any,
     data_config: Any,
     original_multi_modal_inputs: Sequence[Any] | None = None,
+    crop_image_refs: Sequence[Any] | None = None,
     assert_metadata_match: bool = True,
 ) -> list[dict[str, torch.Tensor]]:
     if processor is None:
@@ -90,6 +93,7 @@ def rehydrate_multi_modal_inputs(
     for idx, raw_prompt in enumerate(raw_prompts):
         messages = _normalize_raw_prompt(raw_prompt)
         multi_modal_data = _process_vision_info_sync(processor, dataset_cls, data_config, messages)
+        _append_crop_images(multi_modal_data, _get_sample_crop_image_refs(crop_image_refs, idx))
         sample_inputs = _compute_multi_modal_inputs_for_sample(
             tokenizer=tokenizer,
             processor=processor,
@@ -141,7 +145,9 @@ def _compute_multi_modal_inputs_for_sample(
     return multi_modal_inputs
 
 
-def _process_vision_info_sync(processor: Any, dataset_cls: Any, data_config: Any, messages: list[dict]) -> dict[str, Any]:
+def _process_vision_info_sync(
+    processor: Any, dataset_cls: Any, data_config: Any, messages: list[dict]
+) -> dict[str, Any]:
     image_patch_size = processor.image_processor.patch_size
     images, videos = _run_coro_sync(
         dataset_cls.process_vision_info(messages, image_patch_size=image_patch_size, config=data_config)
@@ -152,6 +158,23 @@ def _process_vision_info_sync(processor: Any, dataset_cls: Any, data_config: Any
     if videos is not None:
         multi_modal_data["videos"] = videos
     return multi_modal_data
+
+
+def _append_crop_images(multi_modal_data: dict[str, Any], crop_image_refs: Any) -> None:
+    refs = normalize_crop_image_refs(crop_image_refs)
+    if not refs:
+        return
+    images = list(multi_modal_data.get("images") or [])
+    images.extend(load_crop_images(refs))
+    multi_modal_data["images"] = images
+
+
+def _get_sample_crop_image_refs(crop_image_refs: Sequence[Any] | None, idx: int) -> Any:
+    if crop_image_refs is None:
+        return None
+    if isinstance(crop_image_refs, np.ndarray):
+        return crop_image_refs[idx]
+    return crop_image_refs[idx]
 
 
 def _run_coro_sync(coro):

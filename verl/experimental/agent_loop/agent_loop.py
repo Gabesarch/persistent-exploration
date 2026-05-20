@@ -39,6 +39,7 @@ from verl.trainer.distillation import is_distillation_enabled
 from verl.utils.chat_template import apply_chat_template, initialize_system_prompt
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
+from verl.utils.debug.comprehensive_logging import gpu_memory_context_from_batch, gpu_memory_stage
 from verl.utils.lazy_multi_modal import lazy_multi_modal_inputs_enabled, strip_heavy_multi_modal_inputs
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.profiler import simple_timer
@@ -61,6 +62,33 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 DEFAULT_ROUTING_CACHE_SIZE = 10000
+
+
+def _gpu_context(batch: DataProto | None = None, extra: dict | None = None) -> dict:
+    context = {}
+    if batch is not None:
+        context.update(gpu_memory_context_from_batch(batch))
+    if extra:
+        context.update(extra)
+    return context
+
+
+def _global_step_from_batch(batch: DataProto | None = None) -> int | None:
+    try:
+        return batch.meta_info.get("global_steps")
+    except Exception:
+        return None
+
+
+def _agent_gpu_stage(config, stage: str, batch: DataProto | None = None, *, role: str, extra: dict | None = None):
+    return gpu_memory_stage(
+        config,
+        stage,
+        global_step=_global_step_from_batch(batch),
+        role=role,
+        context=_gpu_context(batch, extra),
+        worker=True,
+    )
 
 
 @ray.remote
@@ -545,66 +573,87 @@ class AgentLoopWorker:
             responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
             response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
-        config = self.rollout_config
-        sampling_params = dict(
-            temperature=config.temperature,
-            top_p=config.top_p,
-            top_k=config.top_k,
-            repetition_penalty=1.0,
-            logprobs=config.calculate_log_probs,
-        )
+        with _agent_gpu_stage(
+            self.config,
+            "agent_worker_generate_sequences",
+            batch,
+            role="agent_loop_worker",
+            extra={"validate": batch.meta_info.get("validate", False), "request_count": len(batch)},
+        ):
+            config = self.rollout_config
+            sampling_params = dict(
+                temperature=config.temperature,
+                top_p=config.top_p,
+                top_k=config.top_k,
+                repetition_penalty=1.0,
+                logprobs=config.calculate_log_probs,
+            )
 
-        # override sampling params for validation
-        if batch.meta_info.get("validate", False):
-            sampling_params["top_p"] = config.val_kwargs.top_p
-            sampling_params["top_k"] = config.val_kwargs.top_k
-            sampling_params["temperature"] = config.val_kwargs.temperature
+            # override sampling params for validation
+            if batch.meta_info.get("validate", False):
+                sampling_params["top_p"] = config.val_kwargs.top_p
+                sampling_params["top_k"] = config.val_kwargs.top_k
+                sampling_params["temperature"] = config.val_kwargs.temperature
 
-        # by default, we assume it's a single turn agent
-        if "agent_name" not in batch.non_tensor_batch:
-            default_agent_loop = config.agent.default_agent_loop
-            batch.non_tensor_batch["agent_name"] = np.array([default_agent_loop] * len(batch), dtype=object)
+            # by default, we assume it's a single turn agent
+            if "agent_name" not in batch.non_tensor_batch:
+                default_agent_loop = config.agent.default_agent_loop
+                batch.non_tensor_batch["agent_name"] = np.array([default_agent_loop] * len(batch), dtype=object)
 
-        if "index" in batch.non_tensor_batch:
-            index = batch.non_tensor_batch["index"]
-        else:
-            index = np.arange(len(batch))
+            if "index" in batch.non_tensor_batch:
+                index = batch.non_tensor_batch["index"]
+            else:
+                index = np.arange(len(batch))
 
-        max_samples_per_worker = RolloutTraceConfig.get_instance().max_samples_per_step_per_worker
+            max_samples_per_worker = RolloutTraceConfig.get_instance().max_samples_per_step_per_worker
 
-        # For n rollouts per sample, we trace all n rollouts for selected samples
-        # Note: This sampling happens per-worker, so total traces = max_samples_per_worker * num_workers * n
-        if max_samples_per_worker is not None:
-            unique_sample_indices = np.unique(index)
-            if max_samples_per_worker < len(unique_sample_indices):
-                selected_samples = set(
-                    np.random.choice(unique_sample_indices, max_samples_per_worker, replace=False).tolist()
-                )
-                traced_indices = set(i for i in range(len(batch)) if index[i] in selected_samples)
+            # For n rollouts per sample, we trace all n rollouts for selected samples
+            # Note: This sampling happens per-worker, so total traces = max_samples_per_worker * num_workers * n
+            if max_samples_per_worker is not None:
+                unique_sample_indices = np.unique(index)
+                if max_samples_per_worker < len(unique_sample_indices):
+                    selected_samples = set(
+                        np.random.choice(unique_sample_indices, max_samples_per_worker, replace=False).tolist()
+                    )
+                    traced_indices = set(i for i in range(len(batch)) if index[i] in selected_samples)
+                else:
+                    traced_indices = set(range(len(batch)))
             else:
                 traced_indices = set(range(len(batch)))
-        else:
-            traced_indices = set(range(len(batch)))
 
-        trajectory_info = await get_trajectory_info(
-            batch.meta_info.get("global_steps", -1), index.tolist(), batch.meta_info.get("validate", False)
-        )
-
-        tasks = []
-        for i in range(len(batch)):
-            trace_this_sample = i in traced_indices
-            kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
-            tasks.append(
-                asyncio.create_task(
-                    self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
-                )
+            trajectory_info = await get_trajectory_info(
+                batch.meta_info.get("global_steps", -1), index.tolist(), batch.meta_info.get("validate", False)
             )
-        outputs = await asyncio.gather(*tasks)
 
-        output = self._postprocess(
-            outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)
-        )
-        return output
+            tasks = []
+            with _agent_gpu_stage(
+                self.config,
+                "agent_worker_create_tasks",
+                batch,
+                role="agent_loop_worker",
+                extra={"request_count": len(batch), "traced_count": len(traced_indices)},
+            ):
+                for i in range(len(batch)):
+                    trace_this_sample = i in traced_indices
+                    kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
+                    tasks.append(
+                        asyncio.create_task(
+                            self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
+                        )
+                    )
+            with _agent_gpu_stage(
+                self.config,
+                "agent_worker_gather_tasks",
+                batch,
+                role="agent_loop_worker",
+                extra={"request_count": len(tasks)},
+            ):
+                outputs = await asyncio.gather(*tasks)
+
+            output = self._postprocess(
+                outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)
+            )
+            return output
 
     async def _run_agent_loop(
         self,
@@ -1184,25 +1233,50 @@ class AgentLoopManager:
         Returns:
             DataProto: Output batch.
         """
-        if self.stream_teacher_with_rollout:
-            await self.teacher_model_manager.wake_up()
-        chunkes = prompts.chunk(len(self.agent_loop_workers))
-        outputs = await asyncio.gather(
-            *[
-                worker.generate_sequences.remote(chunk)
-                for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
-            ]
-        )
-        if self.stream_teacher_with_rollout:
-            await self.teacher_model_manager.sleep()
-        output = DataProto.concat(outputs)
+        with _agent_gpu_stage(
+            self.config,
+            "agent_manager_generate_sequences",
+            prompts,
+            role="agent_loop_manager",
+            extra={"worker_count": len(self.agent_loop_workers), "request_count": len(prompts)},
+        ):
+            if self.stream_teacher_with_rollout:
+                await self.teacher_model_manager.wake_up()
+            with _agent_gpu_stage(
+                self.config,
+                "agent_manager_split_prompts",
+                prompts,
+                role="agent_loop_manager",
+                extra={"worker_count": len(self.agent_loop_workers), "request_count": len(prompts)},
+            ):
+                chunkes = prompts.chunk(len(self.agent_loop_workers))
+            with _agent_gpu_stage(
+                self.config,
+                "agent_manager_gather_workers",
+                prompts,
+                role="agent_loop_manager",
+                extra={
+                    "worker_count": len(self.agent_loop_workers),
+                    "chunk_sizes": [len(chunk) for chunk in chunkes],
+                    "validate": prompts.meta_info.get("validate", False),
+                },
+            ):
+                outputs = await asyncio.gather(
+                    *[
+                        worker.generate_sequences.remote(chunk)
+                        for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
+                    ]
+                )
+            if self.stream_teacher_with_rollout:
+                await self.teacher_model_manager.sleep()
+            output = DataProto.concat(outputs)
 
-        # calculate performance metrics
-        metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]
-        timing = self._performance_metrics(metrics, output)
+            # calculate performance metrics
+            metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]
+            timing = self._performance_metrics(metrics, output)
 
-        output.meta_info = {"timing": timing, **outputs[0].meta_info}
-        return output
+            output.meta_info = {"timing": timing, **outputs[0].meta_info}
+            return output
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
         timing = {}

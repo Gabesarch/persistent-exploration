@@ -30,6 +30,7 @@ import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
+from verl.utils.crop_cache import CROP_IMAGE_REFS_KEY
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.import_utils import deprecated
@@ -162,6 +163,7 @@ class DataParallelPPOActor(BasePPOActor):
             dataset_cls=self.dataset_cls,
             data_config=self.data_config,
             original_multi_modal_inputs=multi_modal_inputs_batch,
+            crop_image_refs=micro_batch.get(CROP_IMAGE_REFS_KEY),
             assert_metadata_match=self.lazy_multi_modal_assert_metadata_match,
         )
         return extract_multi_modal_inputs(rebuilt_multi_modal_inputs)
@@ -514,6 +516,8 @@ class DataParallelPPOActor(BasePPOActor):
             if "raw_prompt" not in data.non_tensor_batch:
                 raise ValueError("lazy multimodal inputs require raw_prompt in the rollout batch")
             non_tensor_select_keys.append("raw_prompt")
+            if CROP_IMAGE_REFS_KEY in data.non_tensor_batch:
+                non_tensor_select_keys.append(CROP_IMAGE_REFS_KEY)
         if self.use_prefix_grouper:
             select_keys += [k for k in ["prompts", "response_mask"] if k in data.batch]
             if "uid" in data.non_tensor_batch:
@@ -602,6 +606,8 @@ class DataParallelPPOActor(BasePPOActor):
             if "raw_prompt" not in data.non_tensor_batch:
                 raise ValueError("lazy multimodal inputs require raw_prompt in the rollout batch")
             non_tensor_select_keys.append("raw_prompt")
+            if CROP_IMAGE_REFS_KEY in data.non_tensor_batch:
+                non_tensor_select_keys.append(CROP_IMAGE_REFS_KEY)
         if self.use_prefix_grouper and "uid" in data.non_tensor_batch.keys():
             non_tensor_select_keys.append("uid")
 

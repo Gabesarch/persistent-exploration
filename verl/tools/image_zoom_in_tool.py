@@ -19,14 +19,18 @@ import os
 import threading
 from contextlib import ExitStack
 from enum import Enum
+from io import BytesIO
 from math import ceil, floor
 from typing import Any, Callable, Optional, TypeVar
+from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
 import ray
 import ray.actor
 from PIL import Image
 from qwen_vl_utils import fetch_image
+
+from verl.utils.crop_cache import save_crop_image
 
 from .base_tool import BaseTool
 from .schemas import OpenAIFunctionToolSchema, ToolResponse
@@ -35,6 +39,12 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 T = TypeVar("T")
+
+
+class OriginalSourceUnavailableError(ValueError):
+    def __init__(self, message: str, source_info: dict[str, Any]):
+        super().__init__(message)
+        self.source_info = source_info
 
 
 # Adapted from verl/tools/sandbox_fusion_tools.py
@@ -132,6 +142,14 @@ class ImageZoomInTool(BaseTool):
     SMART_RESIZE_FACTOR = 32
     SMART_RESIZE_MIN_PIXELS = 256 * 32 * 32
     SMART_RESIZE_MAX_PIXELS = 12845056
+    IMAGE_SIZE_CONTROL_KEYS = {
+        "max_pixels",
+        "min_pixels",
+        "total_pixels",
+        "resized_height",
+        "resized_width",
+        "image_factor",
+    }
 
     def __init__(self, config: dict, tool_schema: OpenAIFunctionToolSchema):
         """
@@ -182,14 +200,17 @@ class ImageZoomInTool(BaseTool):
         self.cropped_max_pixels = int(
             config.get("cropped_max_pixels", config.get("max_pixels", self.SMART_RESIZE_MAX_PIXELS))
         )
+        self.use_original_resolution_source = bool(config.get("use_original_resolution_source", False))
+        self.original_source_unavailable_policy = config.get("original_source_unavailable_policy", "fallback")
+        self.crop_cache_root = config.get("crop_cache_root")
+        if self.original_source_unavailable_policy not in ("fallback", "error"):
+            raise ValueError(
+                "original_source_unavailable_policy must be either 'fallback' or 'error', "
+                f"got {self.original_source_unavailable_policy!r}."
+            )
 
         self.enable_global_rate_limit = config.get("enable_global_rate_limit", True)
-        self.execution_pool = init_visual_execution_pool(
-            num_workers=self.num_workers,
-            enable_global_rate_limit=self.enable_global_rate_limit,
-            rate_limit=self.rate_limit,
-            mode=PoolMode.ThreadMode,
-        )
+        self.execution_pool = None
         logger.info(f"Initialized ImageZoomInTool with config: {config}")
 
     def round_by_factor(self, number: int, factor: int) -> int:
@@ -300,7 +321,7 @@ class ImageZoomInTool(BaseTool):
         }
         return instance_id, ToolResponse()
 
-    def _get_source_image(self, instance_id: str, img_idx: int, agent_data: Any = None) -> Any:
+    def _get_processed_source_image(self, instance_id: str, img_idx: int, agent_data: Any = None) -> Any:
         instance_data = self._instance_dict[instance_id]
 
         if agent_data is not None and agent_data.image_data is not None:
@@ -319,11 +340,86 @@ class ImageZoomInTool(BaseTool):
 
         raise ValueError("Missing source image: provide agent_data.image_data or create_kwargs.image.")
 
+    def _get_source_image(self, instance_id: str, img_idx: int, agent_data: Any = None) -> Any:
+        return self._get_processed_source_image(instance_id, img_idx, agent_data)
+
+    def _processed_image_count(self, agent_data: Any = None) -> Optional[int]:
+        if agent_data is None or agent_data.image_data is None:
+            return None
+        image_data = agent_data.image_data
+        return len(image_data) if isinstance(image_data, list) else 1
+
+    def _strip_image_size_control_keys(self, source: dict[str, Any]) -> dict[str, Any]:
+        return {key: value for key, value in source.items() if key not in self.IMAGE_SIZE_CONTROL_KEYS}
+
+    def _load_original_source_image(self, source: Any) -> Image.Image:
+        if isinstance(source, Image.Image):
+            return source.convert("RGB").copy()
+
+        if isinstance(source, dict):
+            source = self._strip_image_size_control_keys(source)
+            if "bytes" in source:
+                return Image.open(BytesIO(source["bytes"])).convert("RGB")
+            if "image" in source:
+                return self._load_original_source_image(source["image"])
+            if "image_url" in source:
+                image_url = source["image_url"]
+                if isinstance(image_url, dict) and "url" in image_url:
+                    image_url = image_url["url"]
+                return self._load_original_source_image(image_url)
+            return fetch_image(source).convert("RGB")
+
+        if isinstance(source, str):
+            parsed = urlparse(source)
+            if parsed.scheme == "file":
+                path = unquote(parsed.path)
+                with Image.open(path) as image:
+                    return image.convert("RGB")
+            if parsed.scheme in ("", None) and os.path.exists(source):
+                with Image.open(source) as image:
+                    return image.convert("RGB")
+            return fetch_image({"image": source}).convert("RGB")
+
+        raise TypeError(f"Unsupported original image source type: {type(source).__name__}")
+
+    def _select_source_image(
+        self, instance_id: str, img_idx: int, agent_data: Any = None
+    ) -> tuple[Image.Image, dict[str, Any]]:
+        source_info = {
+            "used_original_resolution_source": False,
+            "original_source_unavailable_policy": self.original_source_unavailable_policy,
+        }
+
+        original_sources = (
+            getattr(agent_data, "original_prompt_image_sources", None) if agent_data is not None else None
+        )
+        if self.use_original_resolution_source and original_sources is not None and img_idx < len(original_sources):
+            try:
+                image = self._load_original_source_image(original_sources[img_idx])
+                source_info["used_original_resolution_source"] = True
+                source_info["original_source_size"] = [image.width, image.height]
+                return image, source_info
+            except Exception as exc:
+                source_info["original_source_error"] = str(exc)
+                if self.original_source_unavailable_policy == "error":
+                    raise OriginalSourceUnavailableError(
+                        f"Original image source unavailable: {exc}", source_info
+                    ) from exc
+                source_info["original_source_fallback"] = True
+
+        image = self._get_processed_source_image(instance_id, img_idx, agent_data)
+        source_info["processed_source_size"] = [image.width, image.height]
+        source_info["initial_prompt_image_count"] = len(original_sources) if original_sources is not None else 0
+        processed_count = self._processed_image_count(agent_data)
+        if processed_count is not None:
+            source_info["processed_image_count"] = processed_count
+        return image, source_info
+
     def _parse_img_idx(self, parameters: dict[str, Any]) -> int:
         if "img_idx" not in parameters:
             raise ValueError("img_idx parameter is missing.")
         img_idx = parameters["img_idx"]
-        if isinstance(img_idx, bool) or not isinstance(img_idx, (int, float)) or int(img_idx) != img_idx:
+        if isinstance(img_idx, bool) or not isinstance(img_idx, int | float) or int(img_idx) != img_idx:
             raise ValueError(f"img_idx must be an integer image index, got {img_idx!r}.")
         img_idx = int(img_idx)
         if img_idx < 0:
@@ -342,6 +438,30 @@ class ImageZoomInTool(BaseTool):
                 bottom / 1000.0 * image_height,
             ]
         raise ValueError(f"Unsupported coordinate_system: {self.coordinate_system}")
+
+    def _validate_and_clamp_bbox(self, bbox_2d: list[float], image_width: int, image_height: int) -> list[float]:
+        try:
+            left, top, right, bottom = [float(value) for value in bbox_2d]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("bbox_2d must contain 4 numeric values.") from exc
+
+        if any(isinstance(value, bool) for value in bbox_2d) or not all(
+            math.isfinite(value) for value in (left, top, right, bottom)
+        ):
+            raise ValueError("bbox_2d must contain 4 finite numeric values.")
+
+        if right <= left or bottom <= top:
+            raise ValueError("bbox_2d must define a positive-area box with left < right and top < bottom.")
+
+        left = max(0.0, left)
+        top = max(0.0, top)
+        right = min(float(image_width), right)
+        bottom = min(float(image_height), bottom)
+
+        if right <= left or bottom <= top:
+            raise ValueError("bbox_2d is outside image bounds or has no positive area after clamping.")
+
+        return [left, top, right, bottom]
 
     async def execute(self, instance_id: str, parameters: dict[str, Any], **kwargs) -> tuple[ToolResponse, float, dict]:
         bbox_2d = parameters.get("bbox_2d")
@@ -370,12 +490,17 @@ class ImageZoomInTool(BaseTool):
         try:
             img_idx = self._parse_img_idx(parameters)
             debug_info["img_idx"] = img_idx
-            image = self._get_source_image(instance_id, img_idx, kwargs.get("agent_data"))
+            image, source_info = self._select_source_image(instance_id, img_idx, kwargs.get("agent_data"))
+            debug_info.update(source_info)
             image_width, image_height = image.size
             debug_info["source_image_size"] = [image_width, image_height]
             pixel_bbox = self._convert_bbox_to_pixels(bbox_2d, image_width=image_width, image_height=image_height)
             debug_info["pixel_bbox"] = pixel_bbox
-            resized_bbox = self._maybe_resize_bbox(pixel_bbox, image_width=image_width, image_height=image_height)
+            clamped_bbox = self._validate_and_clamp_bbox(
+                pixel_bbox, image_width=image_width, image_height=image_height
+            )
+            debug_info["clamped_bbox"] = clamped_bbox
+            resized_bbox = self._maybe_resize_bbox(clamped_bbox, image_width=image_width, image_height=image_height)
             debug_info["resized_bbox"] = resized_bbox
 
             cropped_image = image.crop(resized_bbox)
@@ -389,10 +514,25 @@ class ImageZoomInTool(BaseTool):
             )
             cropped_image = cropped_image.resize((new_width, new_height), resample=Image.BICUBIC)
             debug_info["cropped_image_size"] = [new_width, new_height]
+            crop_ref = save_crop_image(
+                cropped_image,
+                cache_root=getattr(kwargs.get("agent_data"), "crop_cache_root", None) or self.crop_cache_root,
+                request_id=getattr(kwargs.get("agent_data"), "request_id", None),
+                step=getattr(kwargs.get("agent_data"), "crop_cache_step", None),
+                metadata={
+                    "tool": "image_zoom_in_tool",
+                    "img_idx": img_idx,
+                    "bbox_2d": list(bbox_2d),
+                    "label": label,
+                },
+            )
+            debug_info["crop_image_ref"] = crop_ref
             debug_info["success"] = True
             logger.info(f"Cropped image size: {cropped_image.size}")
         except Exception as e:
             logger.error(f"Error processing image zoom-in: {e}")
+            if isinstance(e, OriginalSourceUnavailableError):
+                debug_info.update(e.source_info)
             debug_info["success"] = False
             debug_info["error"] = str(e)
             return ToolResponse(text=f"Error processing image zoom-in: {e}"), -0.05, debug_info
@@ -403,6 +543,7 @@ class ImageZoomInTool(BaseTool):
         return (
             ToolResponse(
                 image=[cropped_image],
+                crop_image_refs=[crop_ref],
                 text=response_text,
             ),
             0.0,

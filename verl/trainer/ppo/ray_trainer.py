@@ -24,7 +24,7 @@ import uuid
 from collections import defaultdict
 from copy import deepcopy
 from pprint import pprint
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 import numpy as np
 import torch
@@ -61,8 +61,15 @@ from verl.trainer.ppo.utils import (
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.crop_cache import cleanup_crop_cache_for_batch, crop_cache_cleanup_enabled
 from verl.utils.debug import marked_timer
-from verl.utils.debug.comprehensive_logging import get_debug_options, to_jsonable
+from verl.utils.debug.comprehensive_logging import (
+    get_debug_options,
+    gpu_memory_context_from_batch,
+    gpu_memory_stage,
+    log_gpu_memory_event,
+    to_jsonable,
+)
 from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.lazy_multi_modal import lazy_multi_modal_inputs_enabled
 from verl.utils.metric import reduce_metrics
@@ -323,6 +330,54 @@ class RayPPOTrainer:
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
+    def _gpu_memory_context(self, batch: DataProto | None = None, extra: Mapping[str, Any] | None = None) -> dict:
+        context = {}
+        if batch is not None:
+            context.update(gpu_memory_context_from_batch(batch))
+        if extra:
+            context.update(extra)
+        try:
+            context.setdefault("rollout_n", self.config.actor_rollout_ref.rollout.n)
+        except Exception:
+            pass
+        return context
+
+    def _gpu_memory_stage(
+        self,
+        stage: str,
+        *,
+        batch: DataProto | None = None,
+        epoch: int | None = None,
+        extra: Mapping[str, Any] | None = None,
+    ):
+        return gpu_memory_stage(
+            self.config,
+            stage,
+            global_step=getattr(self, "global_steps", None),
+            epoch=epoch,
+            role="driver",
+            context=self._gpu_memory_context(batch=batch, extra=extra),
+        )
+
+    def _log_gpu_memory(
+        self,
+        stage: str,
+        phase: str,
+        *,
+        batch: DataProto | None = None,
+        epoch: int | None = None,
+        extra: Mapping[str, Any] | None = None,
+    ) -> None:
+        log_gpu_memory_event(
+            self.config,
+            stage,
+            phase,
+            global_step=getattr(self, "global_steps", None),
+            epoch=epoch,
+            role="driver",
+            context=self._gpu_memory_context(batch=batch, extra=extra),
+        )
+
         self.checkpoint_manager = None
 
     def _validate_lazy_multi_modal_inputs_config(self):
@@ -339,6 +394,13 @@ class RayPPOTrainer:
                 "lazy multimodal inputs do not support non-streaming teacher distillation; "
                 "enable teacher_model.enable_resource_pool or disable lazy multimodal inputs"
             )
+
+    def _cleanup_lazy_crop_cache(self, batch: DataProto | None) -> None:
+        if batch is None:
+            return
+        if not crop_cache_cleanup_enabled(self.config):
+            return
+        cleanup_crop_cache_for_batch(batch)
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -431,7 +493,7 @@ class RayPPOTrainer:
             return os.fspath(value)
         if isinstance(value, str):
             return value
-        if isinstance(value, (list, tuple)):
+        if isinstance(value, list | tuple):
             normalized = []
             for item in value:
                 normalized_item = self._normalize_image_reference(item)
@@ -741,6 +803,7 @@ class RayPPOTrainer:
                 sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
 
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+            self._cleanup_lazy_crop_cache(test_batch)
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
@@ -838,6 +901,10 @@ class RayPPOTrainer:
         actor_role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
         if self.hybrid_engine:
             actor_rollout_resource_pool = self.resource_pool_manager.get_resource_pool(actor_role)
+            with open_dict(self.config.actor_rollout_ref):
+                self.config.actor_rollout_ref.comprehensive_debug_logging = self.config.trainer.get(
+                    "comprehensive_debug_logging", {}
+                )
             actor_rollout_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[actor_role],
                 config=self.config.actor_rollout_ref,
@@ -1434,10 +1501,13 @@ class RayPPOTrainer:
         )
 
         self.global_steps = 0
+        with self._gpu_memory_stage("fit_start"):
+            pass
 
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
-        self.checkpoint_manager.update_weights(self.global_steps)
+        with self._gpu_memory_stage("checkpoint_update_weights_initial"):
+            self.checkpoint_manager.update_weights(self.global_steps)
 
         current_epoch = self.global_steps // len(self.train_dataloader)
 
@@ -1486,6 +1556,8 @@ class RayPPOTrainer:
                     )
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                 batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+                with self._gpu_memory_stage("step_start", batch=batch, epoch=epoch):
+                    pass
 
                 # add uid to batch
                 batch.non_tensor_batch["uid"] = np.array(
@@ -1504,12 +1576,14 @@ class RayPPOTrainer:
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
-                        if curr_step_profile:
-                            self.async_rollout_manager.start_profile()
-                        gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
-                        self.checkpoint_manager.sleep_replicas()
-                        if curr_step_profile:
-                            self.async_rollout_manager.stop_profile()
+                        with self._gpu_memory_stage("gen", batch=gen_batch_output, epoch=epoch):
+                            if curr_step_profile:
+                                self.async_rollout_manager.start_profile()
+                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+                            if curr_step_profile:
+                                self.async_rollout_manager.stop_profile()
+                        with self._gpu_memory_stage("sleep_replicas_after_gen", batch=gen_batch_output, epoch=epoch):
+                            self.checkpoint_manager.sleep_replicas()
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
@@ -1520,8 +1594,12 @@ class RayPPOTrainer:
                             gen_baseline_batch.meta_info["do_sample"] = False
                             if curr_step_profile:
                                 self.async_rollout_manager.start_profile()
-                            gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
-                            self.checkpoint_manager.sleep_replicas()
+                            with self._gpu_memory_stage("gen_max", batch=gen_baseline_batch, epoch=epoch):
+                                gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
+                            with self._gpu_memory_stage(
+                                "sleep_replicas_after_gen_max", batch=gen_baseline_output, epoch=epoch
+                            ):
+                                self.checkpoint_manager.sleep_replicas()
                             if curr_step_profile:
                                 self.async_rollout_manager.stop_profile()
                             batch = batch.union(gen_baseline_output)
@@ -1569,13 +1647,14 @@ class RayPPOTrainer:
                         images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
                     batch.meta_info["images_seqlens"] = images_seqlens_all
                     with marked_timer("reward", timing_raw, color="yellow"):
-                        # compute reward model score
-                        if self.use_rm and "rm_scores" not in batch.batch.keys():
-                            batch_reward = self._compute_reward_colocate(batch)
-                            batch = batch.union(batch_reward)
+                        with self._gpu_memory_stage("reward", batch=batch, epoch=epoch):
+                            # compute reward model score
+                            if self.use_rm and "rm_scores" not in batch.batch.keys():
+                                batch_reward = self._compute_reward_colocate(batch)
+                                batch = batch.union(batch_reward)
 
-                        # extract reward_tensor and reward_extra_infos_dict for training
-                        reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+                            # extract reward_tensor and reward_extra_infos_dict for training
+                            reward_tensor, reward_extra_infos_dict = extract_reward(batch)
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -1593,7 +1672,8 @@ class RayPPOTrainer:
                         )
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
-                            old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+                            with self._gpu_memory_stage("old_log_prob", batch=batch, epoch=epoch):
+                                old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
                             actor_config = self.config.actor_rollout_ref.actor
@@ -1629,77 +1709,89 @@ class RayPPOTrainer:
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
-                            ref_log_prob = self._compute_ref_log_prob(batch)
+                            with self._gpu_memory_stage("ref_log_prob", batch=batch, epoch=epoch):
+                                ref_log_prob = self._compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
                     # compute values
                     if self.use_critic:
                         with marked_timer("values", timing_raw, color="cyan"):
-                            values = self._compute_values(batch)
+                            with self._gpu_memory_stage("values", batch=batch, epoch=epoch):
+                                values = self._compute_values(batch)
                             batch = batch.union(values)
 
                     with marked_timer("adv", timing_raw, color="brown"):
-                        # we combine with rule-based rm
-                        reward_extra_infos_dict: dict[str, list]
-                        batch.batch["token_level_scores"] = reward_tensor
+                        with self._gpu_memory_stage("adv", batch=batch, epoch=epoch):
+                            # we combine with rule-based rm
+                            reward_extra_infos_dict: dict[str, list]
+                            batch.batch["token_level_scores"] = reward_tensor
 
-                        if reward_extra_infos_dict:
-                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+                            if reward_extra_infos_dict:
+                                batch.non_tensor_batch.update(
+                                    {k: np.array(v) for k, v in reward_extra_infos_dict.items()}
+                                )
 
-                        # compute rewards. apply_kl_penalty if available
-                        if self.config.algorithm.use_kl_in_reward:
-                            batch, kl_metrics = apply_kl_penalty(
-                                batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
+                            # compute rewards. apply_kl_penalty if available
+                            if self.config.algorithm.use_kl_in_reward:
+                                batch, kl_metrics = apply_kl_penalty(
+                                    batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
+                                )
+                                metrics.update(kl_metrics)
+                            else:
+                                batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                            # Compute rollout correction: IS weights, rejection sampling, and metrics
+                            # Only runs in decoupled mode (computes once per batch using stable π_old)
+                            # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
+                            if (
+                                rollout_corr_config is not None
+                                and "rollout_log_probs" in batch.batch
+                                and not bypass_recomputing_logprobs  # Only in decoupled mode
+                            ):
+                                from verl.trainer.ppo.rollout_corr_helper import (
+                                    compute_rollout_correction_and_add_to_batch,
+                                )
+
+                                # Compute IS weights, apply rejection sampling, compute metrics
+                                batch, is_metrics = compute_rollout_correction_and_add_to_batch(
+                                    batch, rollout_corr_config
+                                )
+                                # IS and off-policy metrics already have rollout_corr/ prefix
+                                metrics.update(is_metrics)
+
+                            # compute advantages, executed on the driver process
+                            norm_adv_by_std_in_grpo = self.config.algorithm.get(
+                                "norm_adv_by_std_in_grpo", True
+                            )  # GRPO adv normalization factor
+
+                            batch = compute_advantage(
+                                batch,
+                                adv_estimator=self.config.algorithm.adv_estimator,
+                                gamma=self.config.algorithm.gamma,
+                                lam=self.config.algorithm.lam,
+                                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                config=self.config.algorithm,
                             )
-                            metrics.update(kl_metrics)
-                        else:
-                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
-
-                        # Compute rollout correction: IS weights, rejection sampling, and metrics
-                        # Only runs in decoupled mode (computes once per batch using stable π_old)
-                        # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
-                        if (
-                            rollout_corr_config is not None
-                            and "rollout_log_probs" in batch.batch
-                            and not bypass_recomputing_logprobs  # Only in decoupled mode
-                        ):
-                            from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
-
-                            # Compute IS weights, apply rejection sampling, compute metrics
-                            batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
-                            # IS and off-policy metrics already have rollout_corr/ prefix
-                            metrics.update(is_metrics)
-
-                        # compute advantages, executed on the driver process
-                        norm_adv_by_std_in_grpo = self.config.algorithm.get(
-                            "norm_adv_by_std_in_grpo", True
-                        )  # GRPO adv normalization factor
-
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config.algorithm,
-                        )
 
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
-                            critic_output = self._update_critic(batch)
+                            with self._gpu_memory_stage("update_critic", batch=batch, epoch=epoch):
+                                critic_output = self._update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup > self.global_steps:
                         # Still in critic warmup, only update weights to wake up rollout replicas.
-                        self.checkpoint_manager.update_weights(self.global_steps)
+                        with self._gpu_memory_stage("update_weights", batch=batch, epoch=epoch):
+                            self.checkpoint_manager.update_weights(self.global_steps)
                     else:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
-                            actor_output = self._update_actor(batch)
+                            with self._gpu_memory_stage("update_actor", batch=batch, epoch=epoch):
+                                actor_output = self._update_actor(batch)
 
                         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                         esi_close_to_expiration = should_save_ckpt_esi(
@@ -1722,13 +1814,15 @@ class RayPPOTrainer:
                             if esi_force_save:
                                 print("Force saving checkpoint: ESI instance expiration approaching.")
                             with marked_timer("save_checkpoint", timing_raw, color="green"):
-                                self._save_checkpoint()
+                                with self._gpu_memory_stage("save_checkpoint", batch=batch, epoch=epoch):
+                                    self._save_checkpoint()
                             if esi_force_save:
                                 self._esi_force_saved = True
 
                         # update weights from trainer to rollout
                         with marked_timer("update_weights", timing_raw, color="red"):
-                            self.checkpoint_manager.update_weights(self.global_steps)
+                            with self._gpu_memory_stage("update_weights", batch=batch, epoch=epoch):
+                                self.checkpoint_manager.update_weights(self.global_steps)
 
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
@@ -1743,7 +1837,8 @@ class RayPPOTrainer:
                     is_last_step or self.global_steps % self.config.trainer.test_freq == 0
                 ):
                     with marked_timer("testing", timing_raw, color="green"):
-                        val_metrics: dict = self._validate()
+                        with self._gpu_memory_stage("testing", batch=batch, epoch=epoch):
+                            val_metrics: dict = self._validate()
                         if is_last_step:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
@@ -1799,6 +1894,9 @@ class RayPPOTrainer:
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
+                self._cleanup_lazy_crop_cache(batch)
+                with self._gpu_memory_stage("step_end", batch=batch, epoch=epoch):
+                    pass
 
                 progress_bar.update(1)
                 self.global_steps += 1

@@ -146,6 +146,13 @@ trainer:
     save_cropped_images: true
     save_source_images: false
     max_text_chars: null
+    gpu_memory_logging:
+      enabled: false
+      sync_cuda: false
+      reset_peak_stats: true
+      log_driver_stages: true
+      log_worker_stages: true
+      log_nvidia_smi: true
 
   # Number of nodes used in the training
   nnodes: 1

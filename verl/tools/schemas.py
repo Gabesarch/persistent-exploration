@@ -97,6 +97,7 @@ class ToolResponse(BaseModel):
     text: str | None = None
     image: list[Any] | None = None
     video: list[Any] | None = None
+    crop_image_refs: list[dict[str, Any]] | None = None
 
     @model_validator(mode="before")
     @classmethod

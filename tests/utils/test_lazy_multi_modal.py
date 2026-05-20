@@ -1,10 +1,13 @@
 import asyncio
+
 import numpy as np
 import pytest
 import torch
 from omegaconf import OmegaConf
+from PIL import Image
 
 from verl.utils.config import validate_config
+from verl.utils.crop_cache import cleanup_crop_cache_paths
 from verl.utils.lazy_multi_modal import (
     _process_vision_info_sync,
     rehydrate_multi_modal_inputs,
@@ -33,13 +36,15 @@ class _FakeProcessor:
     image_processor = _FakeImageProcessor()
 
     def __call__(self, **kwargs):
-        assert kwargs["images"] == ["image"]
+        assert kwargs["images"][0] == "image"
+        image_count = len(kwargs["images"])
+        image_grid_thw = torch.tensor([[1, 2 + idx, 3 + idx] for idx in range(image_count)])
         return _FakeBatchFeature(
             {
                 "input_ids": torch.tensor([[1, 2]]),
                 "attention_mask": torch.tensor([[1, 1]]),
-                "pixel_values": torch.ones(1, 3),
-                "image_grid_thw": torch.tensor([[1, 2, 3]]),
+                "pixel_values": torch.ones(image_count, 3),
+                "image_grid_thw": image_grid_thw,
                 "mm_token_type_ids": torch.tensor([[1, 1]]),
             }
         )
@@ -92,6 +97,33 @@ def test_rehydrate_multi_modal_inputs_matches_metadata():
     assert torch.equal(rebuilt[0]["images_seqlens"], torch.tensor([6]))
 
 
+def test_rehydrate_multi_modal_inputs_appends_crop_paths_in_order(tmp_path):
+    crop_path = tmp_path / "crop.png"
+    Image.new("RGB", (12, 10), color="red").save(crop_path)
+    original_inputs = [
+        {
+            "image_grid_thw": torch.tensor([[1, 2, 3], [1, 3, 4]]),
+            "images_seqlens": torch.tensor([6, 12]),
+        }
+    ]
+
+    rebuilt = rehydrate_multi_modal_inputs(
+        raw_prompts=[[{"role": "user", "content": "look"}]],
+        input_ids=torch.tensor([[1, 2, 3]]),
+        tokenizer=_FakeTokenizer(),
+        processor=_FakeProcessor(),
+        dataset_cls=_FakeDataset,
+        data_config={"max_pixels": 128},
+        original_multi_modal_inputs=original_inputs,
+        crop_image_refs=[[{"path": str(crop_path), "image_index": 1}]],
+        assert_metadata_match=True,
+    )
+
+    assert rebuilt[0]["pixel_values"].shape[0] == 2
+    assert torch.equal(rebuilt[0]["image_grid_thw"], torch.tensor([[1, 2, 3], [1, 3, 4]]))
+    assert torch.equal(rebuilt[0]["images_seqlens"], torch.tensor([6, 12]))
+
+
 def test_rehydrate_multi_modal_inputs_raises_on_metadata_mismatch():
     original_inputs = [{"image_grid_thw": torch.tensor([[1, 9, 9]]), "images_seqlens": torch.tensor([81])}]
 
@@ -120,6 +152,15 @@ def test_process_vision_info_sync_inside_running_event_loop():
         assert "videos" not in output
 
     asyncio.run(_run())
+
+
+def test_cleanup_crop_cache_paths_removes_files_and_tolerates_missing(tmp_path):
+    crop_path = tmp_path / "crop.png"
+    crop_path.write_bytes(b"crop")
+
+    cleanup_crop_cache_paths([str(crop_path), str(tmp_path / "missing.png")])
+
+    assert not crop_path.exists()
 
 
 def _minimal_lazy_config(**overrides):

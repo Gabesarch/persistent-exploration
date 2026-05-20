@@ -13,10 +13,12 @@
 # limitations under the License.
 
 import unittest
+from tempfile import TemporaryDirectory
 
 import numpy as np
 import torch
 import torch.nn as nn
+from PIL import Image
 from tensordict import TensorDict
 from transformers import AutoModelForCausalLM, Qwen3Config
 
@@ -73,12 +75,14 @@ class FakeProcessor:
     image_processor = FakeImageProcessor()
 
     def __call__(self, **kwargs):
+        image_count = len(kwargs.get("images") or [])
+        image_grid_thw = torch.tensor([[1, 2 + idx, 3 + idx] for idx in range(image_count)])
         return FakeBatchFeature(
             {
                 "input_ids": torch.tensor([[1, 2]]),
                 "attention_mask": torch.tensor([[1, 1]]),
-                "pixel_values": torch.ones(1, 3),
-                "image_grid_thw": torch.tensor([[1, 2, 3]]),
+                "pixel_values": torch.ones(image_count, 3),
+                "image_grid_thw": image_grid_thw,
             }
         )
 
@@ -262,6 +266,59 @@ class TestDataParallelPPOActor(unittest.TestCase):
         self.assertIn("pixel_values", extracted)
         self.assertEqual(extracted["pixel_values"].shape[0], batch_size)
         self.assertTrue(torch.equal(extracted["image_grid_thw"], torch.tensor([[1, 2, 3], [1, 2, 3]])))
+
+    def test_extract_multi_modal_inputs_with_lazy_crop_refs(self):
+        """Test lazy multimodal rehydration loads crop paths from the actor microbatch."""
+        data = self._create_test_data_for_compute_log_prob()
+        batch_size = data.batch["responses"].shape[0]
+        multi_modal_inputs = np.array(
+            [
+                {
+                    "image_grid_thw": torch.tensor([[1, 2, 3], [1, 3, 4]]),
+                    "images_seqlens": torch.tensor([6, 12]),
+                }
+                for _ in range(batch_size)
+            ],
+            dtype=object,
+        )
+        raw_prompt = np.array([[{"role": "user", "content": "look"}] for _ in range(batch_size)], dtype=object)
+        actor = DataParallelPPOActor(
+            config=self.config,
+            actor_module=self.mock_model,
+            actor_optimizer=self.mock_optimizer,
+            tokenizer=FakeTokenizer(),
+            processor=FakeProcessor(),
+            dataset_cls=FakeDataset,
+            data_config={},
+            lazy_multi_modal_inputs_config={"enabled": True, "assert_metadata_match": True},
+        )
+
+        with TemporaryDirectory() as tmpdir:
+            crop_paths = []
+            for idx in range(batch_size):
+                crop_path = f"{tmpdir}/crop_{idx}.png"
+                Image.new("RGB", (8, 8), color="red").save(crop_path)
+                crop_paths.append([{"path": crop_path, "image_index": 1}])
+            crop_image_refs = np.empty(batch_size, dtype=object)
+            crop_image_refs[:] = crop_paths
+
+            extracted = actor._extract_multi_modal_inputs(
+                {
+                    "input_ids": data.batch["input_ids"],
+                    "multi_modal_inputs": multi_modal_inputs,
+                    "raw_prompt": raw_prompt,
+                    "crop_image_refs": crop_image_refs,
+                }
+            )
+
+        self.assertIn("pixel_values", extracted)
+        self.assertEqual(extracted["pixel_values"].shape[0], batch_size * 2)
+        self.assertTrue(
+            torch.equal(
+                extracted["image_grid_thw"],
+                torch.tensor([[1, 2, 3], [1, 3, 4], [1, 2, 3], [1, 3, 4]]),
+            )
+        )
 
     def test_compute_log_prob_without_entropy(self):
         """Test compute_log_prob method without entropy calculation"""

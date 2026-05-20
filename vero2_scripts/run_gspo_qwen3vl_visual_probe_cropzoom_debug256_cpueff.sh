@@ -3,10 +3,10 @@
 #SBATCH --partition=pli-c
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:4
-#SBATCH --cpus-per-task=24
-#SBATCH --mem=800G
-#SBATCH --time=1:00:00
+#SBATCH --gres=gpu:8
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=968G
+#SBATCH --time=24:00:00
 #SBATCH --output=slurm/output/%x_%j.log
 #SBATCH --error=slurm/error/%x_%j.log
 
@@ -18,7 +18,7 @@
 ##SBATCH --cpus-per-task=24
 ##SBATCH --mem=800G
 ##SBATCH --constraint=gpu80
-##SBATCH --time=1:00:00
+##SBATCH --time=24:00:00
 ##SBATCH --output=slurm/output/%x_%j.log
 ##SBATCH --error=slurm/error/%x_%j.log
 
@@ -42,14 +42,14 @@ if [ "$#" -gt 0 ] && [[ "$1" != -* ]]; then
 fi
 HYDRA_ARGS=("$@")
 
-DATE_TIME="20260420_155518"
+DATE_TIME="20260420_155518_cpueff"
 NUM_GPUS="${NUM_GPUS:-${SLURM_GPUS_ON_NODE:-8}}"
 DEBUG_DATA="/scratch/gpfs/ZHUANGL/gs1693/vero2_datasets/train_rl_datasets/chart_search_counting_visual_probe_train_debug256.verl.jsonl"
 
 ALGORITHM_TAG="${ALGORITHM_TAG:-GSPO_fp16_math_verify}"
 TRAINER_EXPERIMENT_SUFFIX="${TRAINER_EXPERIMENT_SUFFIX:-chart_qwen3vl_visual_probe_cropzoom_debug256}"
 TRAINER_EXPERIMENT_NAME="${TRAINER_EXPERIMENT_NAME:-${ALGORITHM_TAG}_${TRAINER_EXPERIMENT_SUFFIX}_${DATE_TIME}}"
-TRAINER_PROJECT_NAME="${TRAINER_PROJECT_NAME:-verl}"
+TRAINER_PROJECT_NAME="${TRAINER_PROJECT_NAME:-verl_vero2}"
 
 DEBUG_LOGGING_ENABLED=0
 case "${VERO2_COMPREHENSIVE_DEBUG_LOGGING:-0}" in
@@ -73,6 +73,10 @@ export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
 export HF_HUB_DISABLE_TELEMETRY="${HF_HUB_DISABLE_TELEMETRY:-1}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
+if [ -z "${VERO2_CROP_CACHE_ROOT:-}" ]; then
+  CROP_CACHE_RUN_ID="${SLURM_JOB_ID:-pid_$$}"
+  export VERO2_CROP_CACHE_ROOT="/tmp/${USER:-unknown}/vero2_crop_cache/${CROP_CACHE_RUN_ID}"
+fi
 
 LOCAL_NO_PROXY="localhost,127.0.0.1,::1"
 export NO_PROXY="${NO_PROXY:+${NO_PROXY},}${LOCAL_NO_PROXY}"
@@ -111,6 +115,16 @@ if [ "$DEBUG_LOGGING_ENABLED" = "1" ]; then
   if [ "$HAS_DEBUG_OVERRIDE" = "0" ]; then
     HYDRA_ARGS=("trainer.comprehensive_debug_logging.enabled=true" "${HYDRA_ARGS[@]}")
   fi
+  HAS_GPU_DEBUG_OVERRIDE=0
+  for arg in "${HYDRA_ARGS[@]}"; do
+    if [[ "$arg" == trainer.comprehensive_debug_logging.gpu_memory_logging.enabled=* ]]; then
+      HAS_GPU_DEBUG_OVERRIDE=1
+      break
+    fi
+  done
+  if [ "$HAS_GPU_DEBUG_OVERRIDE" = "0" ]; then
+    HYDRA_ARGS=("trainer.comprehensive_debug_logging.gpu_memory_logging.enabled=true" "${HYDRA_ARGS[@]}")
+  fi
   HYDRA_ARGS=("trainer.comprehensive_debug_logging.dir=$DEBUG_LOG_DIR" "${HYDRA_ARGS[@]}")
 fi
 
@@ -123,7 +137,7 @@ printf 'HYDRA_ARGS:'; printf ' %q' "${HYDRA_ARGS[@]}"; printf '\n'
 
 python3 -m verl.trainer.main_ppo \
   --config-path="$VERL_ROOT/vero2_scripts/config" \
-  --config-name=gspo_chart_qwen3vl_visual_probe_cropzoom_debug256 \
+  --config-name=gspo_chart_qwen3vl_visual_probe_cropzoom_debug256_cpueff \
   trainer.project_name="$TRAINER_PROJECT_NAME" \
   trainer.experiment_name="$TRAINER_EXPERIMENT_NAME" \
   trainer.n_gpus_per_node="$NUM_GPUS" \
