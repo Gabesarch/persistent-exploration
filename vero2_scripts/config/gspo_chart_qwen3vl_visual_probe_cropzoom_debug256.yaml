@@ -307,9 +307,11 @@ trainer:
   use_legacy_worker_impl: auto
   default_local_dir: ${oc.env:SAVE_PATH}/checkpoints/${trainer.project_name}/${trainer.experiment_name}
   validation_data_dir: ${trainer.default_local_dir}/validation_data
+  save_validation_crops: true
   comprehensive_debug_logging:
     enabled: true
     dir: ${trainer.default_local_dir}/debug_logs
+    log_every_n_steps: 5
     save_cropped_images: true
     save_source_images: false
     max_text_chars: null

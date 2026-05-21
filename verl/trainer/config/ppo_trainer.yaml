@@ -139,10 +139,14 @@ trainer:
   # Directory for logging validation data; no dump if null
   validation_data_dir: null
 
+  # Copy validation crop-cache images into validation_data_dir and include refs in JSONL dumps
+  save_validation_crops: false
+
   # Comprehensive per-sample debug logs and artifacts under the checkpoint directory.
   comprehensive_debug_logging:
     enabled: false
     dir: ${trainer.default_local_dir}/debug_logs
+    log_every_n_steps: 1
     save_cropped_images: true
     save_source_images: false
     max_text_chars: null

@@ -17,7 +17,20 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+from omegaconf import OmegaConf
+
+from verl.utils.crop_cache import CROP_IMAGE_REFS_KEY
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+
+
+class _FakeBatch:
+    def __init__(self, non_tensor_batch, batch_size):
+        self.non_tensor_batch = non_tensor_batch
+        self._batch_size = batch_size
+
+    def __len__(self):
+        return self._batch_size
 
 
 class TestRayTrainerValidationDumpOnCPU(unittest.TestCase):
@@ -25,6 +38,9 @@ class TestRayTrainerValidationDumpOnCPU(unittest.TestCase):
         self.trainer = RayPPOTrainer.__new__(RayPPOTrainer)
         self.trainer.global_steps = 7
         self.trainer.image_key = None
+        self.trainer.comprehensive_debug_options = {"max_text_chars": None}
+        self.trainer.config = OmegaConf.create({"trainer": {"save_validation_crops": False}})
+        self.trainer._warned_save_validation_crops_without_dir = False
 
     def _read_dump(self, dump_dir: str):
         dump_path = Path(dump_dir) / "7.jsonl"
@@ -100,6 +116,63 @@ class TestRayTrainerValidationDumpOnCPU(unittest.TestCase):
             self.assertIn("frames", entry)
             self.assertNotIn("images", entry)
             self.assertEqual(entry["frames"], "frame_a.png")
+
+    def test_dump_generations_with_crop_refs_includes_refs(self):
+        crop_refs = [[{"path": "crops/step_7/sample_a/crop_0.png", "bbox_2d": [1, 2, 3, 4]}]]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.trainer._dump_generations(
+                inputs=["prompt"],
+                outputs=["answer"],
+                gts=["gt"],
+                scores=[1.0],
+                reward_extra_infos_dict={"reward": [1.0]},
+                dump_path=tmpdir,
+                crop_image_refs=crop_refs,
+            )
+
+            [entry] = self._read_dump(tmpdir)
+            self.assertEqual(entry[CROP_IMAGE_REFS_KEY], crop_refs[0])
+
+    def test_copy_validation_crop_refs_for_batch_copies_and_rewrites_refs(self):
+        self.trainer.config = OmegaConf.create({"trainer": {"save_validation_crops": True}})
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            source_crop = tmpdir_path / "cache" / "crop.png"
+            source_crop.parent.mkdir()
+            source_crop.write_bytes(b"crop-bytes")
+
+            crop_refs = np.empty(2, dtype=object)
+            crop_refs[0] = [
+                {
+                    "path": str(source_crop),
+                    "order": 2,
+                    "bbox_2d": [1, 2, 3, 4],
+                    "tool_name": "image_zoom_in_tool",
+                }
+            ]
+            crop_refs[1] = [{"path": str(tmpdir_path / "cache" / "missing.png"), "order": 0}]
+            batch = _FakeBatch(
+                {
+                    CROP_IMAGE_REFS_KEY: crop_refs,
+                    "uid": np.array(["sample/a", "sample_b"], dtype=object),
+                },
+                batch_size=2,
+            )
+
+            copied_refs = self.trainer._copy_validation_crop_refs_for_batch(batch, str(tmpdir_path / "validation"))
+
+            self.assertEqual(len(copied_refs), 2)
+            self.assertEqual(len(copied_refs[0]), 1)
+            self.assertEqual(copied_refs[0][0]["source_path"], str(source_crop))
+            self.assertEqual(copied_refs[0][0]["step"], 7)
+            self.assertEqual(copied_refs[0][0]["bbox_2d"], [1, 2, 3, 4])
+            copied_path = Path(copied_refs[0][0]["path"])
+            self.assertTrue(copied_path.exists())
+            self.assertEqual(copied_path.read_bytes(), b"crop-bytes")
+            self.assertIn("validation/crops/step_7/sample_sample_a/crop_2.png", copied_path.as_posix())
+            self.assertEqual(copied_refs[1], [])
 
     def test_collect_image_references_prefers_image_key_then_falls_back(self):
         self.trainer.image_key = "frames"

@@ -74,6 +74,28 @@ def is_enabled(config: Any) -> bool:
     return bool(_debug_select(config, "enabled", False))
 
 
+def get_log_every_n_steps(config: Any) -> int:
+    raw_value = _debug_select(config, "log_every_n_steps", 1)
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        return 1
+    return max(1, value)
+
+
+def should_log_step(config: Any, global_step: int | None = None) -> bool:
+    if not is_enabled(config):
+        return False
+    interval = get_log_every_n_steps(config)
+    if interval <= 1 or global_step is None:
+        return True
+    try:
+        step = int(global_step)
+    except (TypeError, ValueError):
+        return True
+    return step % interval == 0
+
+
 def get_debug_dir(config: Any) -> str | None:
     debug_dir = _debug_select(config, "dir", None)
     if debug_dir:
@@ -88,6 +110,7 @@ def get_debug_options(config: Any) -> dict[str, Any]:
     return {
         "enabled": is_enabled(config),
         "dir": get_debug_dir(config),
+        "log_every_n_steps": get_log_every_n_steps(config),
         "save_cropped_images": bool(_debug_select(config, "save_cropped_images", True)),
         "save_source_images": bool(_debug_select(config, "save_source_images", False)),
         "max_text_chars": _debug_select(config, "max_text_chars", None),
@@ -380,6 +403,8 @@ def log_gpu_memory_event(
     try:
         options = get_gpu_memory_logging_options(config)
         if not options["enabled"]:
+            return
+        if not should_log_step(config, global_step):
             return
         if worker and not options["log_worker_stages"]:
             return

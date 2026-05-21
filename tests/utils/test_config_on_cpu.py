@@ -14,6 +14,7 @@
 
 import unittest
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from omegaconf import OmegaConf
 
@@ -69,6 +70,12 @@ class TestConfigOnCPU(unittest.TestCase):
         self.assertEqual(cfg.model.activation, "relu")
         assert isinstance(cfg, TestTrainConfig)
         assert isinstance(cfg.model, TestDataclass)
+
+    def test_ppo_trainer_save_validation_crops_defaults_false(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        cfg = OmegaConf.load(repo_root / "verl" / "trainer" / "config" / "ppo_trainer.yaml")
+        self.assertFalse(cfg.trainer.save_validation_crops)
+        self.assertEqual(cfg.trainer.comprehensive_debug_logging.log_every_n_steps, 1)
 
 
 class TestPrintCfgCommand(unittest.TestCase):

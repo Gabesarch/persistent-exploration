@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import shutil
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -61,13 +62,19 @@ from verl.trainer.ppo.utils import (
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.crop_cache import cleanup_crop_cache_for_batch, crop_cache_cleanup_enabled
+from verl.utils.crop_cache import (
+    CROP_IMAGE_REFS_KEY,
+    cleanup_crop_cache_for_batch,
+    crop_cache_cleanup_enabled,
+    normalize_crop_image_refs,
+)
 from verl.utils.debug import marked_timer
 from verl.utils.debug.comprehensive_logging import (
     get_debug_options,
     gpu_memory_context_from_batch,
     gpu_memory_stage,
     log_gpu_memory_event,
+    should_log_step,
     to_jsonable,
 )
 from verl.utils.import_utils import load_class_from_fqn
@@ -312,6 +319,7 @@ class RayPPOTrainer:
         self.comprehensive_debug_options = get_debug_options(self.config)
         self.image_key = None
         self._esi_force_saved = False
+        self._warned_save_validation_crops_without_dir = False
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
@@ -523,6 +531,7 @@ class RayPPOTrainer:
         dump_path,
         image_paths=None,
         extra_payloads=None,
+        crop_image_refs=None,
     ):
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
@@ -546,6 +555,8 @@ class RayPPOTrainer:
                 base_data[self.image_key or "images"] = normalized_image_paths
         if extra_payloads is not None and len(extra_payloads) == n:
             base_data["debug"] = extra_payloads
+        if crop_image_refs is not None and len(crop_image_refs) == n:
+            base_data[CROP_IMAGE_REFS_KEY] = crop_image_refs
 
         lines = []
         for i in range(n):
@@ -562,8 +573,70 @@ class RayPPOTrainer:
 
         print(f"Dumped generations to {filename}")
 
-    def _debug_enabled(self) -> bool:
-        return bool(self.comprehensive_debug_options.get("enabled"))
+    @staticmethod
+    def _safe_validation_crop_name(value, fallback: int) -> str:
+        if value is None:
+            value = fallback
+        text = str(value)
+        safe = "".join(char if char.isalnum() or char in ("-", "_") else "_" for char in text)
+        return safe.strip("_") or str(fallback)
+
+    def _copy_validation_crop_refs_for_batch(
+        self, batch: DataProto, validation_data_dir: str | None
+    ) -> list[list[dict]]:
+        """Copy validation crop-cache images into validation_data_dir and return rewritten refs."""
+        batch_size = len(batch)
+        if not self.config.trainer.get("save_validation_crops", False):
+            return [[] for _ in range(batch_size)]
+        if not validation_data_dir:
+            if not getattr(self, "_warned_save_validation_crops_without_dir", False):
+                print("Warning: trainer.save_validation_crops=true but trainer.validation_data_dir is unset; skipping.")
+                self._warned_save_validation_crops_without_dir = True
+            return [[] for _ in range(batch_size)]
+
+        crop_refs_by_sample = batch.non_tensor_batch.get(CROP_IMAGE_REFS_KEY)
+        if crop_refs_by_sample is None:
+            return [[] for _ in range(batch_size)]
+
+        uids = batch.non_tensor_batch.get("uid")
+        indices = batch.non_tensor_batch.get("index")
+        copied_refs_by_sample = []
+        for sample_offset in range(batch_size):
+            sample_refs = normalize_crop_image_refs(crop_refs_by_sample[sample_offset])
+            if uids is not None:
+                sample_id = uids[sample_offset]
+            elif indices is not None:
+                sample_id = indices[sample_offset]
+            else:
+                sample_id = None
+            sample_dir_name = f"sample_{self._safe_validation_crop_name(sample_id, sample_offset)}"
+            sample_dir = os.path.join(validation_data_dir, "crops", f"step_{self.global_steps}", sample_dir_name)
+            copied_refs = []
+            for ref_offset, crop_ref in enumerate(sample_refs):
+                source_path = crop_ref.get("path")
+                if not source_path or not os.path.exists(source_path):
+                    print(f"Warning: validation crop image missing, skipping: {source_path}")
+                    continue
+                order = crop_ref.get("order", ref_offset)
+                dest_path = os.path.join(sample_dir, f"crop_{order}.png")
+                try:
+                    os.makedirs(sample_dir, exist_ok=True)
+                    shutil.copy2(source_path, dest_path)
+                except OSError as exc:
+                    print(f"Warning: failed to copy validation crop image {source_path}: {exc}")
+                    continue
+                copied_ref = dict(crop_ref)
+                copied_ref["source_path"] = source_path
+                copied_ref["path"] = dest_path
+                copied_ref["step"] = self.global_steps
+                copied_refs.append(copied_ref)
+            copied_refs_by_sample.append(copied_refs)
+        return copied_refs_by_sample
+
+    def _debug_enabled(self, global_step: int | None = None) -> bool:
+        if global_step is None:
+            global_step = getattr(self, "global_steps", None)
+        return bool(self.comprehensive_debug_options.get("enabled") and should_log_step(self.config, global_step))
 
     def _collect_debug_payloads(self, batch: DataProto, reward_extra_infos_dict: dict | None = None) -> list[dict]:
         payloads = []
@@ -709,6 +782,7 @@ class RayPPOTrainer:
         sample_turns = []
         sample_uids = []
         sample_debug_payloads = []
+        sample_validation_crop_refs = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -788,6 +862,12 @@ class RayPPOTrainer:
                 sample_debug_payloads.extend(
                     self._collect_debug_payloads(test_batch, reward_extra_infos_dict=reward_extra_info)
                 )
+            if self.config.trainer.get("save_validation_crops", False):
+                sample_validation_crop_refs.extend(
+                    self._copy_validation_crop_refs_for_batch(
+                        test_batch, self.config.trainer.get("validation_data_dir", None)
+                    )
+                )
 
             reward_extra_infos_dict["reward"].extend(scores)
             for key, values in reward_extra_info.items():
@@ -819,6 +899,7 @@ class RayPPOTrainer:
                 dump_path=val_data_dir,
                 image_paths=sample_image_paths,
                 extra_payloads=sample_debug_payloads if self._debug_enabled() else None,
+                crop_image_refs=sample_validation_crop_refs if any(sample_validation_crop_refs) else None,
             )
 
         for key_info, lst in reward_extra_infos_dict.items():

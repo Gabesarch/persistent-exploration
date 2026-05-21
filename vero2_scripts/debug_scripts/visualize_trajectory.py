@@ -22,6 +22,8 @@ EVENT_ORDER = {
     "sample_final": 4,
 }
 
+SUCCESS_SCORE_THRESHOLD = 1.0
+
 
 def read_jsonl(path: Path):
     with path.open("r", encoding="utf-8") as f:
@@ -142,22 +144,100 @@ def find_sample(
     raise SystemExit(f"Unsupported --select value: {select}")
 
 
+def read_reward_assignments(reward_path: Path) -> dict[str, dict[str, Any]]:
+    if not reward_path.exists():
+        return {}
+    rewards: dict[str, dict[str, Any]] = {}
+    for row in read_jsonl(reward_path):
+        request_id = row.get("request_id")
+        if request_id:
+            rewards[str(request_id)] = row
+    return rewards
+
+
+def reward_score(reward: dict[str, Any] | None) -> float | None:
+    if not reward:
+        return None
+    value = reward.get("score", reward.get("final_reward"))
+    if value is None:
+        raw_result = reward.get("raw_result") or reward.get("reward_extra_info") or {}
+        value = raw_result.get("score") if isinstance(raw_result, dict) else None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def reward_extra(reward: dict[str, Any] | None, key: str) -> Any:
+    if not reward:
+        return None
+    if key in reward:
+        return reward.get(key)
+    for field in ("raw_result", "reward_extra_info"):
+        values = reward.get(field)
+        if isinstance(values, dict) and key in values:
+            return values.get(key)
+    return None
+
+
+def reward_outcome(reward: dict[str, Any] | None) -> str | None:
+    score = reward_score(reward)
+    if score is None:
+        return None
+    return "successful" if score >= SUCCESS_SCORE_THRESHOLD else "incorrect"
+
+
+def attach_reward_assignments(samples: list[dict[str, Any]], rewards: dict[str, dict[str, Any]]) -> None:
+    for sample in samples:
+        request_id = sample.get("request_id")
+        if request_id and str(request_id) in rewards:
+            sample["_reward_assignment"] = rewards[str(request_id)]
+
+
+def filter_by_outcome(samples: list[dict[str, Any]], outcome: str) -> list[dict[str, Any]]:
+    if outcome == "all":
+        return samples
+    return [
+        sample
+        for sample in samples
+        if reward_outcome(sample.get("_reward_assignment")) == outcome
+    ]
+
+
 def find_samples(
     sample_path: Path,
+    reward_path: Path | None,
     request_id: str | None,
     sample_index: int | None,
     rollout_n: int | None,
     select: str,
     num_samples: int,
+    outcome: str,
 ) -> list[dict[str, Any]]:
     samples = [r for r in read_jsonl(sample_path) if r.get("event") == "sample_final"]
     if not samples:
         raise SystemExit(f"No sample_final records found in {sample_path}")
+    total_samples = len(samples)
+
+    rewards: dict[str, dict[str, Any]] = {}
+    if reward_path is not None and (outcome != "all" or reward_path.exists()):
+        rewards = read_reward_assignments(reward_path)
+        attach_reward_assignments(samples, rewards)
+    if outcome != "all":
+        if reward_path is None or not reward_path.exists():
+            raise SystemExit(f"--outcome={outcome} requires reward assignments, but {reward_path} is missing")
+        samples = filter_by_outcome(samples, outcome)
+        if not samples:
+            raise SystemExit(
+                f"No {outcome} samples found in {sample_path}; "
+                f"checked {total_samples} samples and {len(rewards)} reward assignments"
+            )
 
     if request_id:
         matches = [sample for sample in samples if sample.get("request_id") == request_id]
         if not matches:
-            raise SystemExit(f"request_id not found: {request_id}")
+            suffix = f" with outcome={outcome}" if outcome != "all" else ""
+            raise SystemExit(f"request_id not found{suffix}: {request_id}")
         return matches[:1]
 
     if sample_index is not None:
@@ -170,7 +250,8 @@ def find_samples(
         if rollout_n is not None:
             matches = [s for s in matches if s.get("trajectory", {}).get("rollout_n") == rollout_n]
         if not matches:
-            raise SystemExit(f"No sample found for sample_index={sample_index}, rollout_n={rollout_n}")
+            suffix = f", outcome={outcome}" if outcome != "all" else ""
+            raise SystemExit(f"No sample found for sample_index={sample_index}, rollout_n={rollout_n}{suffix}")
         return sorted(matches, key=sample_score, reverse=True)[: max(1, num_samples)]
 
     if select == "first":
@@ -198,19 +279,33 @@ def sample_score(sample: dict[str, Any]) -> tuple[int, int, int]:
 
 
 def events_for_request(agent_path: Path, request_id: str) -> list[dict[str, Any]]:
-    if not agent_path.exists():
-        return []
-    events = []
+    return events_for_requests(agent_path, [request_id]).get(request_id, [])
+
+
+def events_for_requests(agent_path: Path, request_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
+    events_by_request_id = {request_id: [] for request_id in request_ids}
+    if not agent_path.exists() or not request_ids:
+        return events_by_request_id
+
+    wanted = set(request_ids)
     for seq, event in enumerate(read_jsonl(agent_path)):
-        if event.get("request_id") == request_id:
+        request_id = str(event.get("request_id"))
+        if request_id in wanted:
             event["_seq"] = seq
-            events.append(event)
-    return sorted(events, key=lambda e: (e.get("assistant_turn") or 0, EVENT_ORDER.get(e.get("event"), 99), e["_seq"]))
+            events_by_request_id[request_id].append(event)
+
+    for request_id, events in events_by_request_id.items():
+        events_by_request_id[request_id] = sorted(
+            events,
+            key=lambda e: (e.get("assistant_turn") or 0, EVENT_ORDER.get(e.get("event"), 99), e["_seq"]),
+        )
+    return events_by_request_id
 
 
 def render_meta(sample: dict[str, Any], debug_dir: Path) -> str:
     extra = sample.get("extra_info") or {}
     traj = sample.get("trajectory") or {}
+    reward = sample.get("_reward_assignment")
     rows = [
         ("request_id", sample.get("request_id")),
         ("sample index", sample.get("index") or traj.get("sample_index")),
@@ -222,6 +317,12 @@ def render_meta(sample: dict[str, Any], debug_dir: Path) -> str:
         ("answer", extra.get("answer")),
         ("num_turns", sample.get("num_turns")),
         ("tool_calls", len(sample.get("tool_rewards") or [])),
+        ("reward_outcome", reward_outcome(reward)),
+        ("score", reward_score(reward)),
+        ("format", reward_extra(reward, "format")),
+        ("accuracy", reward_extra(reward, "accuracy")),
+        ("tool_call_bonus", reward_extra(reward, "tool_call_bonus")),
+        ("tool_call_count", reward_extra(reward, "tool_call_count")),
         ("debug_dir", str(debug_dir)),
     ]
     body = "\n".join(
@@ -386,10 +487,16 @@ def build_multi_sample_html(
         sample_index = sample.get("index") or traj.get("sample_index")
         rollout_n = traj.get("rollout_n")
         tool_count = len(sample.get("tool_rewards") or [])
+        reward = sample.get("_reward_assignment")
+        score = reward_score(reward)
+        outcome = reward_outcome(reward)
+        reward_label = ""
+        if score is not None:
+            reward_label = f", {outcome}, score {score:g}"
         nav_items.append(
             f'<li><a href="#{anchor}">Sample {idx}: '
             f'{escape(str(sample_index))} / rollout {escape(str(rollout_n))} '
-            f'({tool_count} tools)</a></li>'
+            f'({tool_count} tools{escape(reward_label)})</a></li>'
         )
         sample_html = build_html(
             sample,
@@ -451,6 +558,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-text-chars", type=int, default=0, help="Truncate long text blocks; 0 means no truncation")
     parser.add_argument("--num-samples", type=int, default=1, help="Number of samples to render when not selecting an exact request")
     parser.add_argument("--embed-images", action="store_true", help="Embed images as base64 data URIs; produces large HTML")
+    parser.add_argument(
+        "--outcome",
+        choices=("all", "successful", "incorrect"),
+        default="all",
+        help=(
+            "Filter by reward outcome using reward_assignments.jsonl. "
+            "successful means score >= 1.0; incorrect means score < 1.0."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -459,21 +575,22 @@ def main() -> None:
     debug_dir = args.debug_log_dir.expanduser().resolve()
     sample_path = debug_dir / "sample_traces.jsonl"
     agent_path = debug_dir / "agent_events.jsonl"
+    reward_path = debug_dir / "reward_assignments.jsonl"
     if not sample_path.exists():
         raise SystemExit(f"Missing {sample_path}")
 
     samples = find_samples(
         sample_path,
+        reward_path,
         args.request_id,
         args.sample_index,
         args.rollout_n,
         args.select,
         args.num_samples,
+        args.outcome,
     )
-    events_by_request_id = {
-        str(sample.get("request_id")): events_for_request(agent_path, str(sample.get("request_id")))
-        for sample in samples
-    }
+    request_ids = [str(sample.get("request_id")) for sample in samples]
+    events_by_request_id = events_for_requests(agent_path, request_ids)
 
     output = args.output
     if output is None:
@@ -489,12 +606,19 @@ def main() -> None:
 
     print(f"Wrote {output}")
     print(f"num_samples={len(samples)}")
+    print(f"outcome={args.outcome}")
     for sample in samples:
         request_id = str(sample.get("request_id"))
+        reward = sample.get("_reward_assignment")
         print(f"request_id={request_id}")
         print(f"sample_index={sample.get('index') or sample.get('trajectory', {}).get('sample_index')}")
         print(f"rollout_n={sample.get('trajectory', {}).get('rollout_n')}")
         print(f"tool_calls={len(sample.get('tool_rewards') or [])}")
+        if reward:
+            print(f"score={reward_score(reward)}")
+            print(f"reward_outcome={reward_outcome(reward)}")
+            print(f"format={reward_extra(reward, 'format')}")
+            print(f"accuracy={reward_extra(reward, 'accuracy')}")
 
 
 if __name__ == "__main__":

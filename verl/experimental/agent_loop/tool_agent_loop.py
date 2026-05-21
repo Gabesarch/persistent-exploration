@@ -39,6 +39,7 @@ from verl.utils.debug.comprehensive_logging import (
     get_debug_options,
     path_join,
     save_image,
+    should_log_step,
     to_jsonable,
 )
 from verl.utils.profiler import simple_timer
@@ -196,7 +197,9 @@ class ToolAgentLoop(AgentLoopBase):
             interaction=interaction,
             interaction_kwargs=interaction_kwargs,
         )
-        if self.debug_options["enabled"]:
+        debug_enabled = self._debug_enabled_for_trajectory(debug_trajectory)
+        agent_data.debug_logging_enabled = debug_enabled
+        if debug_enabled:
             agent_data.extra_fields["debug_trajectory"] = debug_trajectory
             await self._debug_log_sample_start(agent_data, kwargs, debug_trajectory, sampling_params)
 
@@ -245,7 +248,7 @@ class ToolAgentLoop(AgentLoopBase):
                 CROP_IMAGE_REFS_KEY: agent_data.crop_image_refs,
             }
         )
-        if self.debug_options["enabled"]:
+        if debug_enabled:
             await self._debug_log_sample_final(output, agent_data, kwargs, debug_trajectory)
         return output
 
@@ -299,7 +302,7 @@ class ToolAgentLoop(AgentLoopBase):
         if output.routed_experts is not None:
             agent_data.routed_experts = output.routed_experts
 
-        if self.debug_options["enabled"]:
+        if self._debug_enabled_for_agent(agent_data):
             assistant_message = await self.loop.run_in_executor(
                 None, lambda: self.tokenizer.decode(agent_data.response_ids, skip_special_tokens=True)
             )
@@ -359,7 +362,7 @@ class ToolAgentLoop(AgentLoopBase):
         # Process tool responses and update multi_modal_data
         # Removed: agent_data.new_images_this_turn = []
         for tool_call, (tool_response, tool_reward, tool_info) in zip(active_tool_calls, responses, strict=False):
-            if self.debug_options["enabled"]:
+            if self._debug_enabled_for_agent(agent_data):
                 event = {
                     "event": "tool_response",
                     "request_id": agent_data.request_id,
@@ -523,7 +526,7 @@ class ToolAgentLoop(AgentLoopBase):
             # TODO: append malformed tool_call to the prompt: invalid function name or arguments
             tool_name = tool_call.name
             tool_args = json.loads(tool_call.arguments)
-            if self.debug_options["enabled"]:
+            if self._debug_enabled_for_agent(agent_data):
                 event = {
                     "event": "tool_call",
                     "request_id": agent_data.request_id,
@@ -540,9 +543,9 @@ class ToolAgentLoop(AgentLoopBase):
             tool_execution_response, tool_reward, res = await tool.execute(
                 instance_id, tool_args, agent_data=agent_data
             )
-            if self.debug_options["enabled"]:
+            if self._debug_enabled_for_agent(agent_data):
                 res.setdefault("debug_context", agent_data.extra_fields.get("debug_trajectory", {}))
-            if self.debug_options["enabled"]:
+            if self._debug_enabled_for_agent(agent_data):
                 self._debug_save_tool_images(
                     agent_data=agent_data,
                     tool_response=tool_execution_response,
@@ -589,6 +592,13 @@ class ToolAgentLoop(AgentLoopBase):
 
     def _debug_dir(self) -> str | None:
         return self.debug_options.get("dir")
+
+    def _debug_enabled_for_trajectory(self, trajectory: dict[str, Any]) -> bool:
+        return bool(self.debug_options.get("enabled") and should_log_step(self.config, trajectory.get("step")))
+
+    @staticmethod
+    def _debug_enabled_for_agent(agent_data: AgentData) -> bool:
+        return bool(getattr(agent_data, "debug_logging_enabled", False))
 
     def _debug_max_text_chars(self) -> int | None:
         return self.debug_options.get("max_text_chars")

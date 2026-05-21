@@ -12,6 +12,7 @@ from verl.utils.debug.comprehensive_logging import (
     gpu_memory_stage,
     log_gpu_memory_event,
     save_image,
+    should_log_step,
     to_jsonable,
     write_config_yaml,
     write_json,
@@ -56,6 +57,7 @@ def test_comprehensive_debug_logging_writes_jsonl_json_yaml_and_images(tmp_path)
 
     assert debug_dir == str(tmp_path / "ckpt" / "debug_logs")
     assert options["enabled"] is True
+    assert options["log_every_n_steps"] == 1
 
     jsonl_path = tmp_path / "ckpt" / "debug_logs" / "events.jsonl"
     append_jsonl(jsonl_path, {"event": "ok", "value": np.int64(3)})
@@ -72,6 +74,26 @@ def test_comprehensive_debug_logging_writes_jsonl_json_yaml_and_images(tmp_path)
     image_path = tmp_path / "ckpt" / "debug_logs" / "image.png"
     assert save_image(Image.new("RGB", (4, 4), color="black"), image_path) == str(image_path)
     assert image_path.exists()
+
+
+def test_comprehensive_debug_logging_step_interval(tmp_path):
+    config = OmegaConf.create(
+        {
+            "trainer": {
+                "default_local_dir": str(tmp_path / "ckpt"),
+                "comprehensive_debug_logging": {
+                    "enabled": True,
+                    "dir": str(tmp_path / "ckpt" / "debug_logs"),
+                    "log_every_n_steps": 4,
+                },
+            }
+        }
+    )
+
+    assert get_debug_options(config)["log_every_n_steps"] == 4
+    assert should_log_step(config, 8) is True
+    assert should_log_step(config, 9) is False
+    assert should_log_step(config, None) is True
 
 
 def test_gpu_memory_logging_options_and_jsonl_event_are_cpu_safe(tmp_path):
@@ -111,6 +133,31 @@ def test_gpu_memory_logging_options_and_jsonl_event_are_cpu_safe(tmp_path):
     assert "torch_cuda" in record
     assert "cpu_memory" in record
     assert "nvidia_smi" not in record
+
+
+def test_gpu_memory_logging_respects_step_interval(tmp_path):
+    config = OmegaConf.create(
+        {
+            "trainer": {
+                "default_local_dir": str(tmp_path / "ckpt"),
+                "comprehensive_debug_logging": {
+                    "enabled": True,
+                    "dir": str(tmp_path / "ckpt" / "debug_logs"),
+                    "log_every_n_steps": 4,
+                    "gpu_memory_logging": {
+                        "enabled": True,
+                        "log_nvidia_smi": False,
+                    },
+                },
+            }
+        }
+    )
+
+    log_gpu_memory_event(config, "unit_stage", "before", global_step=9)
+    assert not (tmp_path / "ckpt" / "debug_logs" / "gpu_memory_events.jsonl").exists()
+
+    log_gpu_memory_event(config, "unit_stage", "before", global_step=12)
+    assert (tmp_path / "ckpt" / "debug_logs" / "gpu_memory_events.jsonl").exists()
 
 
 def test_gpu_memory_stage_logs_exception_and_reraises(tmp_path):

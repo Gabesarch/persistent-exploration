@@ -17,7 +17,7 @@ import inspect
 from verl import DataProto
 from verl.experimental.reward_loop.reward_manager import register
 from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
-from verl.utils.debug.comprehensive_logging import append_jsonl, get_debug_options, path_join
+from verl.utils.debug.comprehensive_logging import append_jsonl, get_debug_options, path_join, should_log_step
 from verl.utils.reward_score import default_compute_score
 
 
@@ -146,10 +146,14 @@ class DAPORewardManager(RewardManagerBase):
         debug_dir = self.debug_options.get("dir")
         if not self.debug_options.get("enabled") or not debug_dir:
             return
+        global_step = self._extract_global_step(data_item)
+        if not should_log_step(self.config, global_step):
+            return
         reward_type = extra_info.get("reward_type") if isinstance(extra_info, dict) else None
         tolerance = extra_info.get("tolerance") if isinstance(extra_info, dict) else None
         record = {
             "event": "reward_assignment",
+            "global_step": global_step,
             "data_source": data_source,
             "uid": data_item.non_tensor_batch.get("uid"),
             "request_id": self._extract_request_id(data_item),
@@ -180,4 +184,13 @@ class DAPORewardManager(RewardManagerBase):
         tool_extra_fields = data_item.non_tensor_batch.get("tool_extra_fields")
         if isinstance(tool_extra_fields, dict):
             return tool_extra_fields.get("request_id")
+        return None
+
+    @staticmethod
+    def _extract_global_step(data_item) -> int | None:
+        for source in (getattr(data_item, "meta_info", None), getattr(data_item, "non_tensor_batch", None)):
+            if isinstance(source, dict):
+                value = source.get("global_steps")
+                if value is not None:
+                    return value
         return None
