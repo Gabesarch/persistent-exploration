@@ -16,7 +16,7 @@ from verl.utils.reward_score.math_verify_reward_type_boxed import (
     _number_list_reward,
     _numeric_reward,
 )
-from verl.utils.reward_score.text_normalization import normalize_text_for_match
+from verl.utils.reward_score.text_normalization import normalize_text_for_match, search_string_reward
 
 __all__ = [
     "format_reward",
@@ -351,7 +351,7 @@ def acc_reward(predict_str: str, ground_truth: str, use_boxed: bool = False, ext
         "number_list": _number_list_reward,
         "numeric": _numeric_reward,
         "counting": _short_string_reward,
-        "search": _short_string_reward,
+        "search": search_string_reward,
         "grounding": _grounding_reward,
     }
     handler = reward_handlers.get(reward_type)

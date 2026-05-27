@@ -171,7 +171,7 @@ actor_rollout_ref:
   actor:
     optim:
       lr: 1e-6
-      lr_warmup_steps: 40
+      lr_warmup_steps: 10
     ppo_mini_batch_size: 128
     ppo_micro_batch_size_per_gpu: 1
     ulysses_sequence_parallel_size: 1
@@ -217,8 +217,8 @@ actor_rollout_ref:
     multi_turn:
       enable: true
       tool_config_path: ${oc.env:VERL_ROOT}/vero2_scripts/config/tool_config/image_zoom_in_tool.yaml
-      max_assistant_turns: 6
-      max_user_turns: 5
+      max_assistant_turns: 11
+      max_user_turns: 10
       max_parallel_calls: 1
       max_tool_response_length: 256
       tool_response_truncate_side: middle
@@ -276,9 +276,9 @@ reward:
     path: ${oc.env:VERL_ROOT}/verl/utils/reward_score/math_verify_reward_type_multiturn_tool_calling_optional_think.py
     name: async_compute_score_from_data_source
     reward_kwargs:
-      format_score: 0.2
+      format_score: 0.1
       min_tool_calls_for_bonus: 1
-      tool_call_bonus: 0.05
+      tool_call_bonus: 0.1
   reward_kwargs:
     overlong_buffer_cfg:
       enable: true

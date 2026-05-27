@@ -7,8 +7,10 @@
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=968G
 #SBATCH --time=24:00:00
+#SBATCH --array=1-3%1
 #SBATCH --output=slurm/output/%x_%j.log
 #SBATCH --error=slurm/error/%x_%j.log
+#SBATCH --dependency=afterany:8565758
 
 ##SBATCH --job-name=crop_debug
 ##SBATCH --partition=gpu-test
@@ -42,22 +44,39 @@ if [ "$#" -gt 0 ] && [[ "$1" != -* ]]; then
 fi
 HYDRA_ARGS=("$@")
 
-DATE_TIME="${DATE_TIME:-$(date +%Y%m%d_%H%M%S)}"
+CHECKPOINT_DATE_TIME="${CHECKPOINT_DATE_TIME:-20260524_160610}"
 RUN_UNIQUE_ID="${RUN_UNIQUE_ID:-${SLURM_JOB_ID:-pid_$$}}"
 NUM_GPUS="${NUM_GPUS:-${SLURM_GPUS_ON_NODE:-8}}"
 DEBUG_DATA="/scratch/gpfs/ZHUANGL/gs1693/vero2_datasets/train_rl_datasets/chart_search_counting_visual_probe_train_debug256.verl.jsonl"
 
 ALGORITHM_TAG="${ALGORITHM_TAG:-GSPO_fp16_math_verify}"
 TRAINER_EXPERIMENT_SUFFIX="${TRAINER_EXPERIMENT_SUFFIX:-chart_qwen3vl_visual_probe_cropzoom_debug256}"
-TRAINER_EXPERIMENT_NAME="${TRAINER_EXPERIMENT_NAME:-${ALGORITHM_TAG}_${TRAINER_EXPERIMENT_SUFFIX}_${DATE_TIME}_${RUN_UNIQUE_ID}}"
+CHECKPOINT_EXPERIMENT_NAME="${CHECKPOINT_EXPERIMENT_NAME:-${ALGORITHM_TAG}_${TRAINER_EXPERIMENT_SUFFIX}_${CHECKPOINT_DATE_TIME}}"
+TRAINER_EXPERIMENT_NAME="${TRAINER_EXPERIMENT_NAME:-${CHECKPOINT_EXPERIMENT_NAME}_${RUN_UNIQUE_ID}}"
 TRAINER_PROJECT_NAME="${TRAINER_PROJECT_NAME:-vero2_verl}"
+TRAINER_DEFAULT_LOCAL_DIR="${TRAINER_DEFAULT_LOCAL_DIR:-${SAVE_PATH}/checkpoints/${TRAINER_PROJECT_NAME}/${CHECKPOINT_EXPERIMENT_NAME}}"
+LEGACY_CHECKPOINT_DIR_LINKED=""
+if [ ! -e "$TRAINER_DEFAULT_LOCAL_DIR" ]; then
+  LEGACY_CHECKPOINT_CANDIDATES=()
+  for candidate in "${TRAINER_DEFAULT_LOCAL_DIR}"_*; do
+    if [ -d "$candidate" ]; then
+      LEGACY_CHECKPOINT_CANDIDATES+=("$candidate")
+    fi
+  done
+  if [ "${#LEGACY_CHECKPOINT_CANDIDATES[@]}" -eq 1 ]; then
+    ln -s "${LEGACY_CHECKPOINT_CANDIDATES[0]}" "$TRAINER_DEFAULT_LOCAL_DIR" 2>/dev/null || true
+    if [ -L "$TRAINER_DEFAULT_LOCAL_DIR" ]; then
+      LEGACY_CHECKPOINT_DIR_LINKED="${LEGACY_CHECKPOINT_CANDIDATES[0]}"
+    fi
+  fi
+fi
 
 DEBUG_LOGGING_ENABLED=0
 case "${VERO2_COMPREHENSIVE_DEBUG_LOGGING:-0}" in
   1|true|TRUE|True|yes|YES|Yes) DEBUG_LOGGING_ENABLED=1 ;;
 esac
 
-DEBUG_LOG_DIR="${SAVE_PATH}/checkpoints/${TRAINER_PROJECT_NAME}/${TRAINER_EXPERIMENT_NAME}/debug_logs"
+DEBUG_LOG_DIR="${TRAINER_DEFAULT_LOCAL_DIR}/debug_logs"
 if [ "$DEBUG_LOGGING_ENABLED" = "1" ]; then
   mkdir -p "$DEBUG_LOG_DIR"
   LOG_FILE="${LOG_FILE:-$DEBUG_LOG_DIR/log.txt}"
@@ -132,6 +151,9 @@ fi
 echo "LOG_FILE=$LOG_FILE"
 echo "TRAINER_PROJECT_NAME=$TRAINER_PROJECT_NAME"
 echo "TRAINER_EXPERIMENT_NAME=$TRAINER_EXPERIMENT_NAME"
+echo "CHECKPOINT_EXPERIMENT_NAME=$CHECKPOINT_EXPERIMENT_NAME"
+echo "TRAINER_DEFAULT_LOCAL_DIR=$TRAINER_DEFAULT_LOCAL_DIR"
+echo "LEGACY_CHECKPOINT_DIR_LINKED=$LEGACY_CHECKPOINT_DIR_LINKED"
 echo "VERO2_COMPREHENSIVE_DEBUG_LOGGING=$DEBUG_LOGGING_ENABLED"
 echo "DEBUG_LOG_DIR=$DEBUG_LOG_DIR"
 printf 'HYDRA_ARGS:'; printf ' %q' "${HYDRA_ARGS[@]}"; printf '\n'
@@ -141,6 +163,7 @@ python3 -m verl.trainer.main_ppo \
   --config-name=gspo_chart_qwen3vl_visual_probe_cropzoom_debug256_cpueff \
   trainer.project_name="$TRAINER_PROJECT_NAME" \
   trainer.experiment_name="$TRAINER_EXPERIMENT_NAME" \
+  trainer.default_local_dir="$TRAINER_DEFAULT_LOCAL_DIR" \
   trainer.n_gpus_per_node="$NUM_GPUS" \
   actor_rollout_ref.actor.fsdp_config.fsdp_size="$NUM_GPUS" \
   "${HYDRA_ARGS[@]}"

@@ -18,7 +18,7 @@ from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig, Stri
 from sympy import Basic
 from sympy.matrices import MatrixBase
 from verl.utils.reward_score import click_reward, grounding_reward, instructions as instruction_lib
-from verl.utils.reward_score.text_normalization import normalize_text_for_match
+from verl.utils.reward_score.text_normalization import normalize_text_for_match, search_string_reward
 
 __all__ = [
     "format_reward",
@@ -1029,7 +1029,7 @@ def acc_reward(predict_str: str, ground_truth: str, use_boxed: bool = False, ext
         "numeric": _numeric_reward,
         "list_string_match": _list_string_match_reward,
         "counting": _string_match_reward,
-        "search": _string_match_reward,
+        "search": search_string_reward,
         "grounding": _grounding_reward,
         "clicking": _clicking_reward,
         "instruction_following_llm_judge": _instruction_following_reward,

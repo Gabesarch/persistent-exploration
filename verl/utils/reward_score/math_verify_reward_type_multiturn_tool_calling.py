@@ -14,6 +14,7 @@ from verl.utils.reward_score.math_verify_reward_type_fixations_no_think_point_bo
     _numeric_reward,
     _short_string_reward,
 )
+from verl.utils.reward_score.text_normalization import search_string_reward
 
 __all__ = [
     "format_reward",
@@ -153,7 +154,7 @@ def acc_reward(predict_str: str, ground_truth: str, use_boxed: bool = False, ext
         "number_list": _number_list_reward,
         "numeric": _numeric_reward,
         "counting": _short_string_reward,
-        "search": _short_string_reward,
+        "search": search_string_reward,
         "grounding": _grounding_reward,
     }
     handler = reward_handlers.get(reward_type)
