@@ -1,0 +1,782 @@
+{
+  "model": "qwen_vllm",
+  "num_samples": 5,
+  "exact_match": 0,
+  "accuracy": 0.0,
+  "avg_f1": 0.0,
+  "results": [
+    {
+      "id": 0,
+      "question": "Who won the award in the picture?",
+      "gt_answer": "Michio Sugeno",
+      "prediction": "Vladimir Vapnik",
+      "f1": 0.0,
+      "exact_match": false,
+      "num_tools": 2,
+      "tool_history": [
+        {
+          "tool": "web_search",
+          "args": {
+            "query": "2010 IEEE Frank Rosenblatt Award winner"
+          },
+          "result": {
+            "query": "2010 IEEE Frank Rosenblatt Award winner",
+            "num_results": 5,
+            "results": [
+              {
+                "title": "IEEE Frank Rosenblatt Award - Wikipedia",
+                "snippet": "The award may be presented to an individual, multiple recipients, or a team of up to three people. It is named for Frank Rosenblatt, creator of the perceptron. Recipients of this award receive a bronze medal, certificate, and honorarium.",
+                "url": "https://en.wikipedia.org/wiki/IEEE_Frank_Rosenblatt_Award"
+              },
+              {
+                "title": "List of IEEE awards - Wikipedia",
+                "snippet": "IEEE Frank Rosenblatt Award (for biologically and linguistically motivated computational paradigms such as neural networks )",
+                "url": "https://en.wikipedia.org/wiki/List_of_IEEE_awards"
+              },
+              {
+                "title": "IEEE Centennial Medal - Wikipedia",
+                "snippet": "The IEEE Centennial Medal was a medal minted and awarded in 1984 to persons deserving of special recognition for extraordinary achievement to ...",
+                "url": "https://en.wikipedia.org/wiki/IEEE_Centennial_Medal"
+              },
+              {
+                "title": "Vladimir Vapnik - Wikipedia",
+                "snippet": "He received the 2005 Gabor Award, 9 the 2008 Paris Kanellakis Award , the 2010 Neural Networks Pioneer Award, 10 the 2012 IEEE Frank Rosenblatt Award ...",
+                "url": "https://en.wikipedia.org/wiki/Vladimir_Vapnik"
+              },
+              {
+                "title": "Claude E. Shannon Award - Wikipedia",
+                "snippet": "Each Shannon Award winner is expected to present a Shannon Lecture at the following IEEE International Symposium on Information Theory.",
+                "url": "https://en.wikipedia.org/wiki/Shannon_Award"
+              }
+            ]
+          }
+        },
+        {
+          "tool": "visit_webpage",
+          "args": {
+            "url": "https://en.wikipedia.org/wiki/Vladimir_Vapnik"
+          },
+          "result": {
+            "url": "https://en.wikipedia.org/wiki/Vladimir_Vapnik",
+            "content": "Vladimir Vapnik\n\nمصرى\n\nবাংলা\n\nDeutsch\n\nEuskara\n\nفارسی\n\nFrançais\n\nעברית\n\nKreyòl ayisyen\n\nItaliano\n\n日本語\n\n한국어\n\nPortuguês\n\nРусский\n\nУкраїнська\n\nOʻzbekcha / ўзбекча\n\n中文\n\nEdit links\n\nFrom Wikipedia, the free encyclopedia\n\nRussian mathematician\n\nVladimir N. Vapnik Born ( 1936-12-06 ) December 6, 1936 (age 89) Tashkent, Uzbek SSR Alma mater Institute of Control Sciences, Russian Academy of Sciences Uzbek State University Known for Vapnik–Chervonenkis theory Vapnik–Chervonenkis dimension Support-vector machine Support-vector clustering algorithm Statistical learning theory Structural risk minimization Awards Kolmogorov Medal (2018) IEEE John von Neumann Medal (2017) Kampé de Fériet Award (2014) C&C Prize (2013) Benjamin Franklin Medal (2012) IEEE Frank Rosenblatt Award (2012) IEEE Neural Networks Pioneer Award (2010) Paris Kanellakis Award (2008) Fellow of the U.S. National Academy of Engineering (2006) Gabor Award, International Neural Network Society (2005) Alexander Humboldt Research Award (2003) Scientific career Fields Machine learning Statistics Institutions Facebook Artificial Intelligence Research Vencore Labs NEC Laboratories America Adaptive Systems Research\nDepartment, AT&T Bell Laboratories Royal Holloway, University of London Columbia University Doctoral advisor Alexander Lerner\n\nVladimir Naumovich Vapnik (Russian: Владимир Наумович Вапник; born 6 December 1936) is a statistician, researcher, and academic. He is one of the main developers of the Vapnik–Chervonenkis theory of statistical learning[1] and the co-inventor of the support-vector machine method and support-vector clustering algorithms.[2]\n\nEarly life and education\n\n[edit]\n\nVladimir Vapnik was born to a Jewish family[3] in the Soviet Union. He received his master's degree in mathematics from the Uzbek State University, Samarkand, Uzbek SSR in 1958 and Ph.D in statistics at the Institute of Control Sciences, Moscow in 1964. He worked at this institute from 1961 to 1990 and became Head of the Computer Science Research Department.[4]\n\nAcademic career\n\n[edit]\n\nAt the end of 1990, Vladimir Vapnik moved to the USA and joined the Adaptive Systems Research Department at AT&T Bell Labs in Holmdel, New Jersey. While at AT&T, Vapnik and his colleagues did work on the support-vector machine (SVM), which he also worked on much earlier before moving to the USA. They demonstrated its performance on a number of problems of interest to the machine learning community, including handwriting recognition. The group later became the Image Processing Research Department of AT&T Laboratories when AT&T spun off Lucent Technologies in 1996. In 2001, Asa Ben-Hur, David Horn, Hava Siegelmann and Vapnik developed Support-Vector Clustering,[5] which enabled the algorithm to categorize inputs without labels—becoming one of the most ubiquitous data clustering applications in use. Vapnik left AT&T in 2002 and joined NEC Laboratories in Princeton, New Jersey, where he worked in the Machine Learning group. He also holds a Professor of Computer Science and Statistics position at Royal Holloway, University of London since 1995, as well as a position as Professor of Computer Science at Columbia University, New York City since 2003.[6] As of February 1, 2021, he has an h-index of 86 and, overall, his publications have been cited 226597 times.[7] His book on \"The Nature of Statistical Learning Theory\" alone has been cited around 113000 times.[8]\n\nOn November 25, 2014, Vapnik joined Facebook Artificial Intelligence Research (now Meta AI),[9] where he is working alongside his longtime collaborators Jason Weston, Léon Bottou, Ronan Collobert, and Yann LeCun.[10] In 2016, he also joined Peraton Labs.\n\nHonors and awards\n\n[edit]\n\nVladimir Vapnik was inducted into the U.S. National Academy of Engineering in 2006. He received the 2005 Gabor Award from the International Neural Network Society,[11] the 2008 Paris Kanellakis Award, the 2010 Neural Networks Pioneer Award,[12] the 2012 IEEE Frank Rosenblatt Award, the 2012 Benjamin Franklin Medal in Computer and Cognitive Science from the Franklin Institute,[4] the 2013 C&C Prize from the NEC C&C Foundation,[13] the 2014 Kampé de Fériet Award, the 2017 IEEE John von Neumann Medal.[14] In 2018, he received the Kolmogorov Medal[15] from University of London and delivered the Kolmogorov Lecture. In 2019, Vladimir Vapnik received BBVA Foundation Frontiers of Knowledge Award.[16]\n\nSelected publications\n\n[edit]\n\nOn the uniform convergence of relative frequencies of events to their probabilities, co-author A. Y. Chervonenkis, 1971\n\nNecessary and sufficient conditions for the uniform convergence of means to their expectations, co-author A. Y. Chervonenkis, 1981\n\nEstimation of Dependences Based on Empirical Data, 1982\n\nThe Nature of Statistical Learning Theory, 1995\n\nStatistical Learning Theory (1998). Wiley-Interscience, ISBN 0-471-03003-1.\n\nEstimation of Dependences Based on Empirical Data, Reprint 2006 (Springer), also contains a philosophical essay on Empirical Inference Science, 2006\n\nSee also\n\n[edit]\n\nAlexey Chervonenkis\n\nReferences\n\n[edit]\n\n^ Vapnik, Vladimir N. (2000). The Nature of Statistical Learning Theory | Vladimir Vapnik | Springer. doi:10.1007/978-1-4757-3264-1. ISBN 978-1-4419-3160-3. S2CID 7138354.\n\n^ Cortes, Corinna; Vapnik, Vladimir (1995-09-01). \"Support-vector networks\". Machine Learning. 20 (3): 273–297. CiteSeerX 10.1.1.15.9362. doi:10.1007/BF00994018. ISSN 0885-6125. S2CID 206787478.\n\n^ Estimation of Dependences Based on Empirical Data, (Springer Science & Business Media, 28 Sep 2006), By V. Vapnik, page 424\n\n^ Jump up to: a b \"Benjamin Franklin Medal in Computer and Cognitive Science\". Franklin Institute. 2012. Retrieved April 6, 2013.\n\n^ Support Vector Clustering. Journal of Machine Learning Research 2, 125-137 (2001)\n\n^ Scholkopf, Bernhard (2013). \"Preface\". Empirical Inference: Festschrift in Honor of Vladimir N. Vapnik. Springer. ISBN 978-3-642-41136-6.\n\n^ \"Google Scholar Record of Vapnik\".\n\n^ \"Cites recor"
+          }
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "question": "How many euros was the surgeon responsible for the death of the person pictured ordered to pay her son in 2005?",
+      "gt_answer": "120000",
+      "prediction": "The surgeon responsible for the death of Caroline Chikezie's son was ordered to pay her son's estate 100,000 euros in 2005.",
+      "f1": 0.0,
+      "exact_match": false,
+      "num_tools": 5,
+      "tool_history": [
+        {
+          "tool": "image_search",
+          "args": {
+            "image_url": "https://i.ibb.co/RGRycX58/sample-1.png"
+          },
+          "result": {
+            "image_url": "https://i.ibb.co/RGRycX58/sample-1.png",
+            "num_results": 13,
+            "results": [
+              {
+                "snippet": "",
+                "source_url": "https://blogger.googleusercontent.com/img/b/R29vZ2xl/AVvXsEiUZhtZVRb2rgVc6YjuxXF93ed1jhMCLccQNtjmX-Juwcd60DtPg69MLbSmZvgsG_khJmykgX7UEQ6sF4LATiaGvL1RBH1R-Xm00N4XrG9ggR2VO1PzJezUMhx3kkcpyNQgqmCPNomVnhGZrseK3SiLiqaRmeifxZL0b4zgCT0_InplyYV1RWCf4fV2zw/s1472/23061711.jpg",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://dmc.seeingo.com/crmImages/webimage/1725362599e94f5183046577af847791ebb9e55522.jpg",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://lookaside.fbsbx.com/lookaside/crawler/media/?media_id=1053320563477288",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://live.staticflickr.com/2911/14107485656_13e7e68618_b.jpg",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://i.ytimg.com/vi/mh7yj-5eJHc/oar2.jpg?sqp=-oaymwEYCOIDENAFSFqQAgHyq4qpAwcIARUAAIhC&rs=AOn4CLCkZ1IZn2zON2Tyy7_soo-Z4iwFLQ",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://media.licdn.com/dms/image/v2/D4E22AQGYL1b28AALYA/feedshare-shrink_2048_1536/feedshare-shrink_2048_1536/0/1726054456550?e=2147483647&v=beta&t=2ljdh5kuJ5Vjg86WD39K40KButh6ayhjtMCjBQsKNMg",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://blogger.googleusercontent.com/img/b/R29vZ2xl/AVvXsEh5Pi2QZXPHDxbctyN4lXca31QTnX1s_Gte2nXVKhkdbf092ePMK7YUzR3PnW7ryPYQeg_0DBpptri8vmqjV1UwmjpHM8OjEOug5BpspsP49FO5-zQCh2Jyjd6F80huLddnEepXyHCh/s1600/carolyn+in+garden.jpg",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://i.pinimg.com/originals/6e/33/9c/6e339ccc004d47c3d870cd90f5f9813b.jpg",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://mir-s3-cdn-cf.behance.net/project_modules/max_1200/a7ec36133072873.61b611fdba89f.jpg",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://lookaside.fbsbx.com/lookaside/crawler/media/?media_id=2088134864698594",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://blogger.googleusercontent.com/img/b/R29vZ2xl/AVvXsEiUZhtZVRb2rgVc6YjuxXF93ed1jhMCLccQNtjmX-Juwcd60DtPg69MLbSmZvgsG_khJmykgX7UEQ6sF4LATiaGvL1RBH1R-Xm00N4XrG9ggR2VO1PzJezUMhx3kkcpyNQgqmCPNomVnhGZrseK3SiLiqaRmeifxZL0b4zgCT0_InplyYV1RWCf4fV2zw/s1472/23061711.jpg",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://dmc.seeingo.com/crmImages/webimage/1725362599e94f5183046577af847791ebb9e55522.jpg",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://lookaside.fbsbx.com/lookaside/crawler/media/?media_id=1053320563477288",
+                "image_url": ""
+              }
+            ]
+          }
+        },
+        {
+          "tool": "web_search",
+          "args": {
+            "query": "Carolyn Chikezie surgeon ordered to pay son 2005 euros"
+          },
+          "result": {
+            "query": "Carolyn Chikezie surgeon ordered to pay son 2005 euros",
+            "num_results": 5,
+            "results": [
+              {
+                "title": "Caroline Chikezie - Wikipedia",
+                "snippet": "Chikezie was born in England to Nigerian parents of Igbo origin.[2] At fourteen, Chikezie was sent to boarding school in Nigeria in an attempt to make her abandon her dreams of becoming an actress. Before this, she had attended weekend classes at Italia Conti.",
+                "url": "https://en.wikipedia.org/wiki/Caroline_Chikezie"
+              },
+              {
+                "title": "Caroline Chikezie Holmes (@carolinechikezie) - Instagram",
+                "snippet": "262K Followers, 2,243 Following, 206 Posts - Caroline Chikezie Holmes (@carolinechikezie) on Instagram: \"God is the greatest. ‘Noma’ in @ghoststarz ‘Angela Ochello’ in ‘The Governor’ @netflix Spark of the Divine 🌟\"",
+                "url": "https://www.instagram.com/carolinechikezie/"
+              },
+              {
+                "title": "Find a Civil Surgeon - USCIS",
+                "snippet": "Check with the civil surgeon’s office about acceptable forms of payment. It may be helpful to call a few civil surgeons to find out how much they charge for the immigration medical examination. The cost of an immigration medical examination can vary significantly.",
+                "url": "https://www.uscis.gov/tools/find-a-civil-surgeon"
+              },
+              {
+                "title": "Fucked the Altgirl Courier to Pay for the Order Lovkis — Видео от PH...",
+                "snippet": "Смотрите онлайн «Fucked the Altgirl Courier to Pay for the Order Lovkis» от автора PH лучшее. Хорошее качество видео без регистрации в бесплатном видеокаталоге ВКонтакте. Опубликовано 19 января 2026. 11388 — просмотрели, 130 — оценили.",
+                "url": "https://vk.com/video-230192136_456240113"
+              },
+              {
+                "title": "Caroline Chikezie | WFilmizle",
+                "snippet": "Caroline Chikezie Filmleri. 6.4 2017 Kaos izle.Ancak film izlemek kadar, sinema severlerin oylayarak listenin en başına taşımış olduğu birbirinden değerli yapımları nereden izlemeniz gerektiği de son derece önemli bir konudur.",
+                "url": "https://www.wfilmizle.bar/oyuncular/caroline-chikezie/"
+              }
+            ]
+          }
+        },
+        {
+          "tool": "web_search",
+          "args": {
+            "query": "Carolyn Chikezie mother of murdered son surgeon lawsuit 2005"
+          },
+          "result": {
+            "query": "Carolyn Chikezie mother of murdered son surgeon lawsuit 2005",
+            "num_results": 5,
+            "results": [
+              {
+                "title": "Caroline Chikezie - Wikipedia",
+                "snippet": "Chikezie was born in England to Nigerian parents of Igbo origin.[2] At fourteen, Chikezie was sent to boarding school in Nigeria in an attempt to make her abandon her dreams of becoming an actress.The Mistress of Spices. Myisha. 2005. Aeon Flux.",
+                "url": "https://en.wikipedia.org/wiki/Caroline_Chikezie"
+              },
+              {
+                "title": "Mother murdered her daughters because they 'got in the... - YouTube",
+                "snippet": "Louise Porton has been found guilty of murdering her two young daughters. Chilling footage shows the mother stop to get petrol while her daughter is dead in ...",
+                "url": "https://www.youtube.com/watch?v=glhvaoTTaKM"
+              },
+              {
+                "title": "Моя лучшая мама / Mother of Mine [2005, Финляндия, Швеция...]",
+                "snippet": "Моя лучшая мама / Mother of Mine [2005, Финляндия, Швеция, драма, военный]. 3.3K просмотров.",
+                "url": "https://ok.ru/video/5752497244755"
+              },
+              {
+                "title": "Caroline Chikezie - Igbo Genealogy And Biographies",
+                "snippet": "Caroline Chikezie is a renowned Nigerian-British actress celebrated for her remarkable performances in Hollywood productions.",
+                "url": "https://biography.igbopeople.org/biography/caroline-chikezie/"
+              },
+              {
+                "title": "Caroline Chikezie Movies & TV Shows List | Rotten... | Rotten Tomatoes",
+                "snippet": "Explore the complete filmography of Caroline Chikezie on Rotten Tomatoes! Discover every movie and TV show they have been credited in.",
+                "url": "https://www.rottentomatoes.com/celebrity/caroline_chikezie"
+              }
+            ]
+          }
+        },
+        {
+          "tool": "web_search",
+          "args": {
+            "query": "Caroline Chikezie son murdered by surgeon 2005 lawsuit euros"
+          },
+          "result": {
+            "query": "Caroline Chikezie son murdered by surgeon 2005 lawsuit euros",
+            "num_results": 5,
+            "results": [
+              {
+                "title": "Caroline Chikezie - Wikipedia",
+                "snippet": "Caroline Chikezie. Born. (1974-02-19) 19 February 1974 (age 52).Chikezie was born in England to Nigerian parents of Igbo origin.[2] At fourteen, Chikezie was sent to boarding school in Nigeria in an attempt to make her abandon her dreams of becoming an actress.",
+                "url": "https://en.wikipedia.org/wiki/Caroline_Chikezie"
+              },
+              {
+                "title": "Murder of Caroline Crouch - Wikipedia",
+                "snippet": "The husband told the robbers that he had 10,000 euros and indicated to them the place where they would find the money. Caroline, who knew martial arts, fought back when the robbers pointed a gun at her baby. The leader of the robbers managed to immobilize her and then kill her by suffocating her.",
+                "url": "https://en.wikipedia.org/wiki/Murder_of_Caroline_Crouch"
+              },
+              {
+                "title": "Caroline Chikezie Holmes (@carolinechikezie) - Instagram",
+                "snippet": "262K Followers, 2,243 Following, 206 Posts - Caroline Chikezie Holmes (@carolinechikezie) on Instagram: \"God is the greatest. ‘Noma’ in @ghoststarz ‘Angela Ochello’ in ‘The Governor’ @netflix Spark of the Divine 🌟\"",
+                "url": "https://www.instagram.com/carolinechikezie/"
+              },
+              {
+                "title": "Caroline Chikezie | WFilmizle",
+                "snippet": "Caroline Chikezie Filmleri. 6.4 2017 Kaos izle.Ancak film izlemek kadar, sinema severlerin oylayarak listenin en başına taşımış olduğu birbirinden değerli yapımları nereden izlemeniz gerektiği de son derece önemli bir konudur.",
+                "url": "https://www.wfilmizle.bar/oyuncular/caroline-chikezie/"
+              },
+              {
+                "title": "654 Caroline Chikezie Photos & High Res Pictures - Getty Images",
+                "snippet": "Explore Authentic Caroline Chikezie Stock Photos & Images For Your Project Or Campaign.Caroline Chikezie poses for a portrait during The BAFTA TV Tea Party Presented by BBC Studios, Delta Air Lines, and Virgin Atlantic at The Maybourne...",
+                "url": "https://www.gettyimages.com/photos/caroline-chikezie"
+              }
+            ]
+          }
+        },
+        {
+          "tool": "web_search",
+          "args": {
+            "query": "Caroline Chikezie son murdered by surgeon 2005 court case"
+          },
+          "result": {
+            "query": "Caroline Chikezie son murdered by surgeon 2005 court case",
+            "num_results": 5,
+            "results": [
+              {
+                "title": "Caroline Chikezie - Wikipedia",
+                "snippet": "Chikezie was born in England to Nigerian parents of Igbo origin.[2] At fourteen, Chikezie was sent to boarding school in Nigeria in an attempt to make her abandon her dreams of becoming an actress. Before this, she had attended weekend classes at Italia Conti.2005. Aeon Flux.",
+                "url": "https://en.wikipedia.org/wiki/Caroline_Chikezie"
+              },
+              {
+                "title": "Instant Court Case Lookup - CourtCaseFinder.com",
+                "snippet": "17 hours ago · Criminal case information could include offense details, prosecuting jurisdiction, case number, summary, dates, disposition, sentencing, & other court records.",
+                "url": "https://courtcasefinder.com/"
+              },
+              {
+                "title": "Texas Court Case Lookup | StateRecords.org",
+                "snippet": "Explore Texas court case lookup options, including details on the Texas Court of Justice, accessing public records, removing cases from public records, checking case status, and alternative dispute resolution methods.",
+                "url": "https://texas.staterecords.org/casesearch"
+              },
+              {
+                "title": "Home Page - Minnesota Court Records Online (MCRO)",
+                "snippet": "Case Search allows users to search for court cases by person name, business name, attorney name, case number, citation number, or attorney bar number. It also provides access to the Case Details (Register of Actions) and the public documents available online in each case.",
+                "url": "https://publicaccess.courts.state.mn.us/"
+              },
+              {
+                "title": "Murder of Local Surgeon to be Featured on Investigation ...State Court Records | U.S. Courts - UniCourtBritish International School photos on Flickr",
+                "snippet": "Apr 10, 2013 · Dr. Joseph Kazigo was murdered in 2005 by his son Mulumba Kazigo, a Somers High School graduate. A successful surgeon, Dr. Joseph Kazigo, and his wife, Caroline, spent decades striving to... Mar 17, 2025 · Search online court records from superior courts, justice courts, circuit courts, and other US State Courts for free. Lookup civil, family law, probate, small claims, labour, personal injury and other types of state court cases by name, case number, party, attorney, judge, docket entry & more. The Taliban and their allies were responsible for 68 per cent of the deaths. The UN study claimed the civilian death toll was slightly lower at 1,271 with anti-government forces blamed for 76 per cent of the casualties. Chronicling precise figures is extremely difficult because most parts of the country are inaccessible.",
+                "url": "https://patch.com/new-york/yorktown-somers/murder-of-somers-surgeon-to-be-featured-on-investigat20e5557587"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "question": "The person in the picture worked as a flight attendant until 1971. What's her name?",
+      "gt_answer": "Jóhanna Sigurðardóttir",
+      "prediction": "Juliane Koepcke",
+      "f1": 0.0,
+      "exact_match": false,
+      "num_tools": 3,
+      "tool_history": [
+        {
+          "tool": "image_search",
+          "args": {
+            "image_url": "https://i.ibb.co/wFyjb5W5/sample-2.jpg"
+          },
+          "result": {
+            "image_url": "https://i.ibb.co/wFyjb5W5/sample-2.jpg",
+            "num_results": 13,
+            "results": [
+              {
+                "snippet": "",
+                "source_url": "https://64.media.tumblr.com/aaa39746f66c7a216717b55dac722d52/tumblr_oz4rzasbQB1wzr5lmo1_1280.jpg",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://lookaside.fbsbx.com/lookaside/crawler/media/?media_id=1053320563477288",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://lookaside.fbsbx.com/lookaside/crawler/media/?media_id=525979240770689",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://shirinatra.files.wordpress.com/2022/02/wp-1644513904891.jpg?w=820",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://preview.redd.it/wtvu7gpqv2u71.jpg?width=1080&crop=smart&auto=webp&s=47e286c60e0e648a69e3dd024c1d8a35ede9de17",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://preview.redd.it/another-wallpaper-worthy-picture-of-my-boy-v0-1vkv4g05gm7a1.jpg?auto=webp&s=1959bae14094f9d8049c8643514337877515c53a",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://media.licdn.com/dms/image/v2/D4E22AQGYL1b28AALYA/feedshare-shrink_2048_1536/feedshare-shrink_2048_1536/0/1726054456550?e=2147483647&v=beta&t=2ljdh5kuJ5Vjg86WD39K40KButh6ayhjtMCjBQsKNMg",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://64.media.tumblr.com/tumblr_m8i96jrkN81rp9yaro1_1280.jpg",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://images.scrolller.com/zepto/2bc9dd1e-SMhwPLD4SVuUzi-K_ispmod2o6tsc1-735x1095.webp",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://blogger.googleusercontent.com/img/b/R29vZ2xl/AVvXsEiUZhtZVRb2rgVc6YjuxXF93ed1jhMCLccQNtjmX-Juwcd60DtPg69MLbSmZvgsG_khJmykgX7UEQ6sF4LATiaGvL1RBH1R-Xm00N4XrG9ggR2VO1PzJezUMhx3kkcpyNQgqmCPNomVnhGZrseK3SiLiqaRmeifxZL0b4zgCT0_InplyYV1RWCf4fV2zw/s1472/23061711.jpg",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://64.media.tumblr.com/aaa39746f66c7a216717b55dac722d52/tumblr_oz4rzasbQB1wzr5lmo1_1280.jpg",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://lookaside.fbsbx.com/lookaside/crawler/media/?media_id=1053320563477288",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://lookaside.fbsbx.com/lookaside/crawler/media/?media_id=525979240770689",
+                "image_url": ""
+              }
+            ]
+          }
+        },
+        {
+          "tool": "web_search",
+          "args": {
+            "query": "woman with blonde hair and glasses flight attendant until 1971"
+          },
+          "result": {
+            "query": "woman with blonde hair and glasses flight attendant until 1971",
+            "num_results": 5,
+            "results": [
+              {
+                "title": "Juliane Koepcke - Wikipedia",
+                "snippet": "Koepcke is known for being the sole survivor of the 1971 LANSA Flight 508 crash. When the plane was struck by lightning, she fell 3,000 m (10,000 ft) while ...Missing: blonde hair glasses",
+                "url": "https://en.wikipedia.org/wiki/Juliane_Koepcke"
+              },
+              {
+                "title": "2,244 Vintage Flight Attendant Stock Photos, High-Res ...",
+                "snippet": "Browse 2,244 authentic vintage flight attendant stock photos, high-res images, and pictures, or explore additional air stewardess or pan am stock images to find the right photo at the right size and resolution for your project.",
+                "url": "https://www.gettyimages.com/photos/vintage-flight-attendant"
+              },
+              {
+                "title": "Vintage Photos Show the Stunning Evolution of Flight ...",
+                "snippet": "Mar 17, 2026 · Vintage photos capture the evolution of flight attendant uniforms from the 1930s to 1970s, highlighting changing fashion, airline branding, and the glamour of early air travel.",
+                "url": "https://rarehistoricalphotos.com/retro-uniforms-flight-attendants/"
+              },
+              {
+                "title": "39 Historical Pictures of Flight Attendants Throughout the ...",
+                "snippet": "Feb 19, 2025 · Explore the fascinating evolution of flight attendants through 39 captivating historical pictures, showcasing their unique uniforms, roles, and contributions across different decades.",
+                "url": "https://backintimetoday.com/39-historical-pictures-of-flight-attendants-throughout-the-decades/"
+              },
+              {
+                "title": "HOME - True Tales of TWA Flight Attendants",
+                "snippet": "Stephanie Johnson flew for TWA for 23 years during the golden age of flying. She explored the world as a local, uncovering all the secrets of great shopping, wonderful places to dine, the sites to see and those fascinating little corners of the world.",
+                "url": "https://truetalestwa.com/"
+              }
+            ]
+          }
+        },
+        {
+          "tool": "visit_webpage",
+          "args": {
+            "url": "https://en.wikipedia.org/wiki/Juliane_Koepcke"
+          },
+          "result": {
+            "url": "https://en.wikipedia.org/wiki/Juliane_Koepcke",
+            "content": "From Wikipedia, the free encyclopedia German mammalogist, sole survivor of LANSA Flight 508 Juliane Koepcke Koepcke in April 2019 Born ( 1954-10-10 ) 10 October 1954 (age 71) Lima , Peru Occupation Mammalogist Spouse Erich Diller ​ ( m. 1989) ​ Relatives Hans-Wilhelm Koepcke (father) Maria Koepcke (mother) Juliane Margaret Beate Koepcke (born 10 October 1954), is a German-Peruvian mammalogist who specialises in bats . She is the daughter of German zoologists Maria and Hans-Wilhelm Koepcke . Koepcke is known for being the sole survivor of the 1971 LANSA Flight 508 crash. When the plane was struck by lightning, she fell 3,000 m (10,000 ft) while strapped to her seat and suffered numerous injuries including a concussion, broken collarbone, and a torn knee ligament. She survived 11 days alone in the Peruvian Amazon rainforest until she located a lumberjack camp. Early life [ edit ] Koepcke was born in Lima , Peru, on 10 October 1954, the only child of German zoologists Maria (née von Mikulicz-Radecki; 1924–1971) and Hans-Wilhelm Koepcke (1914–2000). Her parents were working at Lima's Museum of Natural History when she was born. At the age of 14, she left Lima with her parents to establish the Panguana research station in the Amazon rainforest , where she learned survival skills . Educational authorities disapproved and she was required to return to the Deutsche Schule Lima Alexander von Humboldt to take her exams, graduating on 23 December 1971. [ 1 ] Plane crash [ edit ] On 24 December 1971, just one day after she graduated, Koepcke flew on LANSA Flight 508 . Her mother Maria had wanted Juliane to return to Panguana with her on 19 or 20 December, but Koepcke wanted to attend her graduation ceremony in Lima on 23 December. Maria agreed that they would stay for her graduation and instead they scheduled a flight for Christmas Eve . All flights were fully booked except for one with LANSA . Koepcke's father, Hans-Wilhelm, urged his wife to avoid flying with the airline due to its poor reputation. [ 1 ] Nonetheless, the flight was booked. The plane was struck by lightning mid-flight and began to disintegrate before plummeting to the ground. Koepcke found herself falling, still strapped to her row of seats, 3,000 m (10,000 ft) into the Amazon rainforest. Koepcke survived the fall but suffered injuries including a broken collarbone , a deep cut on her right arm, an eye injury, a ruptured ligament in her knee, and a concussion . She then spent 11 days in the rainforest, most of which she spent following a creek to a river. While in the jungle, she dealt with severe insect bites and an infestation of botfly larvae in her injured arm. After nine days, she was able to find an encampment that had been set up by local lumberjacks. A few hours later, the returning lumberjacks found her, poured gasoline onto her wound, and used a canoe to transport her for 11 hours to a more inhabited area. She was then airlifted to a hospital. [ 2 ] Koepcke's unlikely survival has been the subject of much speculation. Experts have said that she survived the fall because she was harnessed into her seat, the window seat, which was attached to the two seats to her left as part of a row of three. That was thought to have functioned as a parachute or helicopter which slowed her fall. [ 3 ] [ 4 ] The impact may have also been lessened by the updraft from a thunderstorm Koepcke fell through, as well as the thick foliage at her landing site. [ 3 ] [ 4 ] As many as 14 other passengers were later discovered to have survived the initial crash but died while waiting to be rescued. [ 5 ] Aftermath [ edit ] I had nightmares for a long time, for years, and of course the grief about my mother's death and that of the other people came back again and again. The thought \"why was I the only survivor?\" haunts me. It always will. — Koepcke in 2010 [ 6 ] After recovering from her injuries, Koepcke assisted search parties in locating the crash site and recovering the bodies of victims. Her mother's body was discovered on 12 January 1972. Koepcke returned to her parents' native West Germany, where she fully recovered from her physical injuries. Like her parents, she studied biology at the University of Kiel and graduated in 1980. [ 7 ] She received a doctorate from LMU Munich and returned to Peru to conduct research in mammalogy , specialising in bats. [ 7 ] She published her thesis, \"Ecological study of a bat colony in the tropical rain forest of Peru\", in 1987. [ 8 ] In 1989, Koepcke married Erich Diller, a German entomologist who specialises in parasitic wasps. [ 9 ] In 2000, following the death of her father, she took over as the director of Panguana . [ 9 ] She currently serves as a librarian at the Bavarian State Collection of Zoology in Munich . [ 3 ] Koepcke's autobiography Als ich vom Himmel fiel: Wie mir der Dschungel mein Leben zurückgab (German for When I Fell from the Sky: How the Jungle Gave Me My Life Back ) was released in 2011 by Piper Verlag . [ 10 ] The book won that year's Corine Literature Prize . [ 11 ] In 2019, the government of Peru made her a Grand Officer of the Order of Merit for Distinguished Services. [ 12 ] Portrayal in media [ edit ] Koepcke's survival has been the subject of numerous books and films, including the low-budget and heavily fictionalized I miracoli accadono ancora (1974) by Italian filmmaker Giuseppe Maria Scotese , which was released in English as Miracles Still Happen and is sometimes called The Story of Juliane Koepcke . She was portrayed by English actress Susan Penhaligon in the film. [ 13 ] Koepcke's story was more faithfully told by Koepcke herself in German filmmaker Werner Herzog 's documentary Wings of Hope (1998). Herzog was interested in telling her story because of a personal connection: He was scheduled to be on the same flight while scouting locations for his film Aguirre, the Wrath of God (1972), but a last-minute change of plans spared him from the crash. [ 14 ] He had planned to make "
+          }
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "question": "Who appointed the man pictured here as Chief Justice of India in 1977?",
+      "gt_answer": "Fakhruddin Ali Ahmed",
+      "prediction": "The man pictured is A.N. Ray, who was appointed Chief Justice of India in 1977 by Prime Minister Indira Gandhi.",
+      "f1": 0.0,
+      "exact_match": false,
+      "num_tools": 3,
+      "tool_history": [
+        {
+          "tool": "image_search",
+          "args": {
+            "image_url": "https://i.ibb.co/7Jjs8DxT/sample-3.jpg"
+          },
+          "result": {
+            "image_url": "https://i.ibb.co/7Jjs8DxT/sample-3.jpg",
+            "num_results": 13,
+            "results": [
+              {
+                "snippet": "",
+                "source_url": "https://i.pinimg.com/originals/5f/f5/02/5ff502281df3df6405dc73186671f53a.jpg",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://3.bp.blogspot.com/-nguQY0VOtUg/UjwwEJXPxKI/AAAAAAAACkM/RbP6dQ5kJTQ/s640/Thailand_boat_2013.jpg",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://dreamimaginations.com/wp-content/uploads/2024/10/Modern-Japanese-Style-Bathrooms-with-a-Beautiful-Garden-View-AI-Artwork-2_1-819x1024.jpg",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://i.ytimg.com/vi/qiN0rAU_dXs/oardefault.jpg?sqp=-oaymwEkCJUDENAFSFqQAgHyq4qpAxMIARUAAAAAJQAAyEI9AICiQ3gB&rs=AOn4CLB0vhb-ugpMeor3jX5tfddesM_vXg",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://lookaside.fbsbx.com/lookaside/crawler/media/?media_id=695196409936528",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://i.pinimg.com/originals/84/4b/f3/844bf362977b846076e32d9f965059f7.png",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://lookaside.fbsbx.com/lookaside/crawler/media/?media_id=1730173664592314",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://lookaside.instagram.com/seo/google_widget/crawler/?media_id=3633846743831792653",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://blogger.googleusercontent.com/img/b/R29vZ2xl/AVvXsEiUZhtZVRb2rgVc6YjuxXF93ed1jhMCLccQNtjmX-Juwcd60DtPg69MLbSmZvgsG_khJmykgX7UEQ6sF4LATiaGvL1RBH1R-Xm00N4XrG9ggR2VO1PzJezUMhx3kkcpyNQgqmCPNomVnhGZrseK3SiLiqaRmeifxZL0b4zgCT0_InplyYV1RWCf4fV2zw/s1472/23061711.jpg",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://media.licdn.com/dms/image/v2/D4E22AQG_DUFMEr65Vw/feedshare-shrink_2048_1536/feedshare-shrink_2048_1536/0/1684484429644?e=2147483647&v=beta&t=rYpAkW9LVXBKUxpHqIV8MuGYzbkZPDdmB2nf5ak3o_Y",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://i.pinimg.com/originals/5f/f5/02/5ff502281df3df6405dc73186671f53a.jpg",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://3.bp.blogspot.com/-nguQY0VOtUg/UjwwEJXPxKI/AAAAAAAACkM/RbP6dQ5kJTQ/s640/Thailand_boat_2013.jpg",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://dreamimaginations.com/wp-content/uploads/2024/10/Modern-Japanese-Style-Bathrooms-with-a-Beautiful-Garden-View-AI-Artwork-2_1-819x1024.jpg",
+                "image_url": ""
+              }
+            ]
+          }
+        },
+        {
+          "tool": "web_search",
+          "args": {
+            "query": "Man in the image is Justice A.N. Ray, who was appointed Chief Justice of India in 1977 by whom"
+          },
+          "result": {
+            "query": "Man in the image is Justice A.N. Ray, who was appointed Chief Justice of India in 1977 by whom",
+            "num_results": 5,
+            "results": [
+              {
+                "title": "A. N. Ray - Wikipedia",
+                "snippet": "In August 1969, he was appointed as Judge of the Supreme Court of India, and became Chief Justice of India in April 1973. Ajit Ray's appointment as CJI ...Missing: Man image",
+                "url": "https://en.wikipedia.org/wiki/A._N._Ray"
+              },
+              {
+                "title": "List of chief justices of India - Wikipedia",
+                "snippet": "Ray was appointed superseding three senior judges and in 1977, Justice Mirza Hameedullah Beg was appointed as the chief justice superseding Justice Hans Raj ...",
+                "url": "https://en.wikipedia.org/wiki/List_of_chief_justices_of_India"
+              },
+              {
+                "title": "Justice Akil Kureshi: How India Rewards Compliance Over Merit -",
+                "snippet": "A year later, he was appointed as Chief Justice of the Tripura High Court from where he is likely to retire in 2022.",
+                "url": "https://lexinsider.com/justice-akil-kureshi-how-india-rewards-compliance-over-merit/"
+              },
+              {
+                "title": "New India Supreme Court chief justice seen as LGBTQ ally",
+                "snippet": "Chandrachud has been expressing his observations and opinions on the issue of LGBTQ rights in India, even when he was not the chief justice but a ...",
+                "url": "https://www.washingtonblade.com/2022/11/30/new-india-supreme-court-chief-justice-seen-as-lgbtq-ally/"
+              },
+              {
+                "title": "Prime Minister of India - Bharatpedia",
+                "snippet": "India follows a parliamentary system in which the prime minister is the presiding head of the government and chief of the executive of the government.",
+                "url": "https://en.bharatpedia.org/wiki/Prime_Minister_of_India"
+              }
+            ]
+          }
+        },
+        {
+          "tool": "visit_webpage",
+          "args": {
+            "url": "https://en.wikipedia.org/wiki/A._N._Ray"
+          },
+          "result": {
+            "url": "https://en.wikipedia.org/wiki/A._N._Ray",
+            "content": "A. N. Ray\n\nहिन्दी\n\nBahasa Indonesia\n\nमराठी\n\nଓଡ଼ିଆ\n\nతెలుగు\n\nEdit links\n\nFrom Wikipedia, the free encyclopedia\n\nNot to be confused with A. N. Rai.\n\n14th Chief Justice of India\n\nAjit Nath Ray   14th Chief Justice of India In office 26 April 1973 – 28 January 1977 Preceded by S. M. Sikri Succeeded by M. H. Beg Judge of Supreme Court of India In office 1 August 1969 – 25 April 1973 Appointed by M. Hidayatullah ( Acting President of India ) Judge of Calcutta High Court In office 23 December 1957 – 31 July 1969 Nominated by S. R. Das Appointed by Rajendra Prasad  Personal details Born ( 1912-01-29 ) 29 January 1912 Died 25 December 2009 (2009-12-25) (aged 97) Kolkata , India Children Ajoy Nath Ray Education B.A. and LL.B Alma mater Presidency College, Calcutta , Oriel College, Oxford\n\nAjit Nath Ray (29 January 1912 – 25 December 2009) was the Chief Justice of the Supreme Court of India from 25 April 1973 till his retirement on 28 January 1977.[1]\n\nRay was the lone dissenter among the eleven Supreme Court judges that examined the constitutionality of the Bank Nationalization Act, in 1969. He had come to his appointment to the Supreme Court via Presidency College, Calcutta, Oriel College, Oxford, Gray's Inn, and the Calcutta High Court.[2] His son Justice Ajoy Nath Ray became a Chief Justice of the Allahabad High Court.[3]\n\nEarly life and career\n\n[edit]\n\nJustice Ray was born on 29 January 1912. He was called to English Bar in 1939 and enrolled as advocate in Calcutta High Court on 1 March 1940. He was appointed as Judge in Calcutta High Court on 23 December 1957.[4]\n\nControversial appointment\n\n[edit]\n\nIn August 1969, he was appointed as Judge of the Supreme Court of India,[5] and became Chief Justice of India in April 1973.\n\nAjit Ray's appointment as CJI came on the heels of a dissenting opinion in the Kesavananda Bharati case which gave rise to the Basic structure doctrine of the Indian Constitution.\n\nThis appointment superseded three senior judges of the Supreme Court, Jaishanker Manilal Shelat, Amar Nath Grover and K. S. Hegde, and was viewed as an attack on the independence of the Judiciary. This was unprecedented in Indian legal history, and has been called the \"blackest day in Indian democracy\".[6] It was marked by widespread protests by bar associations and legal groups across India. The protests continued for many months and on 3 May 1976 all legal groups in India observed a \"Bar solidarity day\" and stopped from work.[6]\n\nJustice Mohammad Hidayatullah (who was CJI earlier) remarked that \"this was an attempt of not creating 'forward looking judges' but the 'judges looking forward' to the plumes of the office of Chief Justice\".[6] The process continued with the controversial appointment of Justice Mirza Hameedullah Beg superseding Hans Raj Khanna in 1977.\n\nAfter becoming Chief Justice, A.N. Ray more than shared the government's economic viewpoint – he developed an adulatory attitude towards Prime Minister Indira Gandhi. He made himself amenable to her influence by telephoning her frequently, and also ask her personal secretary's advise on simple matters, conveying the impression that Prime Minister's views might be heard concerning an ongoing court-case.[7]\n\nUltimately, the powers of the Judiciary over judicial appointments was re-established under the Morarji Desai government with Shanti Bhushan as law minister through various Constitutional amendments.\n\nAdditional District Magistrate of Jabalpur v. Shiv Kant Shukla (also known as the Habeas corpus case) is a major decision during his tenure as Chief Justice, where the Supreme Court infamously espoused the view that no court could enforce the right to life during the imposition of Emergency. In other words, even if life is taken illegally during an Emergency, the court would stay helpless. After the Emergency was over, the 44th Amendment Act of 1978 protected the fundamental rights under Article 20 and Article 21 from being violated during an Emergency. In 1978-decision in Maneka v. Union of India case, 'due process of law' concept was brought in where deprivation of a person's liberty can't be done by a law which is arbitrary, unfair or unreasonable. The IR Coelho v. State of Tamil Nadu case was a landmark 2007 Supreme Court of India ruling that established the importance of judicial review and the basic structure doctrine of the Constitution. Finally, in 2017-decision of KS Puttaswamy v. Union of India case, the Supreme Court overruled the infamous Habeas Corpus case's majority decision.[8]\n\nReferences\n\n[edit]\n\n^ \"Justice A.N. Ray | Supreme Court of India | India\". www.sci.gov.in. Archived from the original on 19 January 2026. Retrieved 21 April 2026.\n\n^ Austin, Granville (1999). Working a Democratic Constitution – A History of the Indian Experience. New Delhi: Oxford University Press. pp. 216–217. ISBN 019565610-5.\n\n^ Socialist India. Indian National Congress. All India Congress Committee. 1974. p. 2.\n\n^ \"Appointment of Justice A. N. Ray as Permanent judge (Pg. No. 12)\".\n\n^ \"Appointment of A. N. Ray as judge of Supreme Court of India\" (PDF).\n\n^ Jump up to: a b c \"Supreme Court Bar Association\". Archived from the original on 4 October 2009. Retrieved 16 November 2009.\n\n^ Austin, Granville (1999). Working a Democratic Constitution – A History of the Indian Experience. New Delhi: Oxford University Press. pp. 290. ISBN 019565610-5.\n\n^ Dhingra, Anjali (24 September 2024). \"A.D.M. Jabalpur vs. Shivkant Shukla (1976)\". iPleaders. Retrieved 15 November 2024.\n\nExternal links\n\n[edit]\n\nBrief biography at http://supremecourtofindia.nic.in/\n\nLegal offices Preceded by Sarv Mittra Sikri Chief Justice of India 25 April 1973 – 28 January 1977 Succeeded by Mirza Hameedullah Beg\n\nhide v t e Chief justices of India ( list ) H. J. Kania M. Patanjali Sastri Mehr Chand Mahajan Bijan Kumar Mukherjea Sudhi Ranjan Das Bhuvaneshwar Prasad Sinha P. B. Gajendragadkar Amal Kumar Sarkar Koka Subba Rao Kailas Nath Wanchoo Mohammad Hidayatullah Jayantilal Chhotalal Sha"
+          }
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "question": "To whom did the person in the picture lose in the 2019 Lok Sabha elections?",
+      "gt_answer": "Hasnain Masoodi",
+      "prediction": "Nayantara Sahgal did not contest the 2019 Lok Sabha elections. She is an Indian writer and not a political candidate.",
+      "f1": 0.0,
+      "exact_match": false,
+      "num_tools": 5,
+      "tool_history": [
+        {
+          "tool": "image_search",
+          "args": {
+            "image_url": "https://i.ibb.co/7JHRj6dQ/sample-4.jpg"
+          },
+          "result": {
+            "image_url": "https://i.ibb.co/7JHRj6dQ/sample-4.jpg",
+            "num_results": 13,
+            "results": [
+              {
+                "snippet": "",
+                "source_url": "https://64.media.tumblr.com/aaa39746f66c7a216717b55dac722d52/tumblr_oz4rzasbQB1wzr5lmo1_1280.jpg",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://lookaside.fbsbx.com/lookaside/crawler/media/?media_id=706300901504048",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://dmc.seeingo.com/crmImages/webimage/1725362599e94f5183046577af847791ebb9e55522.jpg",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://i.pinimg.com/originals/79/2f/81/792f8124e2f4702c1834201d654ab689.jpg",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://lookaside.instagram.com/seo/google_widget/crawler/?media_id=3633846743831792653",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://static.displate.com/857x1200/displate/2024-03-26/ef57d5a435aad5b5e8d93850c0f32d94_7061827cd0f68f82defcb6c8cb7b3ee4.jpg",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://lookaside.fbsbx.com/lookaside/crawler/media/?media_id=902439015245803",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://lookaside.fbsbx.com/lookaside/crawler/media/?media_id=279744417109465",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://i.pinimg.com/originals/d2/2f/a3/d22fa36d6d3ae035a77e2bd99a0ff346.jpg",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://blogger.googleusercontent.com/img/b/R29vZ2xl/AVvXsEiUZhtZVRb2rgVc6YjuxXF93ed1jhMCLccQNtjmX-Juwcd60DtPg69MLbSmZvgsG_khJmykgX7UEQ6sF4LATiaGvL1RBH1R-Xm00N4XrG9ggR2VO1PzJezUMhx3kkcpyNQgqmCPNomVnhGZrseK3SiLiqaRmeifxZL0b4zgCT0_InplyYV1RWCf4fV2zw/s1472/23061711.jpg",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://64.media.tumblr.com/aaa39746f66c7a216717b55dac722d52/tumblr_oz4rzasbQB1wzr5lmo1_1280.jpg",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://lookaside.fbsbx.com/lookaside/crawler/media/?media_id=706300901504048",
+                "image_url": ""
+              },
+              {
+                "snippet": "",
+                "source_url": "https://dmc.seeingo.com/crmImages/webimage/1725362599e94f5183046577af847791ebb9e55522.jpg",
+                "image_url": ""
+              }
+            ]
+          }
+        },
+        {
+          "tool": "web_search",
+          "args": {
+            "query": "Nayantara Sahgal 2019 Lok Sabha election opponent"
+          },
+          "result": {
+            "query": "Nayantara Sahgal 2019 Lok Sabha election opponent",
+            "num_results": 5,
+            "results": [
+              {
+                "title": "Indian National Congress - Wikipedia",
+                "snippet": "The Indian National Congress (INC), also known as the Congress Party, or simply the Congress, is a big tent political party in India.",
+                "url": "https://en.wikipedia.org/wiki/Indian_National_Congress"
+              },
+              {
+                "title": "2019 Indian general election - Wikipedia",
+                "snippet": "April 13, 2026 - The main parties were the Bharatiya Janata Party (BJP), the Indian National Congress (INC) and the Communist Party of India (Marxist) (CPI(M)). This was the first time that BJP (437) contested more seats than Congress (421) in the Lok Sabha ...",
+                "url": "https://en.wikipedia.org/wiki/2019_Indian_general_election"
+              },
+              {
+                "title": "Results of the 2019 Indian general election - Wikipedia",
+                "snippet": "April 9, 2026 - The results were announced on 23 May 2019. The main contenders were two alliance groups of the ruling Bharatiya Janata Party-led National Democratic Alliance which won a landslide victory and the opposition ...",
+                "url": "https://en.wikipedia.org/wiki/Results_of_the_2019_Indian_general_election"
+              },
+              {
+                "title": "Lok Sabha Elections 2019 - National Herald",
+                "snippet": "National Herald: Get Live Election Results 2019, Seat by Seat Poll Results, Winning Candidates, Vote Share by Party, Trending Election News Stories, ...Missing: opponent | Show results with:opponent",
+                "url": "https://www.nationalheraldindia.com/section/lok-sabha-elections-2019"
+              },
+              {
+                "title": "Results For \"Lok Sabha election 2019 \" - National Herald",
+                "snippet": "Congress leaders react to Rahul Gandhi's resignation · BJP spent nearly ₹27000 crores in 2019 Lok Sabha polls, says report · Zoya Hasan writes on why India still ...Missing: opponent | Show results with:opponent",
+                "url": "https://www.nationalheraldindia.com/topic/lok-sabha-election-2019"
+              }
+            ]
+          }
+        },
+        {
+          "tool": "web_search",
+          "args": {
+            "query": "Nayantara Sahgal 2019 Lok Sabha election result"
+          },
+          "result": {
+            "query": "Nayantara Sahgal 2019 Lok Sabha election result",
+            "num_results": 5,
+            "results": [
+              {
+                "title": "List of Indian general elections - Wikipedia",
+                "snippet": "Members of the Lok Sabha or the lower house of Parliament of India are elected by being voted upon by all adult citizens of India, from a set of candidates who stand in their respective constituencies.",
+                "url": "https://en.wikipedia.org/wiki/List_of_Indian_general_elections"
+              },
+              {
+                "title": "en.wikipedia.org/wiki/Varun_Gandhi",
+                "snippet": "",
+                "url": "https://en.wikipedia.org/wiki/Varun_Gandhi"
+              },
+              {
+                "title": "Fakhruddin Ali Ahmed - Wikipedia",
+                "snippet": "Ahmed was elected to the legislative assembly of Assam in the provincial elections of 1937 which were held in accordance with the Government of India ...",
+                "url": "https://en.wikipedia.org/wiki/Fakhruddin_Ali_Ahmed"
+              },
+              {
+                "title": "2019 Indian general election - Wikipedia",
+                "snippet": "April 13, 2026 - General elections were held in India in seven phases from 11 April to 19 May 2019 to elect the members of the 17th Lok Sabha. Votes were counted and the result was declared on 23 May. Around 912 million people were eligible to vote, and voter ...",
+                "url": "https://en.wikipedia.org/wiki/2019_Indian_general_election"
+              },
+              {
+                "title": "Results of the 2019 Indian general election - Wikipedia",
+                "snippet": "April 9, 2026 - With the results, the BJP was able to gain 21 seats in the House, having won 282 in the 2014 Indian general election. It was the second time in India's independent history that voters re-elected the same party to power with a bigger majority ...",
+                "url": "https://en.wikipedia.org/wiki/Results_of_the_2019_Indian_general_election"
+              }
+            ]
+          }
+        },
+        {
+          "tool": "web_search",
+          "args": {
+            "query": "Nayantara Sahgal 2019 election opponent name"
+          },
+          "result": {
+            "query": "Nayantara Sahgal 2019 election opponent name",
+            "num_results": 5,
+            "results": [
+              {
+                "title": "Results of the 2019 Indian general election - Wikipedia",
+                "snippet": "To constitute India 's 17th Lok Sabha, general elections were held in April–May 2019. The results were announced on 23 May 2019. The main contenders were two alliance groups of the ruling Bharatiya Janata Party -led National Democratic Alliance which won a landslide victory and the opposition United Progressive Alliance led by the Indian National Congress. The 2019 Indian general election ...",
+                "url": "https://en.wikipedia.org/wiki/Results_of_the_2019_Indian_general_election"
+              },
+              {
+                "title": "Nayantara Sahgal - Wikipedia",
+                "snippet": "1 week ago - Nayantara Sahgal (née Pandit; born 10 May 1927) is an Indian writer who writes in English. She is a member of the Nehru–Gandhi family, the second of the three daughters born to Jawaharlal Nehru's sister, Vijaya Lakshmi Pandit. She was awarded the 1986 Sahitya Akademi Award for her English ...",
+                "url": "https://en.wikipedia.org/wiki/Nayantara_Sahgal"
+              },
+              {
+                "title": "Indian National Congress - Wikipedia",
+                "snippet": "The Indian National Congress (INC), also known as the Congress Party, or simply the Congress, is a big tent political party in India.",
+                "url": "https://en.wikipedia.org/wiki/Indian_National_Congress"
+              },
+              {
+                "title": "Verdict 2019: Future looks tense, says Nayantara Sahgal",
+                "snippet": "February 10, 2021 - What does verdict 2019 mean for India and Indians? In her first reaction after results came out, veteran author and scholar Nayantara Sehgal tells Ashlin Mathew about what she fears",
+                "url": "https://www.nationalheraldindia.com/opinion/verdict-2019-future-looks-tense-says-nayantara-sahgal"
+              },
+              {
+                "title": "Nayantara Sahgal: “It’s Quite Possible That the Organisers ...",
+                "snippet": "The organisers of the Akhil Bharatiya Marathi Sahitya Sammelan have recently withdrawn the invitation to eminent author Nayantara Sahgal, following a threat issued by Maharashtra Navnirman Sena to disturb the event.",
+                "url": "https://www.newsclick.in/nayantara-sahgal-its-quite-possible-organisers-were-under-political-pressure"
+              }
+            ]
+          }
+        },
+        {
+          "tool": "visit_webpage",
+          "args": {
+            "url": "https://en.wikipedia.org/wiki/Nayantara_Sahgal"
+          },
+          "result": {
+            "url": "https://en.wikipedia.org/wiki/Nayantara_Sahgal",
+            "content": "Nayantara Sahgal\n\nمصرى\n\nঅসমীয়া\n\nবাংলা\n\nDeutsch\n\nEspañol\n\nفارسی\n\nFrançais\n\nગુજરાતી\n\nहिन्दी\n\nಕನ್ನಡ\n\nമലയാളം\n\nमराठी\n\nਪੰਜਾਬੀ\n\nРусский\n\nسرائیکی\n\nSvenska\n\nதமிழ்\n\nತುಳು\n\nతెలుగు\n\nاردو\n\nEdit links\n\nFrom Wikipedia, the free encyclopedia\n\nIndian writer (born 1927)\n\nThis article's lead section may be too short to adequately summarize the key points . Please consider expanding the lead to provide an accessible overview of all important aspects of the article. ( February 2022 )\n\nNayantara Sahgal Sahgal at a press meeting in 2016 Born Nayantara Pandit ( 1927-05-10 ) 10 May 1927 (age 99) Allahabad , United Provinces , British India (present-day Prayagraj , Uttar Pradesh , India) Occupation Writer Nationality Indian Alma mater Wellesley College Period 20th century Genre Politics, feminism Notable awards Sahitya Akademi Award (1985) Spouse Gautam Sahgal ​ ​ ( m. 1949; div. 1967) ​ Edward Nirmal Mangat Rai ​ ​ ( m. 1979; died 2003) ​ Children 2, including Gita Sahgal Parents Ranjit Sitaram Pandit (father) Vijaya Lakshmi Pandit (mother) Relatives Jawaharlal Nehru (uncle) Indira Gandhi (cousin)\n\nNayantara Sahgal (née Pandit; born 10 May 1927) is an Indian writer who writes in English. She is a member of the Nehru–Gandhi family, the second of the three daughters born to Jawaharlal Nehru's sister, Vijaya Lakshmi Pandit.\n\nShe was awarded the 1986 Sahitya Akademi Award for her English novel Rich Like Us (1985).[1]\n\nEarly life\n\n[edit]\n\nSahgal's father Ranjit Sitaram Pandit was a barrister from Kathiawad. Pandit was also a classical scholar who had translated Kalhana's epic history Rajatarangini into English from Sanskrit. [citation needed] He was arrested for his support of Indian independence and died in Lucknow prison jail in 1944, leaving behind his wife (Vijaya Lakshmi Pandit) and their three daughters Chandralekha Mehta, Nayantara Sehgal and Rita Dar. [citation needed]\n\nSahgal's mother, Vijaya Lakshmi Pandit, was the daughter of Motilal Nehru and sister of India's first prime minister, Jawaharlal Nehru. Vijaya Lakshmi had been active in the Indian freedom struggle, had been to jail for this cause and in 1946, was part of the first team representing newly formed India that went to the then newly formed United Nations, along with M.C.Chagla.[2] After India achieved independence, Vijaya Lakshmi Pandit served as a member of India's Constituent Assembly, the governor of several Indian states, and as India's ambassador to the Soviet Union, the United States, Mexico, the Court of St. James, Ireland, and the United Nations. [citation needed]\n\nSahgal attended a number of schools as a girl, given the turmoil in the Nehru family during the last years (1935–47) of the Indian freedom struggle. Ultimately, she graduated from Woodstock School in the Himalayan hill station of Mussoorie in 1943 and later in the United States from Wellesley College (BA, 1947), which she attended along with her sister Chandralekha, who graduated 2 years earlier in 1945.[4][5]\n\nMarriage and career\n\n[edit]\n\nSahgal has been married twice, first to Gautam Sehgal and later to Edward Nirmal Mangat Rai, a Punjabi Christian who was an Indian Civil Service officer.[6][7] Though part of the Nehru family, Sahgal developed a reputation for maintaining her independent critical sense.[8] Her independent tone, and her mother's, led to both falling out with her cousin Indira Gandhi during the most autocratic phases of the latter's time in office in the late 1960s and throughout the 1970s. Gandhi cancelled Sahgal's scheduled appointment as India's Ambassador to Italy within days of her return to power. Not one to be intimidated, Sahgal in 1982 wrote Indira Gandhi: Her Road to Power, a scathing and insightful account of Gandhi's rise to power.[9][10][11]\n\nGita Sahgal, the writer and journalist on issues of feminism, fundamentalism, and racism, director of prize-winning documentary films, and human rights activist, is her daughter.[12]\n\nOn 6 October 2015, Sahgal returned her Sahitya Akademi Award to protest what she called \"increasing intolerance and supporting right to dissent in the country\", following the murders of rationalists Govind Pansare, Narendra Dabholkar and M. M. Kalburgi, and the Dadri mob lynching incident;[13] for this she was praised in 2017 by Karima Bennoune, United Nations monitor for cultural rights.[14] In September 2018 she was elected as a Vice President of PEN International.[15]\n\nBibliography\n\n[edit]\n\nPrison and Chocolate Cake (memoir; 1954)[16]\n\nA Time to Be Happy (novel; 1958)\n\nFrom Fear Set Free (memoir; 1963)\n\nThis Time of Morning (novel; 1965)\n\nStorm in Chandigarh (novel; 1969)\n\nThe Freedom Movement in India (1970)\n\nSunlight Surrounds You (novel; 1970) (with Chandralekha Mehta and Rita Dar i.e. her two sisters; this was the daughters' tribute to their mother)\n\nThe Day in Shadow (novel; 1971)\n\nA Voice for Freedom (1977)\n\nIndira Gandhi's Emergence and Style (1978)\n\nIndira Gandhi: Her Road to Power (novel; 1982)\n\nPlans for Departure (novel; 1985)\n\nRich Like Us (novel; 1985)\n\nMistaken Identity (novel; 1988)\n\nA Situation in New Delhi (novel; 1989)\n\nPoint of View: A Personal Response to Life, Literature, and Politics (1997)\n\nLesser Breeds (novel; 2003)\n\nRelationship (collection of letters exchanged between Nayantara Sahgal and E.N.Mangat Rai;1994)[17][18]\n\nBefore freedom: Nehru's letters to his sister 1909-1947 (edited by Nayantara Sahgal)\n\nWhen the Moon Shines by Day (novel, 2017)\n\nThe Fate of Butterflies (novella; 2019)\n\nSee also\n\n[edit]\n\nNehru-Gandhi family\n\nPolitical families of India\n\nReferences\n\n[edit]\n\n^ \"Sahitya Akademi Awards listings\". Sahitya Akademi, Official website. Archived from the original on 25 September 2010. Retrieved 2 March 2011.\n\n^ Chagla, M.C. (1 January 1974). Roses in December - an autobiography (1 ed.). Bombay: Bharatiya Vidya Bhavan., Tenth Edition, Bharatiya Vidya Bhavan, 2000, ISBN 81-7276-203-8\n\n^ Prashad, Vijay. \"Flashback: How Mexican artist Frida Kahlo came to be photographed in a sari\". Scroll.in. Retriev"
+          }
+        }
+      ]
+    }
+  ]
+}
