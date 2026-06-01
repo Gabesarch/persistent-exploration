@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import shutil
 import tempfile
@@ -276,7 +277,7 @@ class AsyncOpenAIChat(lmms):
                 eval_logger.debug("Calling tool with MCP client")
                 for call in message.tool_calls:
                     eval_logger.debug(f"Calling {call.function.name}...")
-                    result = await self.mcp_client.run_tool(call.function.name, eval(call.function.arguments))
+                    result = await self.mcp_client.run_tool(call.function.name, json.loads(call.function.arguments))
                     all_response += f"<tool_call>{call.function.name} {call.function.arguments}</tool_call></tool_response>"
                     tool_messages.append({"role": "tool", "name": call.function.name, "content": []})
                     for content in result.content:

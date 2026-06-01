@@ -1,4 +1,4 @@
-dataset_path: Jayant-Sravan/CountQA
+dataset_path: /scratch/gpfs/ZHUANGL/lc1556/hf_cache/hub/datasets--Jayant-Sravan--CountQA/snapshots/f92cc6fe46542c61e2916e3d2ae9a911e2216b1a
 process_docs: !function utils.countqa_process_docs
 task: "countqa_reasoning"
 test_split: test

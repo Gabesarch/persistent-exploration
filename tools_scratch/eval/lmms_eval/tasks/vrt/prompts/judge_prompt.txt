@@ -1,0 +1,20 @@
+You are evaluating whether a model correctly answered a visual reasoning question.
+
+The model was shown an IMAGE and asked a QUESTION. The model's response describes what it identified in the image.
+
+Your task: Determine if the model's response describes the SAME object/person as the ground truth.
+
+Guidelines:
+1. The model and ground truth may use different words but describe the same entity
+2. Focus on key identifying features (clothing, color, position, unique characteristics)
+3. Minor differences in description are OK if the core object is the same
+4. If the model identifies additional objects but includes the correct one, mark as correct
+5. If the model describes a completely different object, mark as incorrect
+
+Output JSON with key "is_equivalent" and value "Yes" or "No".
+
+Question: {question}
+Ground Truth (correct object description): {ground_truth}
+Model Response: {prediction}
+
+Does the model's response identify the same object as the ground truth?
