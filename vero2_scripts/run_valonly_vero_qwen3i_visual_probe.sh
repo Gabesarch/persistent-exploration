@@ -33,7 +33,8 @@ HYDRA_ARGS=("$@")
 export HF_CACHE="${HF_CACHE:-$HF_HOME}"
 export MODEL_PATH="$HF_CACHE/zlab-princeton/Vero-Qwen3I-8B-nothinkchattemplate"
 
-DATA_FILE="/scratch/gpfs/ZHUANGL/gs1693/vero2_datasets/train_rl_datasets/chart_search_counting_visual_probe_train.verl.jsonl"
+# DATA_FILE="/scratch/gpfs/ZHUANGL/gs1693/vero2_datasets/train_rl_datasets/chart_search_counting_visual_probe_train.verl.jsonl"
+DATA_FILE="/scratch/gpfs/ZHUANGL/gs1693/vero2_datasets/train_rl_datasets/chart_search_counting_visual_probe_val.verl.jsonl"
 SYSTEM_PROMPT="$VERL_ROOT/vero2_scripts/prompts/system_prompt_chatting.txt"
 
 for required_path in "$MODEL_PATH" "$DATA_FILE" "$SYSTEM_PROMPT"; do
@@ -49,7 +50,7 @@ RUN_UNIQUE_ID="${RUN_UNIQUE_ID:-${SLURM_JOB_ID:-pid_$$}}"
 NUM_GPUS="${NUM_GPUS:-${SLURM_GPUS_ON_NODE:-8}}"
 
 TRAINER_PROJECT_NAME="${TRAINER_PROJECT_NAME:-vero2_verl}"
-TRAINER_EXPERIMENT_SUFFIX="${TRAINER_EXPERIMENT_SUFFIX:-valonly_vero_qwen3i_visual_probe}"
+TRAINER_EXPERIMENT_SUFFIX="${TRAINER_EXPERIMENT_SUFFIX:-valonly_vero_qwen3i_visual_probe_val}"
 CHECKPOINT_EXPERIMENT_NAME="${CHECKPOINT_EXPERIMENT_NAME:-${TRAINER_EXPERIMENT_SUFFIX}_${CHECKPOINT_DATE_TIME}}"
 TRAINER_EXPERIMENT_NAME="${TRAINER_EXPERIMENT_NAME:-${CHECKPOINT_EXPERIMENT_NAME}_${RUN_UNIQUE_ID}}"
 TRAINER_DEFAULT_LOCAL_DIR="${TRAINER_DEFAULT_LOCAL_DIR:-${SAVE_PATH}/checkpoints/${TRAINER_PROJECT_NAME}/${CHECKPOINT_EXPERIMENT_NAME}}"

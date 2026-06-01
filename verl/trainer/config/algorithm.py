@@ -665,5 +665,7 @@ class AlgoConfig(BaseConfig):
     # gdpo_reward_keys: keys in non_tensor_batch (from compute_score's return dict) that
     #   correspond to individual reward dimensions, e.g. ["format_reward", "accuracy_reward"].
     # gdpo_reward_weights: per-dimension weights for aggregation (default: equal weights).
+    # gdpo_reward_eligibility: optional per-reward eligibility gate for component normalization.
     gdpo_reward_keys: Optional[list[str]] = None
     gdpo_reward_weights: Optional[list[float]] = None
+    gdpo_reward_eligibility: Optional[dict[str, Any]] = None

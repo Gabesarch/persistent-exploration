@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from typing import Any
 
@@ -202,6 +203,27 @@ def acc_reward(predict_str: str, ground_truth: str, use_boxed: bool = False, ext
     return handler(final_answer, truth, extra_info=extra_info)
 
 
+def tool_efficiency_reward(
+    tool_call_count: int,
+    mode: str = "inverse_count",
+    free_calls: int = 0,
+    concave_k: float = 10.0,
+    concave_q: float = 0.95,
+) -> float:
+    effective_tool_calls = max(float(tool_call_count) - float(free_calls), 0.0)
+    if mode == "inverse_count":
+        return 1.0 / (effective_tool_calls + 1.0)
+    if mode == "concave_length_penalty":
+        k = float(concave_k)
+        q = float(concave_q)
+        if k <= 0.0:
+            raise ValueError(f"tool_efficiency_concave_k must be > 0, got {k}.")
+        if abs(q - 1.0) <= 1e-8:
+            return -math.log1p(k * effective_tool_calls) / k
+        return -((1.0 + k * effective_tool_calls) ** (1.0 - q) - 1.0) / (k * (1.0 - q))
+    raise ValueError(f"Unsupported tool_efficiency_reward_mode: {mode}")
+
+
 def compute_score(
     predict_str: str,
     ground_truth: str,
@@ -209,6 +231,11 @@ def compute_score(
     format_score: float = 0.5,
     min_tool_calls_for_bonus: int | None = None,
     tool_call_bonus: float = 0.0,
+    tool_efficiency_reward_mode: str = "inverse_count",
+    tool_efficiency_free_calls: int = 0,
+    tool_efficiency_concave_k: float = 10.0,
+    tool_efficiency_concave_q: float = 0.95,
+    tool_efficiency_score_weight: float = 0.0,
     extra_info=None,
 ) -> dict[str, float]:
     predict_str = str(predict_str)
@@ -230,12 +257,25 @@ def compute_score(
     ):
         tool_call_bonus_score = float(tool_call_bonus)
 
-    score = (1.0 - format_score) * accuracy + format_score * formatting + tool_call_bonus_score
+    tool_efficiency_score = tool_efficiency_reward(
+        tool_call_count,
+        mode=tool_efficiency_reward_mode,
+        free_calls=tool_efficiency_free_calls,
+        concave_k=tool_efficiency_concave_k,
+        concave_q=tool_efficiency_concave_q,
+    )
+    score = (
+        (1.0 - format_score - float(tool_efficiency_score_weight)) * accuracy
+        + format_score * formatting
+        + float(tool_efficiency_score_weight) * tool_efficiency_score
+        + tool_call_bonus_score
+    )
     return {
         "score": score,
         "accuracy": accuracy,
         "format": formatting,
         "tool_call_count": tool_call_count,
+        "tool_efficiency": tool_efficiency_score,
         "tool_call_bonus": tool_call_bonus_score,
     }
 
@@ -249,6 +289,11 @@ def compute_score_from_data_source(
     format_score: float = 0.5,
     min_tool_calls_for_bonus: int | None = None,
     tool_call_bonus: float = 0.0,
+    tool_efficiency_reward_mode: str = "inverse_count",
+    tool_efficiency_free_calls: int = 0,
+    tool_efficiency_concave_k: float = 10.0,
+    tool_efficiency_concave_q: float = 0.95,
+    tool_efficiency_score_weight: float = 0.0,
     **_: dict,
 ) -> dict[str, float]:
     """Adapter for custom_reward_function configs that expect default signature."""
@@ -259,6 +304,11 @@ def compute_score_from_data_source(
         format_score=format_score,
         min_tool_calls_for_bonus=min_tool_calls_for_bonus,
         tool_call_bonus=tool_call_bonus,
+        tool_efficiency_reward_mode=tool_efficiency_reward_mode,
+        tool_efficiency_free_calls=tool_efficiency_free_calls,
+        tool_efficiency_concave_k=tool_efficiency_concave_k,
+        tool_efficiency_concave_q=tool_efficiency_concave_q,
+        tool_efficiency_score_weight=tool_efficiency_score_weight,
         extra_info=extra_info,
     )
 
@@ -272,6 +322,11 @@ async def async_compute_score_from_data_source(
     format_score: float = 0.5,
     min_tool_calls_for_bonus: int | None = None,
     tool_call_bonus: float = 0.0,
+    tool_efficiency_reward_mode: str = "inverse_count",
+    tool_efficiency_free_calls: int = 0,
+    tool_efficiency_concave_k: float = 10.0,
+    tool_efficiency_concave_q: float = 0.95,
+    tool_efficiency_score_weight: float = 0.0,
     **_: dict,
 ) -> dict[str, float]:
     """Async adapter for reward loops."""
@@ -283,5 +338,10 @@ async def async_compute_score_from_data_source(
         format_score=format_score,
         min_tool_calls_for_bonus=min_tool_calls_for_bonus,
         tool_call_bonus=tool_call_bonus,
+        tool_efficiency_reward_mode=tool_efficiency_reward_mode,
+        tool_efficiency_free_calls=tool_efficiency_free_calls,
+        tool_efficiency_concave_k=tool_efficiency_concave_k,
+        tool_efficiency_concave_q=tool_efficiency_concave_q,
+        tool_efficiency_score_weight=tool_efficiency_score_weight,
         extra_info=extra_info,
     )
