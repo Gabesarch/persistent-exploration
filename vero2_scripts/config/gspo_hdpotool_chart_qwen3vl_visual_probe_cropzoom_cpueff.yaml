@@ -17,7 +17,7 @@ data:
   val_files: /scratch/gpfs/ZHUANGL/gs1693/vero2_datasets/train_rl_datasets/chart_search_counting_visual_probe_val.verl.jsonl
   filter_overlong_prompts_workers: 64
   image_root: ${oc.env:IMAGE_ROOT}
-  system_prompt: ${oc.env:VERL_ROOT}/vero2_scripts/prompts/system_prompt_tool_calling.txt
+  system_prompt: ${oc.env:VERL_ROOT}/vero2_scripts/prompts/system_prompt_chatting_tool_calling.txt
   shuffle: true
   train_batch_size: 256
   val_batch_size: 256
@@ -61,7 +61,7 @@ actor_rollout_ref:
               {{- "\n" }}
               {{- tool | tojson }}
           {%- endfor %}
-          {{- "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n" }}
+          {{- "\n</tools>\n\nEvery assistant response must contain exactly one non-empty <think> block followed by exactly one action block. Use <tool_call> for tool calls and <answer> for final answers. Only whitespace may appear outside these blocks. For each function call, put only the json object with function name and arguments in the <tool_call></tool_call> XML tags after the <think> block:\n<think>\nReasoning for this step.\n</think>\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>\n\nFinal answers must use this structure:\n<think>\nFinal reasoning.\n</think>\n<answer>\nFinal answer.\n</answer><|im_end|>\n" }}
       {%- else %}
           {%- if messages[0].role == 'system' %}
               {{- '<|im_start|>system\n' }}
