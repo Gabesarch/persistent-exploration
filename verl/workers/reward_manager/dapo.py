@@ -34,6 +34,7 @@ class DAPORewardManager(AbstractRewardManager):
         reward_fn_key="data_source",
         max_resp_len=None,
         overlong_buffer_cfg=None,
+        reward_response_prefix="",
     ) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
@@ -41,6 +42,7 @@ class DAPORewardManager(AbstractRewardManager):
         self.reward_fn_key = reward_fn_key
         self.overlong_buffer_cfg = overlong_buffer_cfg
         self.max_resp_len = max_resp_len
+        self.reward_response_prefix = reward_response_prefix
 
         if self.overlong_buffer_cfg is not None:
             assert self.max_resp_len is not None, (
@@ -88,6 +90,8 @@ class DAPORewardManager(AbstractRewardManager):
             eos_token = self.tokenizer.eos_token
             if response_str.endswith(eos_token):
                 response_str = response_str[: -len(eos_token)]
+            if self.reward_response_prefix:
+                response_str = f"{self.reward_response_prefix}{response_str}"
 
             ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
 

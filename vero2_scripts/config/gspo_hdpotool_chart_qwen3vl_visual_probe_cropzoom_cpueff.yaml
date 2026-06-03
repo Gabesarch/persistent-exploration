@@ -160,7 +160,7 @@ actor_rollout_ref:
           {%- endif %}
       {%- endfor %}
       {%- if add_generation_prompt %}
-          {{- '<|im_start|>assistant\n' }}
+          {{- '<|im_start|>assistant\n<think>\n' }}
       {%- endif %}
     use_remove_padding: true
     enable_gradient_checkpointing: true
@@ -291,6 +291,7 @@ reward:
       penalty_factor: 1.0
       log: false
     max_resp_len: ${data.max_response_length}
+    reward_response_prefix: "<think>\n"
 
 critic:
   ulysses_sequence_parallel_size: 1

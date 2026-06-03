@@ -31,9 +31,11 @@ class DAPORewardManager(RewardManagerBase):
         self.is_async_reward_score = inspect.iscoroutinefunction(self.compute_score)
 
         # DAPO Reward Config
-        overlong_buffer_cfg = config.reward.get("reward_kwargs", {}).get("overlong_buffer_cfg", None)
+        reward_kwargs = config.reward.get("reward_kwargs", {})
+        overlong_buffer_cfg = reward_kwargs.get("overlong_buffer_cfg", None)
         self.overlong_buffer_cfg = overlong_buffer_cfg
-        self.max_resp_len = config.reward.get("reward_kwargs", {}).get("max_resp_len", None)
+        self.max_resp_len = reward_kwargs.get("max_resp_len", None)
+        self.reward_response_prefix = reward_kwargs.get("reward_response_prefix", "")
         self.reward_router_address = reward_router_address
         self.reward_model_tokenizer = reward_model_tokenizer
         self.debug_options = get_debug_options(config)
@@ -66,6 +68,8 @@ class DAPORewardManager(RewardManagerBase):
         response_str = await self.loop.run_in_executor(
             None, lambda: self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
         )
+        if self.reward_response_prefix:
+            response_str = f"{self.reward_response_prefix}{response_str}"
         extra_reward_kwargs = (
             {
                 "reward_router_address": self.reward_router_address,
