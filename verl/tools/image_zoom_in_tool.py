@@ -142,6 +142,7 @@ class ImageZoomInTool(BaseTool):
     SMART_RESIZE_FACTOR = 32
     SMART_RESIZE_MIN_PIXELS = 256 * 32 * 32
     SMART_RESIZE_MAX_PIXELS = 12845056
+    MAX_CROPPED_ASPECT_RATIO = 199.0
     IMAGE_SIZE_CONTROL_KEYS = {
         "max_pixels",
         "min_pixels",
@@ -199,6 +200,9 @@ class ImageZoomInTool(BaseTool):
         self.cropped_min_pixels = int(config.get("cropped_min_pixels", self.SMART_RESIZE_MIN_PIXELS))
         self.cropped_max_pixels = int(
             config.get("cropped_max_pixels", config.get("max_pixels", self.SMART_RESIZE_MAX_PIXELS))
+        )
+        self.max_cropped_aspect_ratio = float(
+            config.get("max_cropped_aspect_ratio", self.MAX_CROPPED_ASPECT_RATIO)
         )
         self.use_original_resolution_source = bool(config.get("use_original_resolution_source", False))
         self.original_source_unavailable_policy = config.get("original_source_unavailable_policy", "fallback")
@@ -463,6 +467,32 @@ class ImageZoomInTool(BaseTool):
 
         return [left, top, right, bottom]
 
+    def _terminal_error_response(
+        self, error: str, debug_info: dict[str, Any], terminal_reason: str = "image_zoom_in_tool_error"
+    ) -> tuple[ToolResponse, float, dict]:
+        debug_info["success"] = False
+        debug_info["terminal"] = True
+        debug_info["terminal_reason"] = terminal_reason
+        debug_info["error"] = error
+        return (
+            ToolResponse(
+                text=f"Error processing image zoom-in: {error}",
+                terminate=True,
+                terminal_reason=terminal_reason,
+            ),
+            -0.05,
+            debug_info,
+        )
+
+    def _validate_cropped_aspect_ratio(self, width: int, height: int) -> float:
+        aspect_ratio = max(float(width) / float(height), float(height) / float(width))
+        if aspect_ratio > self.max_cropped_aspect_ratio:
+            raise ValueError(
+                f"cropped image aspect ratio {aspect_ratio:.1f} exceeds "
+                f"max_cropped_aspect_ratio={self.max_cropped_aspect_ratio}"
+            )
+        return aspect_ratio
+
     async def execute(self, instance_id: str, parameters: dict[str, Any], **kwargs) -> tuple[ToolResponse, float, dict]:
         bbox_2d = parameters.get("bbox_2d")
         label = parameters.get("label")
@@ -475,17 +505,12 @@ class ImageZoomInTool(BaseTool):
         }
 
         if not bbox_2d or len(bbox_2d) != 4:
-            debug_info["success"] = False
-            debug_info["error"] = "bbox_2d parameter is missing or not a list of 4 numbers."
-            return (
-                ToolResponse(text="Error: bbox_2d parameter is missing or not a list of 4 numbers."),
-                -0.05,
+            return self._terminal_error_response(
+                "bbox_2d parameter is missing or not a list of 4 numbers.",
                 debug_info,
             )
         if "label" not in parameters:
-            debug_info["success"] = False
-            debug_info["error"] = "label parameter is missing."
-            return ToolResponse(text="Error: label parameter is missing."), -0.05, debug_info
+            return self._terminal_error_response("label parameter is missing.", debug_info)
 
         try:
             img_idx = self._parse_img_idx(parameters)
@@ -512,8 +537,13 @@ class ImageZoomInTool(BaseTool):
                 min_pixels=self.cropped_min_pixels,
                 max_pixels=self.cropped_max_pixels,
             )
-            cropped_image = cropped_image.resize((new_width, new_height), resample=Image.BICUBIC)
             debug_info["cropped_image_size"] = [new_width, new_height]
+            debug_info["max_cropped_aspect_ratio"] = self.max_cropped_aspect_ratio
+            debug_info["cropped_aspect_ratio"] = max(
+                float(new_width) / float(new_height), float(new_height) / float(new_width)
+            )
+            self._validate_cropped_aspect_ratio(new_width, new_height)
+            cropped_image = cropped_image.resize((new_width, new_height), resample=Image.BICUBIC)
             crop_ref = save_crop_image(
                 cropped_image,
                 cache_root=getattr(kwargs.get("agent_data"), "crop_cache_root", None) or self.crop_cache_root,
@@ -533,9 +563,7 @@ class ImageZoomInTool(BaseTool):
             logger.error(f"Error processing image zoom-in: {e}")
             if isinstance(e, OriginalSourceUnavailableError):
                 debug_info.update(e.source_info)
-            debug_info["success"] = False
-            debug_info["error"] = str(e)
-            return ToolResponse(text=f"Error processing image zoom-in: {e}"), -0.05, debug_info
+            return self._terminal_error_response(str(e), debug_info)
 
         response_text = f"Zoomed in on the image to the region {bbox_2d}."
         response_text = f"Zoomed in on the image to the region {bbox_2d} with label {label}."

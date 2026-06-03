@@ -49,6 +49,13 @@ from verl.workers.rollout.replica import TokenOutput
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+TERMINAL_TOOL_EXTRA_FIELD_DEFAULTS: dict[str, Any] = {
+    "terminated_by_tool_error": False,
+    "terminal_tool_name": None,
+    "terminal_tool_error": None,
+    "terminal_reason": None,
+}
+
 
 class AgentState(Enum):
     PENDING = "pending"
@@ -238,7 +245,7 @@ class ToolAgentLoop(AgentLoopBase):
             num_turns=agent_data.user_turns + agent_data.assistant_turns + 1,
             metrics=agent_data.metrics,
             routed_experts=agent_data.routed_experts,
-            extra_fields=agent_data.extra_fields,
+            extra_fields={**TERMINAL_TOOL_EXTRA_FIELD_DEFAULTS, **agent_data.extra_fields},
         )
         output.extra_fields.update(
             {
@@ -358,6 +365,49 @@ class ToolAgentLoop(AgentLoopBase):
 
         with simple_timer("tool_calls", agent_data.metrics):
             responses = await asyncio.gather(*tasks)
+
+        for tool_call, (tool_response, tool_reward, tool_info) in zip(active_tool_calls, responses, strict=False):
+            if not tool_response.terminate:
+                continue
+            if self._debug_enabled_for_agent(agent_data):
+                event = {
+                    "event": "tool_response",
+                    "request_id": agent_data.request_id,
+                    "assistant_turn": agent_data.assistant_turns,
+                    "tool_name": tool_call.name,
+                    "tool_arguments": tool_call.arguments,
+                    "tool_response_text": tool_response.text,
+                    "tool_reward": tool_reward,
+                    "tool_info": tool_info,
+                    "terminal": True,
+                }
+                agent_data.debug_events.append(event)
+                self._debug_append_event(event)
+
+            terminal_text = tool_response.text or "Error processing tool call."
+            agent_data.messages.append({"role": "tool", "content": terminal_text})
+            if tool_reward is not None:
+                agent_data.tool_rewards.append(tool_reward)
+            agent_data.extra_fields.update(
+                {
+                    "terminated_by_tool_error": True,
+                    "terminal_tool_name": tool_call.name,
+                    "terminal_tool_error": terminal_text,
+                    "terminal_reason": tool_response.terminal_reason,
+                }
+            )
+            response_ids = await self.apply_chat_template(
+                [{"role": "tool", "content": terminal_text}],
+                images=None,
+                videos=None,
+                remove_system_prompt=True,
+            )
+            agent_data.prompt_ids += response_ids
+            agent_data.response_mask += [0] * len(response_ids)
+            if agent_data.response_logprobs:
+                agent_data.response_logprobs += [0.0] * len(response_ids)
+            agent_data.user_turns += 1
+            return AgentState.TERMINATED
 
         # Process tool responses and update multi_modal_data
         # Removed: agent_data.new_images_this_turn = []
@@ -522,9 +572,9 @@ class ToolAgentLoop(AgentLoopBase):
         """Call tool and return tool response."""
         tool, instance_id = None, None
         res = {}
+        tool_name = tool_call.name
         try:
             # TODO: append malformed tool_call to the prompt: invalid function name or arguments
-            tool_name = tool_call.name
             tool_args = json.loads(tool_call.arguments)
             if self._debug_enabled_for_agent(agent_data):
                 event = {
@@ -555,6 +605,17 @@ class ToolAgentLoop(AgentLoopBase):
         except Exception as e:
             logger.warning(f"Error when executing tool: {e}")
             res = {"success": False, "error": str(e)}
+            if tool_name == "image_zoom_in_tool":
+                res.update({"terminal": True, "terminal_reason": "image_zoom_in_tool_error"})
+                return (
+                    ToolResponse(
+                        text=f"Error processing image zoom-in: {e}",
+                        terminate=True,
+                        terminal_reason="image_zoom_in_tool_error",
+                    ),
+                    -0.05,
+                    res,
+                )
             return (
                 ToolResponse(
                     text=f"Error when executing tool: {e}",
@@ -587,6 +648,9 @@ class ToolAgentLoop(AgentLoopBase):
                     tool_response_kwargs[attr_name] = attr_value
         if tool_execution_response.crop_image_refs:
             tool_response_kwargs["crop_image_refs"] = tool_execution_response.crop_image_refs
+        if tool_execution_response.terminate:
+            tool_response_kwargs["terminate"] = tool_execution_response.terminate
+            tool_response_kwargs["terminal_reason"] = tool_execution_response.terminal_reason
 
         return ToolResponse(**tool_response_kwargs), tool_reward, res
 

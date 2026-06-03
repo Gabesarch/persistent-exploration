@@ -274,6 +274,35 @@ def test_optional_think_decoded_role_markers_without_answer_remain_invalid():
     }
 
 
+def test_optional_think_terminal_tool_error_without_answer_scores_zero():
+    solution = """
+I need to zoom.
+<tool_call>
+{"name": "image_zoom_in_tool", "arguments": {"bbox_2d": [0, 0, 7000, 20], "label": "line", "img_idx": 0}}
+</tool_call>
+<tool_response>
+Error processing image zoom-in: cropped image aspect ratio 300.0 exceeds max_cropped_aspect_ratio=199.0
+</tool_response>
+""".strip()
+
+    assert format_reward(solution) == 0.0
+    result = compute_score_from_data_source(
+        data_source="qwen3vl_filtering",
+        solution_str=solution,
+        ground_truth="6",
+        extra_info={"reward_type": "numeric"},
+        format_score=0.2,
+    )
+    assert result == {
+        "score": 0.0,
+        "accuracy": 0.0,
+        "format": 0.0,
+        "tool_call_count": 1,
+        "tool_efficiency": 0.5,
+        "tool_call_bonus": 0.0,
+    }
+
+
 def test_optional_think_tool_call_bonus_applies_at_threshold():
     solution = """
 I need a closer view.
