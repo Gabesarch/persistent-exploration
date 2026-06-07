@@ -19,7 +19,7 @@ set -euo pipefail
 CHECKPOINT_PATH="/scratch/gpfs/ZHUANGL/hw0171/Qwen3-VL-8B-Instruct"
 
 NUM_GPUS=1
-PORT=8002
+PORT=9001
 MODEL_NAME="qwen_vllm"
 API_KEY="qwen"
 

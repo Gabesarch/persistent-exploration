@@ -52,6 +52,29 @@ def _to_pixel(value: int, size: int) -> float:
 # ========== MCP Drawing Tools ==========
 
 
+# ========== Simple PIL-based tools (no distortion) ==========
+
+@app.tool(name="draw_line_simple", description="Draw a line on an image using PIL (no distortion). Coordinates use 0-1000 scale.")
+def draw_line_simple(
+    image_path: str,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    color: str = "red",
+    linewidth: int = 3,
+) -> ImageContent:
+    """Draw a line using PIL ImageDraw (no matplotlib distortion)."""
+    from PIL import ImageDraw
+    img = Image.open(image_path).convert("RGB")
+    w, h = img.size
+    px1, py1 = int(_to_pixel(x1, w)), int(_to_pixel(y1, h))
+    px2, py2 = int(_to_pixel(x2, w)), int(_to_pixel(y2, h))
+    draw = ImageDraw.Draw(img)
+    draw.line([(px1, py1), (px2, py2)], fill=color, width=linewidth)
+    return _image_to_content(np.array(img))
+
+
 @app.tool(name="draw_box", description="Draw a bounding box on an image. Coordinates use 0-1000 scale where (0,0)=top-left, (1000,1000)=bottom-right. Example: draw_box(img, 100, 200, 500, 600, linewidth=5) draws a thick box.")
 def draw_box(
     image_path: str,
@@ -371,6 +394,117 @@ def draw_polygon(
     return _image_to_content(vis.get_output().get_image())
 
 
+@app.tool(name="draw_mask", description="Draw a binary mask overlay on an image. Use this to highlight segmented regions.")
+def draw_mask(
+    image_path: str,
+    mask_path: str,
+    color: str = "blue",
+    alpha: float = 0.5,
+    text: str = None,
+) -> ImageContent:
+    """
+    Draw a binary mask on an image.
+
+    :param image_path: Path to the input image.
+    :param mask_path: Path to the binary mask image (white=foreground).
+    :param color: Color name for the mask overlay.
+    :param alpha: Opacity of the mask.
+    :param text: Optional text label to draw on the mask.
+    :return: Image with mask drawn.
+    """
+    img = np.array(Image.open(image_path).convert("RGB"))
+    mask = np.array(Image.open(mask_path).convert("L")) > 127
+    vis = Visualizer(img)
+    vis.draw_binary_mask(mask.astype(np.uint8), color=color, alpha=alpha, text=text)
+    return _image_to_content(vis.get_output().get_image())
+
+
+@app.tool(name="draw_numbered_mask", description="Draw a binary mask with a SoM-style numbered label at its center. Use this to mark and reference specific regions.")
+def draw_numbered_mask(
+    image_path: str,
+    mask_path: str,
+    number: int,
+    color: str = None,
+    alpha: float = 0.3,
+    label_mode: str = "1",
+    anno_mode: List[str] = ["Mask", "Mark"],
+) -> ImageContent:
+    """
+    Draw a binary mask with a numbered label (Set-of-Mark style).
+
+    :param image_path: Path to the input image.
+    :param mask_path: Path to the binary mask image.
+    :param number: The number to display on the mask.
+    :param color: Color name (random if None).
+    :param alpha: Opacity of the mask.
+    :param label_mode: '1' for numbers, 'a' for letters.
+    :param anno_mode: List containing 'Mask', 'Box', and/or 'Mark'.
+    :return: Image with numbered mask drawn.
+    """
+    img = np.array(Image.open(image_path).convert("RGB"))
+    mask = np.array(Image.open(mask_path).convert("L")) > 127
+    vis = Visualizer(img)
+    vis.draw_binary_mask_with_number(
+        mask.astype(np.uint8),
+        color=color,
+        text=str(number),
+        label_mode=label_mode,
+        alpha=alpha,
+        anno_mode=anno_mode,
+    )
+    return _image_to_content(vis.get_output().get_image())
+
+
+@app.tool(name="image_crop", description="Crop a region from an image to zoom in. Coordinates use 0-1000 scale. Example: image_crop(img, 250, 250, 750, 750) crops the center 50%.")
+def image_crop(
+    image_path: str,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+) -> ImageContent:
+    """
+    Crop a region from an image.
+
+    :param image_path: Path to the input image.
+    :param x1: Left x coordinate (0-1000).
+    :param y1: Top y coordinate (0-1000).
+    :param x2: Right x coordinate (0-1000).
+    :param y2: Bottom y coordinate (0-1000).
+    :return: Cropped image.
+    """
+    image = Image.open(image_path)
+    w, h = image.size
+    px1, py1 = int((x1 / COORD_SCALE) * w), int((y1 / COORD_SCALE) * h)
+    px2, py2 = int((x2 / COORD_SCALE) * w), int((y2 / COORD_SCALE) * h)
+    cropped = image.crop([px1, py1, px2, py2])
+    image_bytes = io.BytesIO()
+    cropped.save(image_bytes, format="PNG")
+    image_bytes.seek(0)
+    data = base64.b64encode(image_bytes.getvalue()).decode("utf-8")
+    return ImageContent(type="image", data=data, mimeType="image/png")
+
+
+@app.tool(name="image_resize", description="Resize an image by a scale factor. Use this to see more details.")
+def image_resize(image_path: str, scale: float = 2.0) -> ImageContent:
+    """
+    Resize an image by a scale factor.
+
+    :param image_path: Path to the input image.
+    :param scale: Scale factor (e.g., 2.0 = double the size).
+    :return: Resized image.
+    """
+    image = Image.open(image_path)
+    new_width = int(image.width * scale)
+    new_height = int(image.height * scale)
+    resized = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+    image_bytes = io.BytesIO()
+    resized.save(image_bytes, format="PNG")
+    image_bytes.seek(0)
+    data = base64.b64encode(image_bytes.getvalue()).decode("utf-8")
+    return ImageContent(type="image", data=data, mimeType="image/png")
+
+
 # ========== Vision Foundation Model Tools ==========
 
 # Lazy-loaded models
@@ -450,6 +584,68 @@ def _get_grounding_dino():
     return _grounding_dino_model, _grounding_dino_processor
 
 
+@app.tool(name="detect_objects", description="Detect objects matching a text description using GroundingDINO. Returns image with bounding boxes around detected objects and count. Use this to find specific objects like 'yellow flower' or 'person with red shirt'.")
+def detect_objects(
+    image_path: str,
+    prompt: str,
+    threshold: float = 0.3,
+) -> ImageContent:
+    """
+    Detect objects matching a text description.
+
+    :param image_path: Path to the input image.
+    :param prompt: Text description of objects to detect (e.g., 'yellow flower', 'cat', 'person').
+    :param threshold: Confidence threshold for detection (0-1).
+    :return: Image with bounding boxes and detection count.
+    """
+    import torch
+
+    image = Image.open(image_path).convert("RGB")
+    img_array = np.array(image)
+    h, w = img_array.shape[:2]
+
+    model, processor = _get_grounding_dino()
+    device = next(model.parameters()).device
+
+    inputs = processor(images=image, text=prompt, return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    with torch.no_grad():
+        outputs = model(**inputs)
+
+    results = processor.post_process_grounded_object_detection(
+        outputs,
+        inputs["input_ids"],
+        target_sizes=[(h, w)],
+    )[0]
+
+    boxes = results["boxes"].cpu().numpy()
+    scores = results["scores"].cpu().numpy()
+    # Use text_labels for string labels (labels will return int ids in future versions)
+    labels = results.get("text_labels", results.get("labels", []))
+
+    # Filter by threshold
+    mask = scores >= threshold
+    boxes = boxes[mask]
+    scores = scores[mask]
+    labels = [l for l, m in zip(labels, mask) if m]
+
+    vis = Visualizer(img_array)
+    for i, (box, score, label) in enumerate(zip(boxes, scores, labels)):
+        x1, y1, x2, y2 = box
+        color = "green" if score > 0.5 else "yellow"
+        vis.draw_box([x1, y1, x2, y2], edge_color=color, alpha=0.8)
+        vis.draw_text(f"{i+1}: {label} ({score:.2f})", (x1, y1 - 5), color=color, font_size=14)
+
+    result_img = vis.get_output().get_image()
+
+    count = len(boxes)
+    vis2 = Visualizer(result_img)
+    vis2.draw_text(f"Found {count} '{prompt}'", (10, 10), color="white", font_size=18)
+
+    return _image_to_content(vis2.get_output().get_image())
+
+
 @app.tool(name="estimate_depth", description="Estimate depth map from an image using Depth Anything. Returns depth visualization where lower value/darker = closer, higher value/brighter = farther.")
 def estimate_depth(
     image_path: str,
@@ -481,108 +677,275 @@ def estimate_depth(
     return _image_to_content(depth_colored)
 
 
-# @app.tool(name="estimate_depth_at_points", description="Estimate depth and mark two points A and B on the depth map. Lower depth value = closer to camera. Coordinates use 0-1000 scale.")
-# def estimate_depth_at_points(
-#     image_path: str,
-#     point_a_x: int,
-#     point_a_y: int,
-#     point_b_x: int,
-#     point_b_y: int,
-#     colormap: str = "inferno",
-# ) -> ImageContent:
-#     """
-#     Estimate depth and mark points A and B on the depth map.
+@app.tool(name="estimate_depth_at_points", description="Estimate depth and mark two points A and B on the depth map. Lower depth value = closer to camera. Coordinates use 0-1000 scale.")
+def estimate_depth_at_points(
+    image_path: str,
+    point_a_x: int,
+    point_a_y: int,
+    point_b_x: int,
+    point_b_y: int,
+    colormap: str = "inferno",
+) -> ImageContent:
+    """
+    Estimate depth and mark points A and B on the depth map.
 
-#     :param image_path: Path to the input image.
-#     :param point_a_x: X coordinate of point A (0-1000 scale).
-#     :param point_a_y: Y coordinate of point A (0-1000 scale).
-#     :param point_b_x: X coordinate of point B (0-1000 scale).
-#     :param point_b_y: Y coordinate of point B (0-1000 scale).
-#     :param colormap: Matplotlib colormap for visualization.
-#     :return: Depth map with marked points and their depth values. Lower value = closer to camera.
-#     """
-#     import matplotlib.cm as cm
+    :param image_path: Path to the input image.
+    :param point_a_x: X coordinate of point A (0-1000 scale).
+    :param point_a_y: Y coordinate of point A (0-1000 scale).
+    :param point_b_x: X coordinate of point B (0-1000 scale).
+    :param point_b_y: Y coordinate of point B (0-1000 scale).
+    :param colormap: Matplotlib colormap for visualization.
+    :return: Depth map with marked points and their depth values. Lower value = closer to camera.
+    """
+    import matplotlib.cm as cm
 
-#     image = Image.open(image_path).convert("RGB")
-#     img_array = np.array(image)
-#     h, w = img_array.shape[:2]
-#     depth_model = _get_depth_model()
+    image = Image.open(image_path).convert("RGB")
+    img_array = np.array(image)
+    h, w = img_array.shape[:2]
+    depth_model = _get_depth_model()
 
-#     result = depth_model(image)
-#     depth = np.array(result["depth"])
+    result = depth_model(image)
+    depth = np.array(result["depth"])
 
-#     if depth.shape[:2] != (h, w):
-#         depth_pil = Image.fromarray(depth)
-#         depth_pil = depth_pil.resize((w, h), Image.Resampling.BILINEAR)
-#         depth = np.array(depth_pil)
+    if depth.shape[:2] != (h, w):
+        depth_pil = Image.fromarray(depth)
+        depth_pil = depth_pil.resize((w, h), Image.Resampling.BILINEAR)
+        depth = np.array(depth_pil)
 
-#     # Normalize and invert to match convention (lower value = closer)
-#     depth_normalized = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
-#     depth_inverted = 1.0 - depth_normalized  # Now lower = closer
+    # Normalize and invert to match convention (lower value = closer)
+    depth_normalized = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
+    depth_inverted = 1.0 - depth_normalized  # Now lower = closer
 
-#     cmap = cm.get_cmap(colormap)
-#     depth_colored = (cmap(depth_inverted)[:, :, :3] * 255).astype(np.uint8)
+    cmap = cm.get_cmap(colormap)
+    depth_colored = (cmap(depth_inverted)[:, :, :3] * 255).astype(np.uint8)
 
-#     vis = Visualizer(depth_colored)
+    vis = Visualizer(depth_colored)
 
-#     # Collect depth values for summary
-#     depth_values = {}
-#     points = [(point_a_x, point_a_y, "A"), (point_b_x, point_b_y, "B")]
-#     for px_norm, py_norm, label in points:
-#         px = int(_to_pixel(px_norm, w))
-#         py = int(_to_pixel(py_norm, h))
-#         depth_val = depth_inverted[min(py, h - 1), min(px, w - 1)]
-#         depth_values[label] = depth_val
-#         vis.draw_circle((px, py), color="white", radius=15)
-#         vis.draw_circle((px, py), color="black", radius=12)
-#         vis.draw_text(f"{label}", (px, py - 20), color="white", font_size=20)
+    # Collect depth values for summary
+    depth_values = {}
+    points = [(point_a_x, point_a_y, "A"), (point_b_x, point_b_y, "B")]
+    for px_norm, py_norm, label in points:
+        px = int(_to_pixel(px_norm, w))
+        py = int(_to_pixel(py_norm, h))
+        depth_val = depth_inverted[min(py, h - 1), min(px, w - 1)]
+        depth_values[label] = depth_val
+        vis.draw_circle((px, py), color="white", radius=15)
+        vis.draw_circle((px, py), color="black", radius=12)
+        vis.draw_text(f"{label}", (px, py - 20), color="white", font_size=20)
 
-#     # Add summary at bottom showing both values
-#     a_val, b_val = depth_values["A"], depth_values["B"]
-#     vis.draw_text(f"A: {a_val:.2f}  B: {b_val:.2f}", (w // 2, h - 20), color="yellow", font_size=18, horizontal_alignment="center")
+    # Add summary at bottom showing both values
+    a_val, b_val = depth_values["A"], depth_values["B"]
+    vis.draw_text(f"A: {a_val:.2f}  B: {b_val:.2f}", (w // 2, h - 20), color="yellow", font_size=18, horizontal_alignment="center")
 
-#     return _image_to_content(vis.get_output().get_image())
+    return _image_to_content(vis.get_output().get_image())
 
 
-# @app.tool(name="estimate_depth_overlay", description="Overlay depth estimation on the original image. Useful to see depth context with the scene.")
-# def estimate_depth_overlay(
-#     image_path: str,
-#     alpha: float = 0.5,
-#     colormap: str = "inferno",
-# ) -> ImageContent:
-#     """
-#     Overlay depth map on original image.
+@app.tool(name="estimate_depth_overlay", description="Overlay depth estimation on the original image. Useful to see depth context with the scene.")
+def estimate_depth_overlay(
+    image_path: str,
+    alpha: float = 0.5,
+    colormap: str = "inferno",
+) -> ImageContent:
+    """
+    Overlay depth map on original image.
 
-#     :param image_path: Path to the input image.
-#     :param alpha: Opacity of the depth overlay (0-1).
-#     :param colormap: Matplotlib colormap for depth visualization.
-#     :return: Image with depth overlay.
-#     """
-#     import matplotlib.cm as cm
+    :param image_path: Path to the input image.
+    :param alpha: Opacity of the depth overlay (0-1).
+    :param colormap: Matplotlib colormap for depth visualization.
+    :return: Image with depth overlay.
+    """
+    import matplotlib.cm as cm
 
-#     image = Image.open(image_path).convert("RGB")
-#     img_array = np.array(image)
-#     depth_model = _get_depth_model()
+    image = Image.open(image_path).convert("RGB")
+    img_array = np.array(image)
+    depth_model = _get_depth_model()
 
-#     # Run depth estimation
-#     result = depth_model(image)
-#     depth = np.array(result["depth"])
+    # Run depth estimation
+    result = depth_model(image)
+    depth = np.array(result["depth"])
 
-#     # Resize depth to match image if needed
-#     if depth.shape[:2] != img_array.shape[:2]:
-#         depth_pil = Image.fromarray(depth)
-#         depth_pil = depth_pil.resize((img_array.shape[1], img_array.shape[0]), Image.Resampling.BILINEAR)
-#         depth = np.array(depth_pil)
+    # Resize depth to match image if needed
+    if depth.shape[:2] != img_array.shape[:2]:
+        depth_pil = Image.fromarray(depth)
+        depth_pil = depth_pil.resize((img_array.shape[1], img_array.shape[0]), Image.Resampling.BILINEAR)
+        depth = np.array(depth_pil)
 
-#     # Normalize and colorize depth
-#     depth_normalized = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
-#     cmap = cm.get_cmap(colormap)
-#     depth_colored = (cmap(depth_normalized)[:, :, :3] * 255).astype(np.uint8)
+    # Normalize and colorize depth
+    depth_normalized = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
+    cmap = cm.get_cmap(colormap)
+    depth_colored = (cmap(depth_normalized)[:, :, :3] * 255).astype(np.uint8)
 
-#     # Blend with original
-#     blended = (img_array * (1 - alpha) + depth_colored * alpha).astype(np.uint8)
+    # Blend with original
+    blended = (img_array * (1 - alpha) + depth_colored * alpha).astype(np.uint8)
 
-#     return _image_to_content(blended)
+    return _image_to_content(blended)
+
+
+@app.tool(name="segment_point", description="Segment an object at a specific point using SAM. Coordinates use 0-1000 scale. Returns the image with the segmented region highlighted.")
+def segment_point(
+    image_path: str,
+    x: int,
+    y: int,
+    color: str = "blue",
+    alpha: float = 0.5,
+) -> ImageContent:
+    """
+    Segment the object at a specific point.
+
+    :param image_path: Path to the input image.
+    :param x: X coordinate of the point (0-1000).
+    :param y: Y coordinate of the point (0-1000).
+    :param color: Color for the segmentation mask.
+    :param alpha: Opacity of the mask overlay.
+    :return: Image with segmentation mask.
+    """
+    import matplotlib.colors as mcolors
+
+    image = Image.open(image_path).convert("RGB")
+    img_array = np.array(image)
+    h, w = img_array.shape[:2]
+
+    # Convert coordinates
+    px = int(_to_pixel(x, w))
+    py = int(_to_pixel(y, h))
+
+    # Get SAM predictor
+    predictor = _get_sam_predictor()
+    predictor.set_image(img_array)
+
+    # Predict mask
+    point_coords = np.array([[px, py]])
+    point_labels = np.array([1])  # 1 = foreground
+    masks, scores, _ = predictor.predict(
+        point_coords=point_coords,
+        point_labels=point_labels,
+        multimask_output=True,
+    )
+
+    # Use highest scoring mask
+    best_idx = np.argmax(scores)
+    mask = masks[best_idx]
+
+    # Create colored overlay
+    rgb_color = np.array(mcolors.to_rgb(color)) * 255
+    overlay = img_array.copy().astype(np.float32)
+    overlay[mask] = overlay[mask] * (1 - alpha) + rgb_color * alpha
+    overlay = overlay.astype(np.uint8)
+
+    # Draw the point
+    vis = Visualizer(overlay)
+    vis.draw_circle((px, py), color="red", radius=10)
+
+    return _image_to_content(vis.get_output().get_image())
+
+
+@app.tool(name="segment_box", description="Segment objects within a bounding box using SAM. Coordinates use 0-1000 scale.")
+def segment_box(
+    image_path: str,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    color: str = "blue",
+    alpha: float = 0.5,
+) -> ImageContent:
+    """
+    Segment objects within a bounding box.
+
+    :param image_path: Path to the input image.
+    :param x1: Left x coordinate (0-1000).
+    :param y1: Top y coordinate (0-1000).
+    :param x2: Right x coordinate (0-1000).
+    :param y2: Bottom y coordinate (0-1000).
+    :param color: Color for the segmentation mask.
+    :param alpha: Opacity of the mask overlay.
+    :return: Image with segmentation mask.
+    """
+    import matplotlib.colors as mcolors
+
+    image = Image.open(image_path).convert("RGB")
+    img_array = np.array(image)
+    h, w = img_array.shape[:2]
+
+    # Convert coordinates
+    px1, py1 = int(_to_pixel(x1, w)), int(_to_pixel(y1, h))
+    px2, py2 = int(_to_pixel(x2, w)), int(_to_pixel(y2, h))
+
+    # Get SAM predictor
+    predictor = _get_sam_predictor()
+    predictor.set_image(img_array)
+
+    # Predict mask with box prompt
+    box = np.array([px1, py1, px2, py2])
+    masks, scores, _ = predictor.predict(
+        box=box,
+        multimask_output=True,
+    )
+
+    # Use highest scoring mask
+    best_idx = np.argmax(scores)
+    mask = masks[best_idx]
+
+    # Create colored overlay
+    rgb_color = np.array(mcolors.to_rgb(color)) * 255
+    overlay = img_array.copy().astype(np.float32)
+    overlay[mask] = overlay[mask] * (1 - alpha) + rgb_color * alpha
+    overlay = overlay.astype(np.uint8)
+
+    # Draw the box
+    vis = Visualizer(overlay)
+    vis.draw_box([px1, py1, px2, py2], edge_color="red", alpha=0.8)
+
+    return _image_to_content(vis.get_output().get_image())
+
+
+@app.tool(name="segment_all", description="Segment all objects in an image using SAM automatic mask generation. Returns image with all segments colored. Use this to see all distinct objects/regions in the image.")
+def segment_all(
+    image_path: str,
+    min_area: int = 100,
+    max_masks: int = 30,
+    alpha: float = 0.5,
+) -> ImageContent:
+    """
+    Automatically segment all objects in an image.
+
+    :param image_path: Path to the input image.
+    :param min_area: Minimum mask area in pixels to include.
+    :param max_masks: Maximum number of masks to show.
+    :param alpha: Opacity of the mask overlay (0-1).
+    :return: Image with all segments visualized with distinct colors.
+    """
+    from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+    import matplotlib.colors as mcolors
+
+    image = Image.open(image_path).convert("RGB")
+    img_array = np.array(image)
+
+    # Get SAM model and create mask generator
+    predictor = _get_sam_predictor()
+    mask_generator = SAM2AutomaticMaskGenerator(predictor.model)
+
+    # Generate masks
+    masks = mask_generator.generate(img_array)
+
+    # Filter and sort by area
+    masks = [m for m in masks if m["area"] >= min_area]
+    masks = sorted(masks, key=lambda x: x["area"], reverse=True)[:max_masks]
+
+    # Visualize with distinct colors (no labels)
+    vis = Visualizer(img_array)
+    colors = list(mcolors.TABLEAU_COLORS.values()) + list(mcolors.CSS4_COLORS.values())
+    for i, mask_data in enumerate(masks):
+        mask = mask_data["segmentation"]
+        color = colors[i % len(colors)]
+        vis.draw_binary_mask(
+            mask.astype(np.uint8),
+            color=color,
+            alpha=alpha,
+        )
+
+    return _image_to_content(vis.get_output().get_image())
+
 
 if __name__ == "__main__":
     app.run()
