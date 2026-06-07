@@ -67,6 +67,7 @@ nohup vllm serve "$CHECKPOINT_PATH" \
   --api-key "$API_KEY" \
   --enable-auto-tool-choice \
   --tool-call-parser hermes \
+  --enforce-eager \
   > "$LOGFILE" 2>&1 &
 disown
 

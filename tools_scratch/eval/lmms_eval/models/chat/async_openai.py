@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -35,6 +36,11 @@ from lmms_eval.protocol import ChatMessages
 
 VideoReader, _ = optional_import("decord", "VideoReader")
 cpu, _ = optional_import("decord", "cpu")
+
+# Sentinel emitted by MCP tools (see lmms_eval/mcp/vero2_mcp.py) so the
+# client can discover and clean up tool-generated image files after each
+# request finishes.
+_TOOL_SAVED_IMAGE_RE = re.compile(r"Saved drawn image to:\s*(\S+)")
 
 load_dotenv(verbose=True)
 
@@ -189,10 +195,25 @@ class AsyncOpenAIChat(lmms):
             messages = chat_messages.to_openai_messages(video_kwargs)
         messages = self._apply_system_prompt(messages, self.system_prompt) if self.system_prompt else messages
         images, videos, audios = chat_messages.extract_media()
+        # Track every image file that belongs to this request so we can
+        # delete them after the model finishes answering (avoids unbounded
+        # accumulation of input copies and chained tool outputs on disk).
+        request_image_paths: List[str] = []
+
+        def _cleanup_request_images():
+            for path in request_image_paths:
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    eval_logger.debug(f"Failed to remove tool image {path}: {exc}")
+
         if self.mcp_client is not None:
             for image_idx, image in enumerate(images):
                 image_path = os.path.join(self.work_dir, f"{uuid.uuid4()}.jpg")
                 image.save(image_path)
+                request_image_paths.append(image_path)
                 messages[-1]["content"].append(
                     {
                         "type": "text",
@@ -207,97 +228,34 @@ class AsyncOpenAIChat(lmms):
                     }
                 )
 
-        payload = {"messages": messages}
-        payload["model"] = self.model_version
-        all_response = ""
-        total_input_tokens = 0
-        total_output_tokens = 0
-        total_reasoning_tokens = 0
-
-        if "max_new_tokens" not in gen_kwargs:
-            gen_kwargs["max_new_tokens"] = 1024
-        if "temperature" not in gen_kwargs:
-            gen_kwargs["temperature"] = 0
-        if "top_p" not in gen_kwargs:
-            gen_kwargs["top_p"] = None
-        if "do_sample" not in gen_kwargs:
-            gen_kwargs["do_sample"] = False
-        # payload["max_completion_tokens"] = gen_kwargs["max_new_tokens"]
-        payload["max_tokens"] = gen_kwargs["max_new_tokens"]
-        payload["temperature"] = gen_kwargs["temperature"]
-
-        if self.mcp_client is not None:
-            # get the function list from the MCP server
-            functions = await self.mcp_client.get_function_list()
-            payload["tools"] = functions
-            payload["tool_choice"] = "auto"  # or "auto" for automatic tool selection
-
-        response = await self.client.chat.completions.create(**payload)
-        last_response = response.choices[0].message.content or ""
-        # Extract usage metrics
-        input_tokens = 0
-        output_tokens = 0
-        reasoning_tokens = 0
-        if hasattr(response, "usage") and response.usage:
-            input_tokens = getattr(response.usage, "prompt_tokens", 0) or 0
-            output_tokens = getattr(response.usage, "completion_tokens", 0) or 0
-            if hasattr(response.usage, "completion_tokens_details") and response.usage.completion_tokens_details:
-                reasoning_tokens = getattr(response.usage.completion_tokens_details, "reasoning_tokens", 0) or 0
-        total_input_tokens += input_tokens
-        total_output_tokens += output_tokens
-        total_reasoning_tokens += reasoning_tokens
-        log_usage(
-            model_name=self.model_version,
-            task_name=task if "task" in locals() else None,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            reasoning_tokens=reasoning_tokens,
-            source="model",
-        )
-        # Sometimes asyncio return None, skip this case
         try:
-            all_response += last_response
-        except Exception as e:
-            all_response += f"Error: {str(e)}"
+            payload = {"messages": messages}
+            payload["model"] = self.model_version
+            all_response = ""
+            total_input_tokens = 0
+            total_output_tokens = 0
+            total_reasoning_tokens = 0
 
-        max_tool_iterations = 10
-        tool_iteration = 0
-        while response.choices[0].finish_reason == "tool_calls" and tool_iteration < max_tool_iterations:
-            tool_iteration += 1
-            messages.append({"role": "assistant", "content": last_response})
-            messages.append(
-                {
-                    "role": "assistant",
-                    "tool_calls": response.choices[0].message.tool_calls,
-                }
-            )
-            message = response.choices[0].message
-            tool_messages = []
-            if message.tool_calls:
-                eval_logger.debug("Calling tool with MCP client")
-                for call in message.tool_calls:
-                    eval_logger.debug(f"Calling {call.function.name}...")
-                    result = await self.mcp_client.run_tool(call.function.name, json.loads(call.function.arguments))
-                    all_response += f"<tool_call>{call.function.name} {call.function.arguments}</tool_call></tool_response>"
-                    tool_messages.append({"role": "tool", "name": call.function.name, "content": []})
-                    for content in result.content:
-                        tool_message = self.mcp_client.convert_result_to_openai_format(content)
-                        for content in tool_message:
-                            if content["type"] == "image_url":
-                                all_response += "<image_url>"
-                            elif content["type"] == "text":
-                                all_response += content["text"]
-                        tool_messages[-1]["content"].extend(tool_message)
-                    all_response += "</tool_response>"
+            if "max_new_tokens" not in gen_kwargs:
+                gen_kwargs["max_new_tokens"] = 1024
+            if "temperature" not in gen_kwargs:
+                gen_kwargs["temperature"] = 0
+            if "top_p" not in gen_kwargs:
+                gen_kwargs["top_p"] = None
+            if "do_sample" not in gen_kwargs:
+                gen_kwargs["do_sample"] = False
+            # payload["max_completion_tokens"] = gen_kwargs["max_new_tokens"]
+            payload["max_tokens"] = gen_kwargs["max_new_tokens"]
+            payload["temperature"] = gen_kwargs["temperature"]
 
-            response = await self.client.chat.completions.create(
-                model=self.model_version,
-                messages=messages + tool_messages,
-                max_tokens=gen_kwargs["max_new_tokens"],
-                temperature=gen_kwargs["temperature"],
-                tools=functions,
-                tool_choice="auto",
-            )
+            if self.mcp_client is not None:
+                # get the function list from the MCP server
+                functions = await self.mcp_client.get_function_list()
+                payload["tools"] = functions
+                payload["tool_choice"] = "auto"  # or "auto" for automatic tool selection
+
+            response = await self.client.chat.completions.create(**payload)
+            last_response = response.choices[0].message.content or ""
             # Extract usage metrics
             input_tokens = 0
             output_tokens = 0
@@ -318,16 +276,86 @@ class AsyncOpenAIChat(lmms):
                 reasoning_tokens=reasoning_tokens,
                 source="model",
             )
-            last_response = response.choices[0].message.content or ""
+            # Sometimes asyncio return None, skip this case
             try:
                 all_response += last_response
             except Exception as e:
-                all_response += str(e)
+                all_response += f"Error: {str(e)}"
 
-        if tool_iteration >= max_tool_iterations:
-            eval_logger.warning(f"Max tool iterations ({max_tool_iterations}) reached for request {idx}")
-            all_response += f"\n[MAX_TOOL_ITERATIONS_REACHED]"
-        return all_response, idx, TokenCounts(input_tokens=total_input_tokens, output_tokens=total_output_tokens, reasoning_tokens=total_reasoning_tokens)
+            max_tool_iterations = 5
+            tool_iteration = 0
+            while response.choices[0].finish_reason == "tool_calls" and tool_iteration < max_tool_iterations:
+                tool_iteration += 1
+                messages.append({"role": "assistant", "content": last_response})
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "tool_calls": response.choices[0].message.tool_calls,
+                    }
+                )
+                message = response.choices[0].message
+                tool_messages = []
+                if message.tool_calls:
+                    eval_logger.debug("Calling tool with MCP client")
+                    for call in message.tool_calls:
+                        eval_logger.debug(f"Calling {call.function.name}...")
+                        result = await self.mcp_client.run_tool(call.function.name, json.loads(call.function.arguments))
+                        all_response += f"<tool_call>{call.function.name} {call.function.arguments}</tool_call></tool_response>"
+                        tool_messages.append({"role": "tool", "name": call.function.name, "content": []})
+                        for content in result.content:
+                            tool_message = self.mcp_client.convert_result_to_openai_format(content)
+                            for content in tool_message:
+                                if content["type"] == "image_url":
+                                    all_response += "<image_url>"
+                                elif content["type"] == "text":
+                                    all_response += content["text"]
+                                    # Discover paths of tool-generated images so we can
+                                    # clean them up after the request finishes.
+                                    for match in _TOOL_SAVED_IMAGE_RE.finditer(content["text"]):
+                                        request_image_paths.append(match.group(1))
+                            tool_messages[-1]["content"].extend(tool_message)
+                        all_response += "</tool_response>"
+
+                response = await self.client.chat.completions.create(
+                    model=self.model_version,
+                    messages=messages + tool_messages,
+                    max_tokens=gen_kwargs["max_new_tokens"],
+                    temperature=gen_kwargs["temperature"],
+                    tools=functions,
+                    tool_choice="auto",
+                )
+                # Extract usage metrics
+                input_tokens = 0
+                output_tokens = 0
+                reasoning_tokens = 0
+                if hasattr(response, "usage") and response.usage:
+                    input_tokens = getattr(response.usage, "prompt_tokens", 0) or 0
+                    output_tokens = getattr(response.usage, "completion_tokens", 0) or 0
+                    if hasattr(response.usage, "completion_tokens_details") and response.usage.completion_tokens_details:
+                        reasoning_tokens = getattr(response.usage.completion_tokens_details, "reasoning_tokens", 0) or 0
+                total_input_tokens += input_tokens
+                total_output_tokens += output_tokens
+                total_reasoning_tokens += reasoning_tokens
+                log_usage(
+                    model_name=self.model_version,
+                    task_name=task if "task" in locals() else None,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    reasoning_tokens=reasoning_tokens,
+                    source="model",
+                )
+                last_response = response.choices[0].message.content or ""
+                try:
+                    all_response += last_response
+                except Exception as e:
+                    all_response += str(e)
+
+            if tool_iteration >= max_tool_iterations:
+                eval_logger.warning(f"Max tool iterations ({max_tool_iterations}) reached for request {idx}")
+                all_response += f"\n[MAX_TOOL_ITERATIONS_REACHED]"
+            return all_response, idx, TokenCounts(input_tokens=total_input_tokens, output_tokens=total_output_tokens, reasoning_tokens=total_reasoning_tokens)
+        finally:
+            _cleanup_request_images()
 
     def generate_until(self, requests) -> List[GenerationResult]:
         results = []
