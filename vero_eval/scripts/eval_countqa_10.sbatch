@@ -19,8 +19,14 @@
 
 set -euo pipefail
 
-SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERO_EVAL_DIR="$(cd "$SELF/.." && pwd)"
+# SLURM copies this script elsewhere, so derive the package dir from the submit
+# directory (submit from the repo root, as the --output paths above assume).
+VERO_EVAL_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}/vero_eval"
+if [[ ! -f "$VERO_EVAL_DIR/set_paths.sh.example" ]]; then
+  echo "ERROR: $VERO_EVAL_DIR not found. Submit from the repo root:" >&2
+  echo "  sbatch vero_eval/scripts/eval_countqa_10.sbatch" >&2
+  exit 1
+fi
 set +u
 if [[ -f "$VERO_EVAL_DIR/set_paths.sh" ]]; then
   source "$VERO_EVAL_DIR/set_paths.sh"
