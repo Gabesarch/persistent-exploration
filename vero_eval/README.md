@@ -66,3 +66,25 @@ Tool usage is orthogonal to the yaml — enable it with `mcp_server_path` (defau
 
 Validate tool-image rendering for a new checkpoint:
 `sbatch vero_eval/scripts/probe_tool_image.sbatch`.
+
+## Judge (for judge-based tasks, e.g. visual_probe / simplevqa / mathvista)
+countqa is `exact_match` (no judge). Judge tasks score via `get_judge_engine`, picked
+by `JUDGE_BACKEND` in `eval_domain.sh`:
+
+| `JUDGE_BACKEND` | judge | GPU | when |
+|---|---|---|---|
+| `server` (recommended on 1 GPU) | reuses the policy server on `$PORT` → judge **is** the Qwen3-VL policy | **0 extra** | single H100; vision-capable |
+| `engine` (default) | in-process **Qwen3-32B** (text-only) | needs a free GPU (OOMs beside the 0.9-util policy) | 2-GPU alloc, or no resident policy |
+| `server` + `START_VLLM_JUDGE_SERVER=1` | dedicated sleep-mode judge (Qwen3-32B) via `scripts/serve_judge_vllm.sh` | its own GPU (set `VLLM_JUDGE_CUDA_VISIBLE_DEVICES`) | want a strong judge + 2nd GPU |
+
+Run a judge task (reuses the policy server, zero extra GPU):
+```bash
+sbatch vero_eval/scripts/eval_visual_probe.sbatch        # JUDGE_BACKEND=server by default
+# or interactively, with the policy server already up:
+JUDGE_BACKEND=server bash examples/eval_domain.sh --tasks visual_probe_easy_qwen3_zs --limit 20
+```
+For a dedicated Qwen3-32B judge on a 2-GPU node:
+```bash
+sbatch --gres=gpu:2 --export=ALL,JUDGE_BACKEND=server,START_VLLM_JUDGE_SERVER=1,VLLM_JUDGE_CUDA_VISIBLE_DEVICES=1 \
+  vero_eval/scripts/eval_visual_probe.sbatch
+```

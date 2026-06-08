@@ -68,10 +68,18 @@ if [[ "$JUDGE_BACKEND" == "engine" ]]; then
   export VLLM_JUDGE_MAX_NUM_SEQS="${VLLM_JUDGE_MAX_NUM_SEQS:-32}"
   unset VLLM_SERVER_JUDGE VLLM_JUDGE_BASE_URL VLLM_JUDGE_PORT VLLM_JUDGE_MODEL_PATH 2>/dev/null || true
 elif [[ "$JUDGE_BACKEND" == "server" ]]; then
-  # Judge served over HTTP via wake/sleep (VLLMServerJudge). Defaults to reusing
-  # the policy server on $PORT (single GPU); set VLLM_JUDGE_BASE_URL for a separate one.
+  # Judge served over HTTP via wake/sleep (VLLMServerJudge).
   export VLLM_SERVER_JUDGE=1
-  export VLLM_JUDGE_BASE_URL="${VLLM_JUDGE_BASE_URL:-http://localhost:${PORT}/v1}"
+  if [[ "${START_VLLM_JUDGE_SERVER:-0}" == "1" ]]; then
+    # Launch a DEDICATED judge server (e.g. Qwen3-32B). Needs a free GPU — on a
+    # single H100 give it its own: request gpu:2 and set VLLM_JUDGE_CUDA_VISIBLE_DEVICES=1.
+    # serve_judge_vllm.sh exports VLLM_JUDGE_BASE_URL.
+    source "$VERO_EVAL_DIR/scripts/serve_judge_vllm.sh"
+  else
+    # Default: reuse the policy server on $PORT as the judge (judge == policy model,
+    # zero extra GPU). wake/sleep are harmless no-ops against the non-sleep server.
+    export VLLM_JUDGE_BASE_URL="${VLLM_JUDGE_BASE_URL:-http://localhost:${PORT}/v1}"
+  fi
   export VLLM_JUDGE_MODEL_PATH="${VLLM_JUDGE_MODEL_PATH:-qwen_vllm}"
   export JUDGE_MODEL_PATH="${JUDGE_MODEL_PATH:-$VLLM_JUDGE_MODEL_PATH}"
 else
