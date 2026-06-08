@@ -1,0 +1,7 @@
+# Run outputs and scratch artifacts (do not commit)
+logs/
+lc1556/
+**/vllm_logs/
+eval/eval_results/countqa_10_lc1556/
+eval/eval_results/countqa_10_postfix/
+**/__pycache__/

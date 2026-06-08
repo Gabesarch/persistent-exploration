@@ -78,6 +78,9 @@ class AsyncOpenAIChat(lmms):
         prefix_aware_queue: bool = True,
         prefix_hash_chars: int = 256,
         system_prompt: Optional[str] = None,
+        max_tool_iterations: int = 10,
+        max_tool_images: int = 8,
+        tool_image_as_user_turn: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -126,6 +129,12 @@ class AsyncOpenAIChat(lmms):
             os.makedirs(self.work_dir, exist_ok=True)
         else:
             self.mcp_client = None
+        # Multi-turn tool loop controls (model_args). Tool list is fetched once
+        # and cached to avoid forking the MCP server subprocess on every request.
+        self.max_tool_iterations = int(max_tool_iterations)
+        self.max_tool_images = int(max_tool_images)
+        self.tool_image_as_user_turn = parse_bool(tool_image_as_user_turn)
+        self._tool_functions = None
 
         accelerator = Accelerator()
         # assert self.batch_size_per_gpu == 1, "Llava currently does not support batched generation. See https://github.com/haotian-liu/LLaVA/issues/754. HF Llava also has this issue."
@@ -240,19 +249,35 @@ class AsyncOpenAIChat(lmms):
                 gen_kwargs["max_new_tokens"] = 1024
             if "temperature" not in gen_kwargs:
                 gen_kwargs["temperature"] = 0
-            if "top_p" not in gen_kwargs:
-                gen_kwargs["top_p"] = None
-            if "do_sample" not in gen_kwargs:
-                gen_kwargs["do_sample"] = False
-            # payload["max_completion_tokens"] = gen_kwargs["max_new_tokens"]
             payload["max_tokens"] = gen_kwargs["max_new_tokens"]
             payload["temperature"] = gen_kwargs["temperature"]
+            # Forward the FULL per-yaml sampling. Previously only max_tokens+temperature
+            # were sent, silently dropping top_p/top_k/penalties and collapsing the
+            # per-model templates (see memory multiturn-tool-eval-design). top_p /
+            # presence_penalty / frequency_penalty are OpenAI-native; top_k /
+            # repetition_penalty / min_p are forwarded through vLLM's extra_body.
+            # NOTE: we deliberately do NOT forward 'until'/'stop' (the harness injects
+            # until=["\n\n"], which would truncate CoT/tool reasoning mid-stream).
+            if gen_kwargs.get("top_p") is not None:
+                payload["top_p"] = gen_kwargs["top_p"]
+            for _sp in ("presence_penalty", "frequency_penalty"):
+                if gen_kwargs.get(_sp) is not None:
+                    payload[_sp] = gen_kwargs[_sp]
+            _extra_body = {}
+            for _sp in ("top_k", "repetition_penalty", "min_p"):
+                if gen_kwargs.get(_sp) is not None:
+                    _extra_body[_sp] = gen_kwargs[_sp]
+            if _extra_body:
+                payload["extra_body"] = _extra_body
 
             if self.mcp_client is not None:
-                # get the function list from the MCP server
-                functions = await self.mcp_client.get_function_list()
+                # Fetch the tool/function list ONCE and cache it (avoids forking the
+                # MCP server subprocess on every request via get_function_list).
+                if self._tool_functions is None:
+                    self._tool_functions = await self.mcp_client.get_function_list()
+                functions = self._tool_functions
                 payload["tools"] = functions
-                payload["tool_choice"] = "auto"  # or "auto" for automatic tool selection
+                payload["tool_choice"] = "auto"
 
             response = await self.client.chat.completions.create(**payload)
             last_response = response.choices[0].message.content or ""
@@ -282,48 +307,85 @@ class AsyncOpenAIChat(lmms):
             except Exception as e:
                 all_response += f"Error: {str(e)}"
 
-            max_tool_iterations = 5
             tool_iteration = 0
-            while response.choices[0].finish_reason == "tool_calls" and tool_iteration < max_tool_iterations:
+            tool_image_count = 0
+            while response.choices[0].finish_reason == "tool_calls" and tool_iteration < self.max_tool_iterations:
                 tool_iteration += 1
-                messages.append({"role": "assistant", "content": last_response})
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "tool_calls": response.choices[0].message.tool_calls,
-                    }
-                )
-                message = response.choices[0].message
-                tool_messages = []
-                if message.tool_calls:
-                    eval_logger.debug("Calling tool with MCP client")
-                    for call in message.tool_calls:
-                        eval_logger.debug(f"Calling {call.function.name}...")
-                        result = await self.mcp_client.run_tool(call.function.name, json.loads(call.function.arguments))
-                        all_response += f"<tool_call>{call.function.name} {call.function.arguments}</tool_call></tool_response>"
-                        tool_messages.append({"role": "tool", "name": call.function.name, "content": []})
-                        for content in result.content:
-                            tool_message = self.mcp_client.convert_result_to_openai_format(content)
-                            for content in tool_message:
-                                if content["type"] == "image_url":
-                                    all_response += "<image_url>"
-                                elif content["type"] == "text":
-                                    all_response += content["text"]
-                                    # Discover paths of tool-generated images so we can
-                                    # clean them up after the request finishes.
-                                    for match in _TOOL_SAVED_IMAGE_RE.finditer(content["text"]):
-                                        request_image_paths.append(match.group(1))
-                            tool_messages[-1]["content"].extend(tool_message)
-                        all_response += "</tool_response>"
+                assistant_message = response.choices[0].message
+                # Canonical OpenAI shape: ONE assistant message carrying both the
+                # content and the tool_calls (each with its id), followed by one
+                # role="tool" message per call keyed by the matching tool_call_id.
+                assistant_dict = {"role": "assistant", "content": assistant_message.content or ""}
+                if assistant_message.tool_calls:
+                    assistant_dict["tool_calls"] = [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                        }
+                        for tc in assistant_message.tool_calls
+                    ]
+                messages.append(assistant_dict)
+                # NOTE: assistant_message.content was already folded into all_response
+                # (before the loop on the 1st pass, at the loop tail afterwards).
 
-                response = await self.client.chat.completions.create(
-                    model=self.model_version,
-                    messages=messages + tool_messages,
-                    max_tokens=gen_kwargs["max_new_tokens"],
-                    temperature=gen_kwargs["temperature"],
-                    tools=functions,
-                    tool_choice="auto",
-                )
+                pending_user_images = []
+                for call in (assistant_message.tool_calls or []):
+                    eval_logger.debug(f"Calling {call.function.name}...")
+                    all_response += f"<tool_call>{call.function.name} {call.function.arguments}</tool_call>"
+                    try:
+                        tool_args = json.loads(call.function.arguments) if call.function.arguments else {}
+                        result = await self.mcp_client.run_tool(call.function.name, tool_args)
+                        raw_parts = []
+                        for content in result.content:
+                            raw_parts.extend(self.mcp_client.convert_result_to_openai_format(content))
+                    except Exception as exc:
+                        # Fault-tolerant: feed the error back as the tool result so the
+                        # model can recover within the same request (Qwen-Agent pattern).
+                        eval_logger.warning(f"Tool {call.function.name} failed: {exc}")
+                        raw_parts = [{"type": "text", "text": f"Tool {call.function.name} failed: {exc}"}]
+
+                    all_response += "<tool_response>"
+                    kept_parts = []
+                    for part in raw_parts:
+                        if part.get("type") == "image_url":
+                            if tool_image_count >= self.max_tool_images:
+                                continue  # cap tool images to keep context under max-model-len
+                            tool_image_count += 1
+                            all_response += "<image_url>"
+                            kept_parts.append(part)
+                        elif part.get("type") == "text":
+                            all_response += part["text"]
+                            # Discover tool-generated image paths so we can clean them up.
+                            for match in _TOOL_SAVED_IMAGE_RE.finditer(part["text"]):
+                                request_image_paths.append(match.group(1))
+                            kept_parts.append(part)
+                        else:
+                            kept_parts.append(part)
+                    all_response += "</tool_response>"
+
+                    if self.tool_image_as_user_turn:
+                        # Fallback path: keep the tool result text-only and re-home any
+                        # returned image(s) as a follow-up user turn (for servers/chat
+                        # templates that drop image parts inside a role="tool" message).
+                        text_parts = [p for p in kept_parts if p.get("type") == "text"]
+                        if not text_parts:
+                            text_parts = [{"type": "text", "text": "(tool returned an image; shown below)"}]
+                        messages.append({"role": "tool", "tool_call_id": call.id, "name": call.function.name, "content": text_parts})
+                        pending_user_images.extend([p for p in kept_parts if p.get("type") == "image_url"])
+                    else:
+                        messages.append({"role": "tool", "tool_call_id": call.id, "name": call.function.name, "content": kept_parts})
+
+                if pending_user_images:
+                    messages.append({"role": "user", "content": pending_user_images + [{"type": "text", "text": "Above are the tool-returned image(s)."}]})
+
+                # Once the image budget is spent, stop offering tools so the model answers.
+                if tool_image_count >= self.max_tool_images:
+                    payload.pop("tools", None)
+                    payload.pop("tool_choice", None)
+
+                payload["messages"] = messages
+                response = await self.client.chat.completions.create(**payload)
                 # Extract usage metrics
                 input_tokens = 0
                 output_tokens = 0
@@ -350,8 +412,8 @@ class AsyncOpenAIChat(lmms):
                 except Exception as e:
                     all_response += str(e)
 
-            if tool_iteration >= max_tool_iterations:
-                eval_logger.warning(f"Max tool iterations ({max_tool_iterations}) reached for request {idx}")
+            if tool_iteration >= self.max_tool_iterations:
+                eval_logger.warning(f"Max tool iterations ({self.max_tool_iterations}) reached for request {idx}")
                 all_response += f"\n[MAX_TOOL_ITERATIONS_REACHED]"
             return all_response, idx, TokenCounts(input_tokens=total_input_tokens, output_tokens=total_output_tokens, reasoning_tokens=total_reasoning_tokens)
         finally:
