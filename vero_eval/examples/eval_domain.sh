@@ -55,11 +55,29 @@ if [[ -z "$TASKS" ]]; then
   exit 1
 fi
 
-# ── judge (only used by judge-based tasks; inert for exact_match like countqa) ──
-export VLLM_SERVER_JUDGE="${VLLM_SERVER_JUDGE:-1}"
-export VLLM_JUDGE_BASE_URL="${VLLM_JUDGE_BASE_URL:-http://localhost:8003/v1}"
-export VLLM_JUDGE_PORT="${VLLM_JUDGE_PORT:-8003}"
-export VLLM_JUDGE_MODEL_PATH="${VLLM_JUDGE_MODEL_PATH:-qwen_vllm}"
+# ── judge backend (only used by judge-based tasks; inert for exact_match like
+#    countqa). Mirrors reason-vlm-eval/examples/eval_model.sh. get_judge_engine()
+#    reads these env vars to pick the backend. ────────────────────────────────
+JUDGE_BACKEND="${JUDGE_BACKEND:-engine}"
+if [[ "$JUDGE_BACKEND" == "engine" ]]; then
+  # In-process vLLM judge (default), loaded by the task's process_results.
+  export JUDGE_MODEL_PATH="${JUDGE_MODEL_PATH:-$HF_HOME/Qwen/Qwen3-32B}"
+  export CHARXIV_JUDGE_GPU_MEMORY_UTILIZATION="${CHARXIV_JUDGE_GPU_MEMORY_UTILIZATION:-0.9}"
+  export CHARXIV_JUDGE_TENSOR_PARALLEL_SIZE="${CHARXIV_JUDGE_TENSOR_PARALLEL_SIZE:-${NUM_GPUS:-1}}"
+  export CHARXIV_JUDGE_MAX_MODEL_LEN="${CHARXIV_JUDGE_MAX_MODEL_LEN:-18384}"
+  export VLLM_JUDGE_MAX_NUM_SEQS="${VLLM_JUDGE_MAX_NUM_SEQS:-32}"
+  unset VLLM_SERVER_JUDGE VLLM_JUDGE_BASE_URL VLLM_JUDGE_PORT VLLM_JUDGE_MODEL_PATH 2>/dev/null || true
+elif [[ "$JUDGE_BACKEND" == "server" ]]; then
+  # Judge served over HTTP via wake/sleep (VLLMServerJudge). Defaults to reusing
+  # the policy server on $PORT (single GPU); set VLLM_JUDGE_BASE_URL for a separate one.
+  export VLLM_SERVER_JUDGE=1
+  export VLLM_JUDGE_BASE_URL="${VLLM_JUDGE_BASE_URL:-http://localhost:${PORT}/v1}"
+  export VLLM_JUDGE_MODEL_PATH="${VLLM_JUDGE_MODEL_PATH:-qwen_vllm}"
+  export JUDGE_MODEL_PATH="${JUDGE_MODEL_PATH:-$VLLM_JUDGE_MODEL_PATH}"
+else
+  echo "ERROR: unknown JUDGE_BACKEND '$JUDGE_BACKEND' (use engine|server)" >&2
+  exit 1
+fi
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 
 # ── build model_args ──────────────────────────────────────────────────

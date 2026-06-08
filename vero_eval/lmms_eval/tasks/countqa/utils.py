@@ -199,11 +199,16 @@ def _get_ground_truth_count(doc: Dict[str, Any]) -> Optional[int]:
 
 
 def countqa_process_results(doc: Dict[str, Any], results):
+    # Standardized on LAST-int extraction (same as countqa_cot_process_results) so
+    # scoring is consistent across the zs / reasoning / thinking variants regardless
+    # of which yaml the `include` chain resolves to. extract_final_answer already
+    # isolates the <answer>/post-</think>/\boxed span first, so last-int subsumes
+    # first-int for clean single-number outputs and is robust to CoT.
     pred = results[0] if isinstance(results, (list, tuple)) else results
     if isinstance(pred, (list, tuple)):
         pred = pred[-1] if len(pred) > 0 else ""
     pred = extract_final_answer(pred)
-    pred_int = _extract_int_from_text(pred)
+    pred_int = _extract_last_int_from_text(pred)
     gt_int = _get_ground_truth_count(doc)
     score = 1.0 if (pred_int is not None and gt_int is not None and pred_int == gt_int) else 0.0
     return {"exact_match": score}
