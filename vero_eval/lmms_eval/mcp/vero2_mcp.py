@@ -20,12 +20,40 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 import numpy as np
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent
-from PIL import Image
+from PIL import Image, ImageDraw
 
-try:
-    from .visualizer import Visualizer
-except ImportError:
-    from visualizer import Visualizer
+# The rich drawing tools below render via the heavy Visualizer (cv2 + matplotlib).
+# Import it LAZILY through a same-named factory so this MCP server starts in a
+# minimal/offline env. This is the single canonical tool server: it supersedes the
+# old offline_image_tools.py (PIL-only) and vision_tools.py — the PIL-only tools
+# image_crop / image_resize / draw_box keep working even without cv2/matplotlib.
+_VISUALIZER_CLS = None
+
+
+def _get_visualizer_cls():
+    global _VISUALIZER_CLS
+    if _VISUALIZER_CLS is None:
+        try:
+            from .visualizer import Visualizer as _V
+        except ImportError:
+            from visualizer import Visualizer as _V
+        _VISUALIZER_CLS = _V
+    return _VISUALIZER_CLS
+
+
+def Visualizer(*args, **kwargs):
+    """Lazy factory for the cv2/matplotlib-backed Visualizer used by the rich
+    drawing tools. Raises a clear RuntimeError (caught by the agentic tool loop)
+    when the optional deps are missing, so the PIL-only tools stay usable offline."""
+    try:
+        return _get_visualizer_cls()(*args, **kwargs)
+    except ImportError as exc:
+        raise RuntimeError(
+            "This drawing tool needs the optional 'visualizer' deps (cv2 + matplotlib), "
+            "which are not installed. Use image_crop / image_resize / draw_box (PIL-only) "
+            f"instead, or install the extras. ({exc})"
+        )
+
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +75,45 @@ def _image_to_content(image: np.ndarray) -> ImageContent:
 def _to_pixel(value: int, size: int) -> float:
     """Convert 0-1000 coordinate to pixel coordinate."""
     return (value / COORD_SCALE) * size
+
+
+def _pil_to_content(image: Image.Image) -> ImageContent:
+    """Encode a PIL image as an MCP ImageContent (base64 PNG)."""
+    buf = io.BytesIO()
+    image.convert("RGB").save(buf, format="PNG")
+    buf.seek(0)
+    return ImageContent(type="image", data=base64.b64encode(buf.getvalue()).decode("utf-8"), mimeType="image/png")
+
+
+def _to_px_clamped(value: float, size: int) -> int:
+    """0-1000 coordinate -> pixel, clamped to [0, size]."""
+    return max(0, min(size, int((value / COORD_SCALE) * size)))
+
+
+# ========== Offline-safe PIL-only tools (always available) ==========
+
+
+@app.tool(name="image_crop", description="Crop a region from an image to zoom in on details. Coordinates use 0-1000 scale where (0,0)=top-left, (1000,1000)=bottom-right. Example: image_crop(image_path, 250, 250, 750, 750) crops the center 50%.")
+def image_crop(image_path: str, x1: int, y1: int, x2: int, y2: int) -> ImageContent:
+    """Crop [x1,y1,x2,y2] (0-1000 scale) out of the image. PIL-only (works offline)."""
+    image = Image.open(image_path)
+    w, h = image.size
+    px1, py1 = _to_px_clamped(x1, w), _to_px_clamped(y1, h)
+    px2, py2 = _to_px_clamped(x2, w), _to_px_clamped(y2, h)
+    if px2 <= px1:
+        px2 = min(w, px1 + 1)
+    if py2 <= py1:
+        py2 = min(h, py1 + 1)
+    return _pil_to_content(image.crop((px1, py1, px2, py2)))
+
+
+@app.tool(name="image_resize", description="Resize an image by a scale factor to see more (scale>1) or less detail. Example: image_resize(image_path, 2.0) doubles the size.")
+def image_resize(image_path: str, scale: float = 2.0) -> ImageContent:
+    """Resize the image by `scale` (LANCZOS). PIL-only (works offline)."""
+    image = Image.open(image_path)
+    scale = max(0.1, min(8.0, float(scale)))
+    new_w, new_h = max(1, int(image.width * scale)), max(1, int(image.height * scale))
+    return _pil_to_content(image.resize((new_w, new_h), Image.Resampling.LANCZOS))
 
 
 # ========== MCP Drawing Tools ==========
@@ -78,13 +145,19 @@ def draw_box(
     :param linewidth: Width of the box outline in pixels.
     :return: Image with box drawn.
     """
-    img = np.array(Image.open(image_path).convert("RGB"))
-    h, w = img.shape[:2]
+    pil_img = Image.open(image_path).convert("RGB")
+    w, h = pil_img.size
     px1, py1 = _to_pixel(x1, w), _to_pixel(y1, h)
     px2, py2 = _to_pixel(x2, w), _to_pixel(y2, h)
-    vis = Visualizer(img)
-    vis.draw_box([px1, py1, px2, py2], edge_color=color, alpha=alpha, linewidth=linewidth)
-    return _image_to_content(vis.get_output().get_image())
+    try:
+        vis = Visualizer(np.array(pil_img))
+        vis.draw_box([px1, py1, px2, py2], edge_color=color, alpha=alpha, linewidth=linewidth)
+        return _image_to_content(vis.get_output().get_image())
+    except RuntimeError:
+        # Offline fallback: plain PIL rectangle (no cv2/matplotlib).
+        draw = ImageDraw.Draw(pil_img)
+        draw.rectangle([px1, py1, px2, py2], outline=color, width=max(1, int(linewidth)))
+        return _pil_to_content(pil_img)
 
 
 @app.tool(name="draw_numbered_boxes", description="Draw multiple numbered bounding boxes on an image. Coordinates use 0-1000 scale. Each box gets a unique number label. Example: draw_numbered_boxes(img, [[100,100,200,200], [300,300,400,400]], linewidth=4) draws 2 numbered boxes.")

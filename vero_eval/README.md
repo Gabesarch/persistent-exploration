@@ -3,7 +3,12 @@
 Agentic, multi-turn **tool-use** evaluation for vision-language models, built on a
 vendored `lmms_eval`. The policy model is served by **vLLM** (OpenAI-compatible) with
 Qwen3-VL tool-calling flags; the `async_openai` backend drives an MCP tool loop
-(`lmms_eval/mcp/vero2_mcp.py` — 11 drawing tools) and scores the result.
+(`lmms_eval/mcp/vero2_mcp.py`) and scores the result. `vero2_mcp.py` is the single
+canonical tool server (it supersedes the old `offline_image_tools.py` and
+`vision_tools.py`): an **offline-safe PIL core** (`image_crop`, `image_resize`,
+`draw_box`) that always works, plus 10 richer drawing tools rendered via the
+optional cv2/matplotlib `Visualizer` (lazy-imported; if those deps are missing the
+server still starts and the PIL core still works).
 
 This is the cleaned-up successor to `tools_scratch/`. It mirrors the
 `reason-vlm-eval` conventions (same `set_paths.sh` pattern, task-yaml naming, judge).
