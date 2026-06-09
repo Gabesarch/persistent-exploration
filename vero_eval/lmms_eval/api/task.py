@@ -99,6 +99,22 @@ def _resolve_hf_datasets_cache_dir() -> str:
     return local_cache_dir
 
 
+def _resolve_local_dataset_path(dataset_path):
+    """Resolve a Hugging Face dataset *id* (e.g. 'lmms-lab/RealWorldQA') to its local
+    cache snapshot directory via snapshot_download, so tasks load under HF_HUB_OFFLINE=1
+    (the reason-vlm-eval convention: keep HF ids in the yaml, resolve them here —
+    datasets.load_dataset on a bare id refuses the cache when offline, but on the local
+    snapshot path it loads fine). Absolute / existing local paths are returned unchanged,
+    so a yaml may still point dataset_path at a specific local directory."""
+    if not dataset_path or os.path.exists(dataset_path) or "/" not in dataset_path:
+        return dataset_path
+    try:
+        return snapshot_download(repo_id=dataset_path, repo_type="dataset")
+    except Exception as exc:  # network off + not cached, private repo, etc.
+        eval_logger.debug(f"snapshot_download could not resolve dataset id {dataset_path!r}: {exc}")
+        return dataset_path
+
+
 @dataclass
 class TaskConfig(dict):
     # task naming/registry
@@ -303,7 +319,7 @@ class Task(abc.ABC):
         """
         resolved_cache_dir = cache_dir if cache_dir is not None else _resolve_hf_datasets_cache_dir()
         self.dataset = datasets.load_dataset(
-            path=self.DATASET_PATH,
+            path=_resolve_local_dataset_path(self.DATASET_PATH),
             name=self.DATASET_NAME,
             data_dir=data_dir,
             cache_dir=resolved_cache_dir,
@@ -1147,7 +1163,7 @@ class ConfigurableTask(Task):
             load_dataset_kwargs = dict(dataset_kwargs) if dataset_kwargs is not None else {}
             load_dataset_cache_dir = load_dataset_kwargs.pop("cache_dir", resolved_dataset_cache_dir)
             self.dataset = datasets.load_dataset(
-                path=self.DATASET_PATH,
+                path=_resolve_local_dataset_path(self.DATASET_PATH),
                 name=self.DATASET_NAME,
                 cache_dir=load_dataset_cache_dir,
                 download_mode=datasets.DownloadMode.REUSE_DATASET_IF_EXISTS,

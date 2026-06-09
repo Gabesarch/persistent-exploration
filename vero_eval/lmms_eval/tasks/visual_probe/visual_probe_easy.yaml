@@ -1,6 +1,4 @@
 include: _default_template_yaml
-# Pinned to the local HF snapshot so it loads under HF_HUB_OFFLINE=1 (same convention
-# as the countqa yamls). Upstream id: Mini-o3/VisualProbe_Easy. Edit for your cache.
-dataset_path: /scratch/gpfs/ZHUANGL/lc1556/hf_cache/hub/datasets--Mini-o3--VisualProbe_Easy/snapshots/0e665a57946d4473deb9975a13f8ddba973b8026
+dataset_path: Mini-o3/VisualProbe_Easy
 task: "visual_probe_easy"
 tag: visual_search

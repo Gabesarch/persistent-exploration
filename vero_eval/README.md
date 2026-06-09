@@ -201,9 +201,13 @@ sbatch --gres=gpu:2 --export=ALL,JUDGE_BACKEND=server,START_VLLM_JUDGE_SERVER=1,
    `doc_to_target`, `process_results`, `metric_list`, and a `task:` field per variant
    (`<name>_reasoning`, `<name>_qwen3_zs`, …). For LLM-judge tasks, reuse a
    `*_aggregate_judge_results` + `get_judge_engine` pattern (see `visual_probe/utils.py`).
-2. **Offline datasets:** under `HF_HUB_OFFLINE=1`, an HF-id `dataset_path` won't resolve —
-   pin it to the local snapshot dir (as `countqa` and `visual_probe_easy` do:
-   `dataset_path: /scratch/.../hub/datasets--ORG--NAME/snapshots/<hash>`).
+2. **Offline datasets:** keep the upstream **HF id** in `dataset_path` (e.g.
+   `dataset_path: lmms-lab/RealWorldQA`). The loader (`lmms_eval/api/task.py`
+   `_resolve_local_dataset_path`) resolves an HF id to its local cache snapshot via
+   `snapshot_download` (using `$HF_HOME` from `set_paths.sh`), so it loads under
+   `HF_HUB_OFFLINE=1` as long as the dataset is in your HF cache. To force a *specific*
+   local copy of one dataset, set `dataset_path` to an absolute dir — the loader passes
+   existing paths through unchanged (`scripts/pin_datasets.py` can do this in bulk).
 3. Smoke it: `bash examples/eval_tasks.sh --tasks <name>_reasoning --limit 2`.
 4. To include it in a domain, append its stem to that domain in `examples/_domain_map.sh`.
 
