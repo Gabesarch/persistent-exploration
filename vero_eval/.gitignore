@@ -1,0 +1,11 @@
+# Account-specific config (copy from set_paths.sh.example; may hold secrets)
+set_paths.sh
+.env
+
+# Run outputs and scratch artifacts (do not commit)
+logs/*
+!logs/.gitkeep
+**/vllm_logs/
+**/__pycache__/
+results/countqa_10_lc1556/
+results/countqa_10_postfix/
