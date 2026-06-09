@@ -146,6 +146,17 @@ tasks reuse the policy endpoint). Results go to `results/<model>_<ts>/<domain>/`
 Tool usage is **orthogonal** to the suffix (enable via `MCP_SERVER_PATH`, not the yaml);
 the suffix selects the prompt/sampling/scoring for that base model.
 
+**System prompts are model-dependent — important for Vero.** Vero's `chat_template.jinja`
+**bakes in** its reasoning system prompt (`<think>/<answer>/\boxed`) and emits it every
+turn (and, in the tools branch, the tool instructions too); its message loop only renders
+`user`/`assistant`/`tool`, so a passed `system` message is **silently dropped**. So when
+evaluating **Vero, do NOT set `SYSTEM_PROMPT`** — it has no effect (the runner default of
+no system prompt is already correct). **Baseline** models (base Qwen3-VL-Instruct/Thinking,
+Qwen2.5-VL) do *not* bake one in and *do* honor a passed `system` message, so set
+`SYSTEM_PROMPT=prompts/<...>.txt` to control them. (`prompts/vero_system_prompt.txt` is a
+reference of the format; it is close to but not byte-identical to Vero's baked-in text —
+extract from the checkpoint's `chat_template.jinja` if you need exact parity for a baseline.)
+
 | Base model / mode | suffix |
 |---|---|
 | **Vero** (our RL agent) | `_reasoning` |
