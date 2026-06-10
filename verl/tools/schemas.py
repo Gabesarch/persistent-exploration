@@ -98,6 +98,8 @@ class ToolResponse(BaseModel):
     image: list[Any] | None = None
     video: list[Any] | None = None
     crop_image_refs: list[dict[str, Any]] | None = None
+    terminate: bool = False
+    terminal_reason: str | None = None
 
     @model_validator(mode="before")
     @classmethod

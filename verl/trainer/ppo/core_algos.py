@@ -358,6 +358,54 @@ def compute_grpo_vectorized_outcome_advantage(
         return advantages, advantages
 
 
+def _compute_gdpo_component_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+    eligible_mask: Optional[torch.Tensor] = None,
+    min_group_size: int = 1,
+) -> torch.Tensor:
+    """Compute one GDPO component advantage, optionally over eligible rows only."""
+    if eligible_mask is None:
+        normalized_score, _ = compute_grpo_outcome_advantage(
+            token_level_rewards=token_level_rewards,
+            response_mask=response_mask,
+            index=index,
+            epsilon=epsilon,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            config=config,
+        )
+        return normalized_score
+
+    scores = token_level_rewards.sum(dim=-1)
+    scalars = torch.zeros_like(scores)
+    eligible_mask = eligible_mask.to(device=scores.device, dtype=torch.bool)
+    min_group_size = max(int(min_group_size), 1)
+
+    with torch.no_grad():
+        for idx in set(index.tolist()):
+            rows_np = np.nonzero(index == idx)[0]
+            rows = torch.as_tensor(rows_np, dtype=torch.long, device=scores.device)
+            eligible_rows = rows[eligible_mask[rows]]
+            if eligible_rows.numel() < min_group_size:
+                continue
+
+            group_scores = scores[eligible_rows]
+            centered = group_scores - torch.mean(group_scores)
+            if norm_adv_by_std_in_grpo:
+                if group_scores.numel() == 1:
+                    std = torch.tensor(1.0, dtype=group_scores.dtype, device=group_scores.device)
+                else:
+                    std = torch.std(group_scores)
+                centered = centered / (std + epsilon)
+            scalars[eligible_rows] = centered
+
+    return scalars.unsqueeze(-1) * response_mask
+
+
 @register_adv_est(AdvantageEstimator.GDPO)  # or simply: @register_adv_est("gdpo")
 def compute_gdpo_outcome_advantage(
     token_level_rewards: torch.Tensor,
@@ -408,6 +456,8 @@ def compute_gdpo_outcome_advantage(
     """
     score_list = None
     reward_weights = None
+    reward_keys = None
+    reward_eligibility = None
 
     if config is not None and non_tensor_batch is not None and batch is not None:
         gdpo_reward_keys = config.get("gdpo_reward_keys", None)
@@ -415,12 +465,13 @@ def compute_gdpo_outcome_advantage(
             "GDPO requires 'algorithm.gdpo_reward_keys' listing the individual reward "
             "component keys returned by compute_score (e.g. ['format_reward', 'accuracy_reward'])."
         )
+        reward_keys = list(gdpo_reward_keys)
         device = token_level_rewards.device
         prompt_length = batch["prompts"].size(1)
         valid_response_length = batch["attention_mask"][:, prompt_length:].sum(dim=1) - 1
 
         score_list = []
-        for key in gdpo_reward_keys:
+        for key in reward_keys:
             assert key in non_tensor_batch, (
                 f"GDPO reward key '{key}' not found in non_tensor_batch. "
                 f"Available keys: {list(non_tensor_batch.keys())}. "
@@ -435,6 +486,7 @@ def compute_gdpo_outcome_advantage(
         gdpo_weights = config.get("gdpo_reward_weights", None)
         if gdpo_weights is not None:
             reward_weights = list(gdpo_weights)
+        reward_eligibility = config.get("gdpo_reward_eligibility", None)
 
     if score_list is None:
         score_list = [token_level_rewards]
@@ -449,13 +501,36 @@ def compute_gdpo_outcome_advantage(
     new_advantage = None
 
     for i in range(num_scores):
-        normalized_score, _ = compute_grpo_outcome_advantage(
+        eligibility_cfg = None
+        if reward_keys is not None and reward_eligibility is not None:
+            eligibility_cfg = reward_eligibility.get(reward_keys[i], None)
+
+        eligible_mask = None
+        min_group_size = 1
+        if eligibility_cfg is not None:
+            eligibility_key = eligibility_cfg.get("key", None)
+            assert eligibility_key is not None, f"GDPO eligibility for '{reward_keys[i]}' requires a 'key'."
+            assert eligibility_key in non_tensor_batch, (
+                f"GDPO eligibility key '{eligibility_key}' for reward key '{reward_keys[i]}' not found in "
+                f"non_tensor_batch. Available keys: {list(non_tensor_batch.keys())}."
+            )
+            threshold = float(eligibility_cfg.get("threshold", 1.0))
+            min_group_size = int(eligibility_cfg.get("min_group_size", 1))
+            eligibility_values = torch.tensor(
+                np.asarray(non_tensor_batch[eligibility_key], dtype=np.float32),
+                device=token_level_rewards.device,
+            )
+            eligible_mask = eligibility_values >= threshold
+
+        normalized_score = _compute_gdpo_component_advantage(
             token_level_rewards=score_list[i],
             response_mask=response_mask,
             index=index,
             epsilon=epsilon,
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
             config=config,
+            eligible_mask=eligible_mask,
+            min_group_size=min_group_size,
         )
 
         if new_advantage is None:

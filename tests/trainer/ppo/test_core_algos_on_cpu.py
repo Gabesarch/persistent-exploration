@@ -21,7 +21,9 @@ import torch
 
 import verl.trainer.ppo.core_algos
 from verl.trainer.ppo.core_algos import (
+    _compute_gdpo_component_advantage,
     compute_gae_advantage_return,
+    compute_gdpo_outcome_advantage,
     compute_grpo_outcome_advantage,
     compute_grpo_vectorized_outcome_advantage,
     compute_rloo_outcome_advantage,
@@ -311,6 +313,262 @@ def test_grpo_and_vectorized_equivalence(batch_size: int, seq_len: int, num_grou
     assert ret1.shape == ret2.shape == (batch_size, seq_len)
     assert torch.allclose(adv1, adv2, rtol=1e-5, atol=1e-6)
     assert torch.allclose(ret1, ret2, rtol=1e-5, atol=1e-6)
+
+
+def _make_gdpo_test_batch(num_rows: int, response_len: int = 3) -> dict[str, torch.Tensor]:
+    prompt_len = 2
+    return {
+        "prompts": torch.ones((num_rows, prompt_len), dtype=torch.int64),
+        "attention_mask": torch.ones((num_rows, prompt_len + response_len), dtype=torch.int64),
+    }
+
+
+def _make_scalar_reward_component(values: list[float], response_mask: torch.Tensor) -> torch.Tensor:
+    rewards = torch.zeros_like(response_mask, dtype=torch.float32)
+    rewards[:, -1] = torch.tensor(values, dtype=torch.float32)
+    return rewards
+
+
+def test_gdpo_without_eligibility_matches_existing_component_sum_behavior():
+    response_mask = torch.ones((4, 3), dtype=torch.float32)
+    index = np.array(["prompt-a", "prompt-a", "prompt-b", "prompt-b"], dtype=object)
+    batch = _make_gdpo_test_batch(num_rows=4)
+    non_tensor_batch = {
+        "accuracy": np.array([1.0, 0.0, 0.0, 1.0], dtype=np.float32),
+        "format": np.array([1.0, 1.0, 0.0, 0.0], dtype=np.float32),
+    }
+    config = {
+        "gdpo_reward_keys": ["accuracy", "format"],
+        "gdpo_reward_weights": [0.9, 0.1],
+    }
+
+    adv, returns = compute_gdpo_outcome_advantage(
+        token_level_rewards=torch.zeros_like(response_mask),
+        response_mask=response_mask,
+        index=index,
+        config=config,
+        non_tensor_batch=non_tensor_batch,
+        batch=batch,
+    )
+
+    acc_adv, _ = compute_grpo_outcome_advantage(
+        token_level_rewards=_make_scalar_reward_component([1.0, 0.0, 0.0, 1.0], response_mask),
+        response_mask=response_mask,
+        index=index,
+    )
+    fmt_adv, _ = compute_grpo_outcome_advantage(
+        token_level_rewards=_make_scalar_reward_component([1.0, 1.0, 0.0, 0.0], response_mask),
+        response_mask=response_mask,
+        index=index,
+    )
+    expected = verl.trainer.ppo.core_algos.verl_F.masked_whiten(0.9 * acc_adv + 0.1 * fmt_adv, response_mask)
+    expected = expected * response_mask
+
+    assert adv.shape == returns.shape == response_mask.shape
+    assert torch.allclose(adv, expected, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(returns, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_gdpo_component_eligibility_normalizes_tool_efficiency_only_over_correct_rows():
+    response_mask = torch.ones((4, 3), dtype=torch.float32)
+    index = np.array(["prompt-a"] * 4, dtype=object)
+    tool_rewards = _make_scalar_reward_component([1.0, 0.5, 1.0 / 3.0, 0.25], response_mask)
+    correct_mask = torch.tensor([True, False, True, False])
+
+    component_adv = _compute_gdpo_component_advantage(
+        token_level_rewards=tool_rewards,
+        response_mask=response_mask,
+        index=index,
+        eligible_mask=correct_mask,
+        min_group_size=2,
+    )
+    scalar_adv = component_adv[:, -1]
+
+    assert scalar_adv[0] > scalar_adv[2]
+    assert torch.equal(scalar_adv[[1, 3]], torch.zeros(2))
+    assert torch.all(component_adv[:, :-1] == component_adv[:, -1:])
+
+
+def test_gdpo_component_eligibility_zeroes_tool_channel_when_too_few_correct_rows():
+    response_mask = torch.ones((3, 3), dtype=torch.float32)
+    index = np.array(["prompt-a"] * 3, dtype=object)
+    tool_rewards = _make_scalar_reward_component([1.0, 0.5, 1.0 / 3.0], response_mask)
+    correct_mask = torch.tensor([False, True, False])
+
+    component_adv = _compute_gdpo_component_advantage(
+        token_level_rewards=tool_rewards,
+        response_mask=response_mask,
+        index=index,
+        eligible_mask=correct_mask,
+        min_group_size=2,
+    )
+
+    assert torch.equal(component_adv, torch.zeros_like(component_adv))
+
+
+def test_gdpo_component_eligibility_is_group_local():
+    response_mask = torch.ones((6, 3), dtype=torch.float32)
+    index = np.array(["prompt-a", "prompt-a", "prompt-a", "prompt-b", "prompt-b", "prompt-b"], dtype=object)
+    tool_rewards = _make_scalar_reward_component([1.0, 0.5, 0.25, 1.0, 0.5, 0.25], response_mask)
+    correct_mask = torch.tensor([True, True, False, True, False, False])
+
+    component_adv = _compute_gdpo_component_advantage(
+        token_level_rewards=tool_rewards,
+        response_mask=response_mask,
+        index=index,
+        eligible_mask=correct_mask,
+        min_group_size=2,
+    )
+    scalar_adv = component_adv[:, -1]
+
+    assert scalar_adv[0] > scalar_adv[1]
+    assert scalar_adv[2] == 0
+    assert torch.equal(scalar_adv[3:], torch.zeros(3))
+
+
+def test_gdpo_conditional_tool_efficiency_uses_eligibility_config():
+    response_mask = torch.ones((4, 3), dtype=torch.float32)
+    index = np.array(["prompt-a"] * 4, dtype=object)
+    batch = _make_gdpo_test_batch(num_rows=4)
+    non_tensor_batch = {
+        "tool_efficiency": np.array([1.0, 0.5, 1.0 / 3.0, 0.25], dtype=np.float32),
+        "accuracy": np.array([1.0, 0.0, 1.0, 0.0], dtype=np.float32),
+    }
+    config = {
+        "gdpo_reward_keys": ["tool_efficiency"],
+        "gdpo_reward_weights": [1.0],
+        "gdpo_reward_eligibility": {
+            "tool_efficiency": {
+                "key": "accuracy",
+                "threshold": 1.0,
+                "min_group_size": 2,
+            },
+        },
+    }
+
+    adv, _ = compute_gdpo_outcome_advantage(
+        token_level_rewards=torch.zeros_like(response_mask),
+        response_mask=response_mask,
+        index=index,
+        config=config,
+        non_tensor_batch=non_tensor_batch,
+        batch=batch,
+    )
+
+    scalar_adv = adv[:, -1]
+    assert scalar_adv[0] > scalar_adv[2]
+    assert torch.allclose(scalar_adv[1], scalar_adv[3])
+
+
+def test_multiturn_tool_reward_returns_tool_efficiency_without_changing_score():
+    from verl.utils.reward_score.math_verify_reward_type_multiturn_tool_calling_optional_think import compute_score
+
+    response = (
+        '<tool_call>\n{"name": "image_zoom_in", "arguments": {"bbox": [0, 0, 1, 1]}}\n</tool_call>'
+        "<answer>\\boxed{red}</answer>"
+    )
+
+    result = compute_score(
+        response,
+        "red",
+        format_score=0.1,
+        min_tool_calls_for_bonus=1,
+        tool_call_bonus=0.1,
+        extra_info={"reward_type": "short_string"},
+    )
+
+    assert result["tool_call_count"] == 1
+    assert result["tool_efficiency"] == 0.5
+    assert result["tool_call_bonus"] == 0.1
+    assert result["score"] == pytest.approx(1.1)
+
+
+def test_multiturn_tool_efficiency_score_weight_changes_scalar_score():
+    from verl.utils.reward_score.math_verify_reward_type_multiturn_tool_calling_optional_think import compute_score
+
+    response = (
+        '<tool_call>\n{"name": "image_zoom_in", "arguments": {"bbox": [0, 0, 1, 1]}}\n</tool_call>'
+        '<tool_call>\n{"name": "image_zoom_in", "arguments": {"bbox": [1, 1, 2, 2]}}\n</tool_call>'
+        "<answer>\\boxed{red}</answer>"
+    )
+
+    result = compute_score(
+        response,
+        "red",
+        format_score=0.1,
+        min_tool_calls_for_bonus=None,
+        tool_call_bonus=0.0,
+        tool_efficiency_reward_mode="concave_length_penalty",
+        tool_efficiency_free_calls=1,
+        tool_efficiency_concave_k=10.0,
+        tool_efficiency_concave_q=0.95,
+        tool_efficiency_score_weight=0.1,
+        extra_info={"reward_type": "short_string"},
+    )
+
+    assert result["tool_call_bonus"] == 0.0
+    assert result["score"] == pytest.approx(0.8 + 0.1 + 0.1 * result["tool_efficiency"])
+
+
+def test_tool_efficiency_default_mode_matches_inverse_count():
+    from verl.utils.reward_score.math_verify_reward_type_multiturn_tool_calling_optional_think import (
+        tool_efficiency_reward,
+    )
+
+    assert tool_efficiency_reward(0) == pytest.approx(1.0)
+    assert tool_efficiency_reward(1) == pytest.approx(0.5)
+    assert tool_efficiency_reward(9) == pytest.approx(0.1)
+
+
+def test_tool_efficiency_inverse_count_respects_free_calls():
+    from verl.utils.reward_score.math_verify_reward_type_multiturn_tool_calling_optional_think import (
+        tool_efficiency_reward,
+    )
+
+    assert tool_efficiency_reward(0, mode="inverse_count", free_calls=1) == pytest.approx(1.0)
+    assert tool_efficiency_reward(1, mode="inverse_count", free_calls=1) == pytest.approx(1.0)
+    assert tool_efficiency_reward(2, mode="inverse_count", free_calls=1) == pytest.approx(0.5)
+
+
+def test_tool_efficiency_concave_penalty_respects_free_calls_and_is_monotonic():
+    from verl.utils.reward_score.math_verify_reward_type_multiturn_tool_calling_optional_think import (
+        tool_efficiency_reward,
+    )
+
+    rewards = [
+        tool_efficiency_reward(
+            tool_calls,
+            mode="concave_length_penalty",
+            free_calls=1,
+            concave_k=10.0,
+            concave_q=0.95,
+        )
+        for tool_calls in range(11)
+    ]
+
+    assert rewards[0] == pytest.approx(0.0)
+    assert rewards[1] == pytest.approx(0.0)
+    assert all(rewards[i] >= rewards[i + 1] for i in range(len(rewards) - 1))
+
+    early_drop = rewards[1] - rewards[2]
+    late_drop = rewards[9] - rewards[10]
+    assert late_drop < early_drop
+
+
+def test_tool_efficiency_concave_penalty_log_limit_for_q_one():
+    from verl.utils.reward_score.math_verify_reward_type_multiturn_tool_calling_optional_think import (
+        tool_efficiency_reward,
+    )
+
+    reward = tool_efficiency_reward(
+        3,
+        mode="concave_length_penalty",
+        free_calls=1,
+        concave_k=10.0,
+        concave_q=1.0,
+    )
+
+    assert reward == pytest.approx(-torch.log1p(torch.tensor(20.0)).item() / 10.0)
 
 
 def test_compute_policy_loss_flow_grpo() -> None:

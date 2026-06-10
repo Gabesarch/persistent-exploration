@@ -19,9 +19,10 @@ import pytest
 from PIL import Image, ImageChops
 
 import verl.tools.image_zoom_in_tool as image_zoom_in_tool
-from verl.experimental.agent_loop.tool_agent_loop import ToolAgentLoop
+from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, ToolAgentLoop
+from verl.experimental.agent_loop.tool_parser import FunctionCall
 from verl.tools.image_zoom_in_tool import ImageZoomInTool
-from verl.tools.schemas import OpenAIFunctionToolSchema
+from verl.tools.schemas import OpenAIFunctionToolSchema, ToolResponse
 
 
 def _tool_schema() -> OpenAIFunctionToolSchema:
@@ -85,6 +86,18 @@ def _make_zoom_tool(monkeypatch, **config_overrides):
     )
     assert tool.execution_pool is None
     return tool
+
+
+def _assert_terminal_zoom_error(response, reward, metrics, expected_error: str):
+    assert reward == -0.05
+    assert metrics["success"] is False
+    assert metrics["terminal"] is True
+    assert metrics["terminal_reason"] == "image_zoom_in_tool_error"
+    assert metrics["error"] == expected_error
+    assert response.image is None
+    assert response.terminate is True
+    assert response.terminal_reason == "image_zoom_in_tool_error"
+    assert response.text == f"Error processing image zoom-in: {expected_error}"
 
 
 def test_image_zoom_in_tool_selects_image_by_img_idx(zoom_tool):
@@ -271,11 +284,14 @@ def test_image_zoom_in_tool_errors_when_original_unavailable_and_policy_is_error
 
     response, reward, metrics = asyncio.run(run_test())
 
-    assert reward < 0
+    assert reward == -0.05
     assert metrics["success"] is False
+    assert metrics["terminal"] is True
     assert metrics["used_original_resolution_source"] is False
     assert metrics["error"].startswith("Original image source unavailable:")
     assert response.image is None
+    assert response.terminate is True
+    assert response.terminal_reason == "image_zoom_in_tool_error"
     assert response.text.startswith("Error processing image zoom-in: Original image source unavailable:")
 
 
@@ -368,13 +384,11 @@ def test_image_zoom_in_tool_invalid_normalized_bbox_returns_error(zoom_tool):
 
     response, reward, metrics = asyncio.run(run_test())
 
-    assert reward < 0
-    assert metrics["success"] is False
-    assert metrics["error"] == "bbox_2d must define a positive-area box with left < right and top < bottom."
-    assert response.image is None
-    assert response.text == (
-        "Error processing image zoom-in: "
-        "bbox_2d must define a positive-area box with left < right and top < bottom."
+    _assert_terminal_zoom_error(
+        response,
+        reward,
+        metrics,
+        "bbox_2d must define a positive-area box with left < right and top < bottom.",
     )
 
 
@@ -392,11 +406,7 @@ def test_image_zoom_in_tool_non_finite_bbox_returns_error(zoom_tool):
 
     response, reward, metrics = asyncio.run(run_test())
 
-    assert reward < 0
-    assert metrics["success"] is False
-    assert metrics["error"] == "bbox_2d must contain 4 finite numeric values."
-    assert response.image is None
-    assert response.text == "Error processing image zoom-in: bbox_2d must contain 4 finite numeric values."
+    _assert_terminal_zoom_error(response, reward, metrics, "bbox_2d must contain 4 finite numeric values.")
 
 
 def test_image_zoom_in_tool_out_of_bounds_bbox_returns_error_after_clamping(zoom_tool):
@@ -413,12 +423,11 @@ def test_image_zoom_in_tool_out_of_bounds_bbox_returns_error_after_clamping(zoom
 
     response, reward, metrics = asyncio.run(run_test())
 
-    assert reward < 0
-    assert metrics["success"] is False
-    assert metrics["error"] == "bbox_2d is outside image bounds or has no positive area after clamping."
-    assert response.image is None
-    assert response.text == (
-        "Error processing image zoom-in: bbox_2d is outside image bounds or has no positive area after clamping."
+    _assert_terminal_zoom_error(
+        response,
+        reward,
+        metrics,
+        "bbox_2d is outside image bounds or has no positive area after clamping.",
     )
 
 
@@ -436,10 +445,7 @@ def test_image_zoom_in_tool_missing_img_idx_returns_error(zoom_tool):
 
     response, reward, metrics = asyncio.run(run_test())
 
-    assert reward < 0
-    assert metrics["success"] is False
-    assert response.image is None
-    assert response.text == "Error processing image zoom-in: img_idx parameter is missing."
+    _assert_terminal_zoom_error(response, reward, metrics, "img_idx parameter is missing.")
 
 
 def test_image_zoom_in_tool_out_of_range_img_idx_returns_error(zoom_tool):
@@ -456,7 +462,113 @@ def test_image_zoom_in_tool_out_of_range_img_idx_returns_error(zoom_tool):
 
     response, reward, metrics = asyncio.run(run_test())
 
-    assert reward < 0
+    _assert_terminal_zoom_error(response, reward, metrics, "img_idx=1 is out of range for 1 images.")
+
+
+def test_image_zoom_in_tool_missing_label_returns_terminal_error(zoom_tool):
+    async def run_test():
+        instance_id, _ = await zoom_tool.create()
+        return await zoom_tool.execute(
+            instance_id,
+            {"bbox_2d": [250, 250, 750, 750], "img_idx": 0},
+            agent_data=agent_data,
+        )
+
+    image = Image.new("RGB", (200, 100), color="white")
+    agent_data = SimpleNamespace(image_data=[image])
+
+    response, reward, metrics = asyncio.run(run_test())
+
+    _assert_terminal_zoom_error(response, reward, metrics, "label parameter is missing.")
+
+
+def test_image_zoom_in_tool_extreme_aspect_ratio_returns_terminal_error(monkeypatch):
+    async def run_test():
+        instance_id, _ = await tool.create()
+        return await tool.execute(
+            instance_id,
+            {"bbox_2d": [0, 0, 7000, 20], "label": "line", "img_idx": 0},
+            agent_data=agent_data,
+        )
+
+    image = Image.new("RGB", (7000, 1000), color="white")
+    agent_data = SimpleNamespace(image_data=[image])
+    tool = _make_zoom_tool(monkeypatch, coordinate_system="pixel")
+
+    response, reward, metrics = asyncio.run(run_test())
+
+    assert reward == -0.05
     assert metrics["success"] is False
+    assert metrics["terminal"] is True
+    assert metrics["max_cropped_aspect_ratio"] == 199.0
+    assert metrics["cropped_aspect_ratio"] > 199.0
+    assert metrics["error"].startswith("cropped image aspect ratio ")
+    assert metrics["error"].endswith(" exceeds max_cropped_aspect_ratio=199.0")
     assert response.image is None
-    assert response.text == "Error processing image zoom-in: img_idx=1 is out of range for 1 images."
+    assert response.terminate is True
+    assert response.terminal_reason == "image_zoom_in_tool_error"
+
+
+def test_tool_agent_loop_terminal_tool_response_stops_trajectory():
+    agent_data = AgentData(
+        messages=[],
+        image_data=None,
+        video_data=None,
+        metrics={},
+        request_id="request-1",
+        tools_kwargs={},
+    )
+    agent_data.prompt_ids = [101, 102]
+    agent_data.response_mask = [1, 1]
+    agent_data.tool_calls = [FunctionCall(name="image_zoom_in_tool", arguments='{"bbox_2d": []}')]
+
+    class DummyLoop:
+        max_parallel_calls = 1
+        tool_parser_name = "hermes"
+
+        @staticmethod
+        def _debug_enabled_for_agent(agent_data):
+            return False
+
+        async def _call_tool(self, tool_call, tools_kwargs, agent_data, tool_index=0):
+            return (
+                ToolResponse(
+                    text="Error processing image zoom-in: bbox_2d parameter is missing or not a list of 4 numbers.",
+                    terminate=True,
+                    terminal_reason="image_zoom_in_tool_error",
+                ),
+                -0.05,
+                {"success": False, "terminal": True},
+            )
+
+        async def apply_chat_template(self, messages, images=None, videos=None, remove_system_prompt=False):
+            assert messages == [
+                {
+                    "role": "tool",
+                    "content": (
+                        "Error processing image zoom-in: "
+                        "bbox_2d parameter is missing or not a list of 4 numbers."
+                    ),
+                }
+            ]
+            assert images is None
+            assert videos is None
+            assert remove_system_prompt is True
+            return [201, 202, 203]
+
+    state = asyncio.run(ToolAgentLoop._handle_processing_tools_state(DummyLoop(), agent_data))
+
+    assert state == AgentState.TERMINATED
+    assert agent_data.messages == [
+        {
+            "role": "tool",
+            "content": "Error processing image zoom-in: bbox_2d parameter is missing or not a list of 4 numbers.",
+        }
+    ]
+    assert agent_data.prompt_ids == [101, 102, 201, 202, 203]
+    assert agent_data.response_mask == [1, 1, 0, 0, 0]
+    assert agent_data.tool_rewards == [-0.05]
+    assert agent_data.user_turns == 1
+    assert agent_data.extra_fields["terminated_by_tool_error"] is True
+    assert agent_data.extra_fields["terminal_tool_name"] == "image_zoom_in_tool"
+    assert agent_data.extra_fields["terminal_reason"] == "image_zoom_in_tool_error"
