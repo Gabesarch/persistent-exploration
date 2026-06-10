@@ -1,0 +1,48 @@
+#!/bin/bash
+# Environment + paths for the vero_eval agentic (MCP tool-use) eval harness.
+# Mirrors the reason-vlm-eval set_paths.sh convention.
+#
+# Copy to set_paths.sh and edit for your account:
+#   cp set_paths.sh.example set_paths.sh
+# The scripts here (examples/eval_domain.sh, scripts/serve_qwen_vllm.sh,
+# scripts/*.sbatch) auto-source vero_eval/set_paths.sh if it exists.
+#
+# set_paths.sh and .env are gitignored (account-specific, may hold secrets);
+# only this .example is committed.
+
+# ---- Edit these for your account ----
+export REPO_ROOT="${REPO_ROOT:-/home/<user>/repo/reason-vlm/vero2}"
+export ROOT_PATH="${ROOT_PATH:-/scratch/gpfs/<group>/<user>}"
+
+# ---- Activate environment (needs vLLM >=0.17 for Qwen3-VL + mcp + lmms_eval) ----
+source "$HOME/miniconda3/etc/profile.d/conda.sh"
+conda activate "$ROOT_PATH/conda/envs/qwen35"
+
+# ---- HuggingFace / vLLM caches ----
+export HF_HOME="${HF_HOME:-$ROOT_PATH/hf_cache}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$HF_HOME/hub}"
+export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-$ROOT_PATH/vllm_cache}"
+mkdir -p "$HF_HUB_CACHE" "$VLLM_CACHE_ROOT"
+
+# ---- Offline mode (compute nodes without internet) ----
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
+export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
+
+# ---- vero_eval serving defaults (policy model served via vLLM) ----
+export VERO_EVAL_DIR="$REPO_ROOT/vero_eval"
+export CHECKPOINT_PATH="${CHECKPOINT_PATH:-/scratch/gpfs/ZHUANGL/hw0171/Qwen3-VL-8B-Instruct}"
+export PORT="${PORT:-9001}"
+export MODEL_NAME="${MODEL_NAME:-qwen_vllm}"
+export API_KEY="${API_KEY:-qwen}"
+export NUM_GPUS="${NUM_GPUS:-1}"
+
+# ---- Optional: LLM judge (only for judge-based tasks; inert for countqa) ----
+# export VLLM_JUDGE_PORT=8003
+# export GPT_API_KEY="sk-..."   # only if using a GPT judge
+
+export TQDM_MININTERVAL="${TQDM_MININTERVAL:-10}"
+export no_proxy="${no_proxy:-localhost,127.0.0.1}"
+export NO_PROXY="${NO_PROXY:-localhost,127.0.0.1}"
+[[ -n "${SLURM_JOB_ID:-}" ]] && command -v module &>/dev/null && module load proxy/default 2>/dev/null || true
