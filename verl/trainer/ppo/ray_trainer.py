@@ -82,6 +82,11 @@ from verl.utils.lazy_multi_modal import lazy_multi_modal_inputs_enabled
 from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.rollout_skip import RolloutSkip
+from verl.utils.response_display import (
+    apply_response_display_prefix,
+    apply_response_display_prefixes,
+    get_response_display_prefix,
+)
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
@@ -680,7 +685,10 @@ class RayPPOTrainer:
         """
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
             inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
-            outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+            outputs = apply_response_display_prefixes(
+                self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True),
+                get_response_display_prefix(self.config),
+            )
             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
             image_paths = self._collect_image_references(
@@ -835,7 +843,13 @@ class RayPPOTrainer:
 
             # Store generated outputs
             output_ids = test_output_gen_batch.batch["responses"]
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+            response_display_prefix = get_response_display_prefix(self.config)
+            output_texts = [
+                apply_response_display_prefix(
+                    self.tokenizer.decode(ids, skip_special_tokens=True), response_display_prefix
+                )
+                for ids in output_ids
+            ]
             sample_outputs.extend(output_texts)
 
             test_batch = test_batch.union(test_output_gen_batch)

@@ -164,7 +164,7 @@ actor_rollout_ref:
       {%- endif %}
     use_remove_padding: true
     enable_gradient_checkpointing: true
-    enable_activation_offload: true
+    enable_activation_offload: false
     use_fused_kernels: false
     use_liger: true
 

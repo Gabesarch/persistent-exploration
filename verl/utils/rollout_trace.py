@@ -22,6 +22,7 @@ from typing import Optional
 from pydantic import BaseModel
 
 from verl.utils.ray_utils import get_event_loop
+from verl.utils.response_display import apply_response_display_prefix, get_response_display_prefix
 
 _trace_enabled: ContextVar[bool] = ContextVar("_trace_enabled", default=True)
 
@@ -212,6 +213,9 @@ def rollout_trace_op(func):
 
                 if hasattr(result, "response_ids"):
                     response_text = await loop.run_in_executor(None, self.tokenizer.decode, result.response_ids)
+                    response_text = apply_response_display_prefix(
+                        response_text, get_response_display_prefix(getattr(self, "config", None))
+                    )
                     _result["response_text"] = response_text
                 return _result
             return result
