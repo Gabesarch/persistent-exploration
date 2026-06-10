@@ -1,4 +1,4 @@
-"""Reward helpers for multi-turn tool-calling outputs with optional think tags."""
+"""Reward helpers for multi-turn tool-calling outputs with mandatory think tags."""
 
 from __future__ import annotations
 
@@ -35,7 +35,6 @@ _TOOL_RESPONSE_OPEN = "<tool_response>"
 _TOOL_RESPONSE_CLOSE = "</tool_response>"
 _ANSWER_OPEN = "<answer>"
 _ANSWER_CLOSE = "</answer>"
-_ACTION_TAGS = (_TOOL_CALL_OPEN, _ANSWER_OPEN)
 _RESERVED_TAGS = (
     _THINK_OPEN,
     _THINK_CLOSE,
@@ -84,28 +83,11 @@ def _consume_tagged_block(text: str, pos: int, open_tag: str, close_tag: str) ->
     return content, content_end + len(close_tag)
 
 
-def _find_next_action_pos(text: str, pos: int) -> int | None:
-    positions = [idx for tag in _ACTION_TAGS if (idx := text.find(tag, pos)) != -1]
-    if not positions:
+def _consume_think_block(text: str, pos: int) -> int | None:
+    _, next_pos = _consume_tagged_block(text, pos, _THINK_OPEN, _THINK_CLOSE)
+    if next_pos == pos:
         return None
-    return min(positions)
-
-
-def _consume_optional_reasoning(text: str, pos: int) -> int | None:
-    if text.startswith(_THINK_OPEN, pos):
-        _, next_pos = _consume_tagged_block(text, pos, _THINK_OPEN, _THINK_CLOSE)
-        if next_pos == pos:
-            return None
-        return _skip_ws(text, next_pos)
-
-    next_action_pos = _find_next_action_pos(text, pos)
-    if next_action_pos is None:
-        return None
-
-    reasoning = text[pos:next_action_pos]
-    if _contains_reserved_tag(reasoning):
-        return None
-    return _skip_ws(text, next_action_pos)
+    return _skip_ws(text, next_pos)
 
 
 def _validate_tool_call_payload(payload: str) -> bool:
@@ -133,7 +115,7 @@ def _parse_multiturn_tool_calling_output(predict_str: str) -> tuple[bool, str | 
 
     while pos < len(text):
         pos = _skip_ws(text, pos)
-        pos = _consume_optional_reasoning(text, pos)
+        pos = _consume_think_block(text, pos)
         if pos is None:
             return False, None, 0
 

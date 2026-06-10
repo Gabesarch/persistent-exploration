@@ -88,7 +88,7 @@ All set via env before any runner (consumed in `examples/eval_domain.sh`, forwar
 | Max tool images | (model_arg `max_tool_images`) | `8` | cap on returned images kept in context |
 | System prompt | `SYSTEM_PROMPT` | none | path to a `prompts/*.txt` (e.g. `prompts/countqa_system_prompt.txt`) |
 | Policy port | `PORT` | `9001` | vLLM server port |
-| Judge | `JUDGE_BACKEND` | `engine` | `engine` / `server` (see §7) |
+| Judge | `JUDGE_BACKEND` | auto | judge tasks → dedicated Qwen3-32B on a 2nd GPU (see §7) |
 
 ```bash
 # tools OFF, single-turn:
@@ -100,10 +100,22 @@ MAX_TOOL_ITERATIONS=5 SYSTEM_PROMPT=prompts/countqa_system_prompt.txt \
 
 ---
 
-## 5. The three runner types
+## 5. Running
 
-All three ultimately call `examples/eval_domain.sh`. Run interactive ones from the
-package root (`cd vero_eval`); submit the array from the **repo root**.
+### Easiest — one sbatch entrypoint (`run_eval.sbatch`)
+Pick MODEL / TASKS / TOOLS and submit from the **repo root** (see `instruction.md`):
+```bash
+sbatch --export=ALL,MODEL=qwen3vl,TASKS=countqa_reasoning,visual_probe_easy_qwen3_zs,TOOLS=on \
+       vero_eval/run_eval.sbatch
+sbatch --export=ALL,MODEL=vero,CHECKPOINT_PATH=/scratch/.../actor/huggingface,TASKS=all,TOOLS=on \
+       vero_eval/run_eval.sbatch
+```
+It serves the model, runs the tasks, and launches the judge (for judge tasks) in one job.
+`TASKS` accepts a comma-list **or** a domain name. Add `--gres=gpu:1` for exact-match-only runs.
+
+### The three underlying runner types
+All ultimately call `examples/eval_domain.sh`. Run interactive ones from the package root
+(`cd vero_eval`); submit the array from the **repo root**.
 
 ### TYPE 1 — one model on an explicit list of task yamls
 ```bash
@@ -112,7 +124,7 @@ bash examples/eval_tasks.sh --tasks countqa_reasoning,chartqa_reasoning,charxiv_
 ```
 Auto-serves `CHECKPOINT_PATH` if nothing is on `$PORT`, then forwards the comma-list to
 `eval_domain.sh`. Use any task name that exists under `lmms_eval/tasks/**` (the `task:`/
-`group:` field). For judge tasks on 1 GPU add `JUDGE_BACKEND=server`.
+`group:` field). Judge tasks need 2 GPUs for the dedicated Qwen3-32B judge (see §7).
 
 ### TYPE 2 — an array of checkpoints on a domain (SLURM)
 ```bash
@@ -186,22 +198,24 @@ variant (e.g. charxiv has no `_qwen3_zs`). Edit this file to add/remove domain m
 
 ## 7. Judge (judge-based tasks: visual_probe, simplevqa, mathvista, charxiv, …)
 
-countqa is `exact_match` (no judge). Judge tasks score via `get_judge_engine`, chosen by
-`JUDGE_BACKEND` in `eval_domain.sh`:
+countqa is `exact_match` (no judge). Judge tasks are auto-detected; `eval_domain.sh` then
+sets up the judge **by default = a dedicated Qwen3-32B on a 2nd GPU** (the strong,
+reportable judge, like reason-vlm-eval — hence the runners default to `--gres=gpu:2`):
 
-| `JUDGE_BACKEND` | judge | GPU | use when |
-|---|---|---|---|
-| `server` (best on 1 GPU) | reuses the policy server → judge **is** the Qwen3-VL policy | none extra | single H100; vision-capable |
-| `engine` (default) | in-process **Qwen3-32B** (text-only) | own GPU (OOMs beside the policy) | 2-GPU alloc |
-| `server` + `START_VLLM_JUDGE_SERVER=1` | dedicated sleep-mode Qwen3-32B (`scripts/serve_judge_vllm.sh`) | own GPU (`VLLM_JUDGE_CUDA_VISIBLE_DEVICES`) | strong judge + 2nd GPU |
+| Situation | Judge used | GPU |
+|---|---|---|
+| **judge task + ≥2 GPUs** (default) | dedicated **Qwen3-32B** server on GPU1 | +1 GPU |
+| judge task + 1 GPU (fallback) | the **policy model (Qwen3-VL-8B)** judges itself — prints a **WARNING**; not for reporting | 0 extra |
+| `JUDGE_BACKEND=engine` (≥2 GPUs) | in-process **Qwen3-32B** | +1 GPU |
+| no judge task (countqa) | none set up | — |
 
 ```bash
-# zero-extra-GPU judge run:
-sbatch vero_eval/scripts/eval_visual_probe.sbatch        # JUDGE_BACKEND=server
-# dedicated 32B judge on a 2-GPU node:
-sbatch --gres=gpu:2 --export=ALL,JUDGE_BACKEND=server,START_VLLM_JUDGE_SERVER=1,VLLM_JUDGE_CUDA_VISIBLE_DEVICES=1 \
-  vero_eval/scripts/eval_visual_probe.sbatch
+# Strong 32B judge is automatic on 2 GPUs:
+sbatch vero_eval/scripts/eval_visual_probe.sbatch
+# Quick 8B self-judge (single GPU, not reportable):
+sbatch --gres=gpu:1 --export=ALL,START_VLLM_JUDGE_SERVER=0 vero_eval/scripts/eval_visual_probe.sbatch
 ```
+The 8B-self-judge is never silently the default — it only happens on a single GPU and warns.
 
 ---
 

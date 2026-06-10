@@ -34,7 +34,7 @@ BATCH_SIZE="${BATCH_SIZE:-1}"
 PORT="${PORT:-9001}"
 API_KEY="${API_KEY:-qwen}"
 MODEL_VERSION="${MODEL_VERSION:-qwen_vllm}"
-MCP_SERVER_PATH="${MCP_SERVER_PATH-lmms_eval/mcp/vero2_mcp.py}"    # set empty to disable tools
+MCP_SERVER_PATH="${MCP_SERVER_PATH-lmms_eval/mcp/vero2_mcp.py}"    # set empty (MCP_SERVER_PATH='') to disable tools
 MAX_TOOL_ITERATIONS="${MAX_TOOL_ITERATIONS:-10}"
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-}"
 LIMIT="${LIMIT:-}"
@@ -55,38 +55,49 @@ if [[ -z "$TASKS" ]]; then
   exit 1
 fi
 
-# ── judge backend (only used by judge-based tasks; inert for exact_match like
-#    countqa). Mirrors reason-vlm-eval/examples/eval_model.sh. get_judge_engine()
-#    reads these env vars to pick the backend. ────────────────────────────────
-JUDGE_BACKEND="${JUDGE_BACKEND:-engine}"
-if [[ "$JUDGE_BACKEND" == "engine" ]]; then
-  # In-process vLLM judge (default), loaded by the task's process_results.
-  export JUDGE_MODEL_PATH="${JUDGE_MODEL_PATH:-$HF_HOME/Qwen/Qwen3-32B}"
-  export CHARXIV_JUDGE_GPU_MEMORY_UTILIZATION="${CHARXIV_JUDGE_GPU_MEMORY_UTILIZATION:-0.9}"
-  export CHARXIV_JUDGE_TENSOR_PARALLEL_SIZE="${CHARXIV_JUDGE_TENSOR_PARALLEL_SIZE:-${NUM_GPUS:-1}}"
-  export CHARXIV_JUDGE_MAX_MODEL_LEN="${CHARXIV_JUDGE_MAX_MODEL_LEN:-18384}"
-  export VLLM_JUDGE_MAX_NUM_SEQS="${VLLM_JUDGE_MAX_NUM_SEQS:-32}"
-  unset VLLM_SERVER_JUDGE VLLM_JUDGE_BASE_URL VLLM_JUDGE_PORT VLLM_JUDGE_MODEL_PATH 2>/dev/null || true
-elif [[ "$JUDGE_BACKEND" == "server" ]]; then
-  # Judge served over HTTP via wake/sleep (VLLMServerJudge).
-  export VLLM_SERVER_JUDGE=1
-  if [[ "${START_VLLM_JUDGE_SERVER:-0}" == "1" ]]; then
-    # Launch a DEDICATED judge server (e.g. Qwen3-32B). Needs a free GPU — on a
-    # single H100 give it its own: request gpu:2 and set VLLM_JUDGE_CUDA_VISIBLE_DEVICES=1.
-    # serve_judge_vllm.sh exports VLLM_JUDGE_BASE_URL.
-    source "$VERO_EVAL_DIR/scripts/serve_judge_vllm.sh"
+# ── judge backend (set up ONLY when the run contains a judge-based task; inert for
+#    exact_match tasks like countqa). DEFAULT = a dedicated Qwen3-32B judge on a 2nd
+#    GPU (the strong, reportable judge, like reason-vlm-eval). On a single GPU it
+#    falls back to reusing the policy model as judge (Qwen3-VL-8B) with a loud warning,
+#    so 8B-self-judge numbers are never reported by accident. ────────────────────
+_JUDGE_STEMS="visual_probe simplevqa mathvista mathvision charxiv mmvetv2 mia_bench mm_mt_bench mmifeval fvqa chartmuseum"
+RUN_HAS_JUDGE=0
+for _t in ${TASKS//,/ }; do
+  for _s in $_JUDGE_STEMS; do [[ "$_t" == ${_s}* ]] && RUN_HAS_JUDGE=1; done
+done
+
+if [[ "$RUN_HAS_JUDGE" == 1 ]]; then
+  export VLLM_WORKER_MULTIPROC_METHOD=spawn
+  JUDGE_BACKEND="${JUDGE_BACKEND:-server}"
+  if [[ "$JUDGE_BACKEND" == "engine" ]]; then
+    # In-process vLLM judge (Qwen3-32B). Needs its own GPU memory — use a 2-GPU alloc.
+    export JUDGE_MODEL_PATH="${JUDGE_MODEL_PATH:-$HF_HOME/Qwen/Qwen3-32B}"
+    export CHARXIV_JUDGE_GPU_MEMORY_UTILIZATION="${CHARXIV_JUDGE_GPU_MEMORY_UTILIZATION:-0.9}"
+    export CHARXIV_JUDGE_TENSOR_PARALLEL_SIZE="${CHARXIV_JUDGE_TENSOR_PARALLEL_SIZE:-1}"
+    export CHARXIV_JUDGE_MAX_MODEL_LEN="${CHARXIV_JUDGE_MAX_MODEL_LEN:-18432}"
+    export VLLM_JUDGE_MAX_NUM_SEQS="${VLLM_JUDGE_MAX_NUM_SEQS:-32}"
+    unset VLLM_SERVER_JUDGE VLLM_JUDGE_BASE_URL VLLM_JUDGE_PORT VLLM_JUDGE_MODEL_PATH 2>/dev/null || true
+  elif [[ "$JUDGE_BACKEND" == "server" ]]; then
+    export VLLM_SERVER_JUDGE=1
+    _NGPU="$(nvidia-smi -L 2>/dev/null | wc -l || echo 1)"
+    if [[ "${START_VLLM_JUDGE_SERVER:-auto}" != "0" && "${_NGPU:-1}" -ge 2 ]]; then
+      # DEFAULT: dedicated Qwen3-32B judge on the last GPU (reuse-aware: launched once).
+      export VLLM_JUDGE_MODEL_PATH="${VLLM_JUDGE_MODEL_PATH:-$HF_HOME/Qwen/Qwen3-32B}"
+      export VLLM_JUDGE_CUDA_VISIBLE_DEVICES="${VLLM_JUDGE_CUDA_VISIBLE_DEVICES:-$((_NGPU - 1))}"
+      source "$VERO_EVAL_DIR/scripts/serve_judge_vllm.sh"   # exports VLLM_JUDGE_BASE_URL
+    else
+      # Fallback: reuse the policy server as judge (Qwen3-VL-8B judging itself).
+      export VLLM_JUDGE_BASE_URL="${VLLM_JUDGE_BASE_URL:-http://localhost:${PORT}/v1}"
+      export VLLM_JUDGE_MODEL_PATH="qwen_vllm"
+      echo "WARNING: judge = the policy model (Qwen3-VL-8B reusing itself), NOT a 32B judge." >&2
+      echo "         For reportable numbers request gpu:2 (a 2nd GPU auto-launches a dedicated Qwen3-32B judge)." >&2
+    fi
+    export JUDGE_MODEL_PATH="${JUDGE_MODEL_PATH:-${VLLM_JUDGE_MODEL_PATH:-qwen_vllm}}"
   else
-    # Default: reuse the policy server on $PORT as the judge (judge == policy model,
-    # zero extra GPU). wake/sleep are harmless no-ops against the non-sleep server.
-    export VLLM_JUDGE_BASE_URL="${VLLM_JUDGE_BASE_URL:-http://localhost:${PORT}/v1}"
+    echo "ERROR: unknown JUDGE_BACKEND '$JUDGE_BACKEND' (use engine|server)" >&2
+    exit 1
   fi
-  export VLLM_JUDGE_MODEL_PATH="${VLLM_JUDGE_MODEL_PATH:-qwen_vllm}"
-  export JUDGE_MODEL_PATH="${JUDGE_MODEL_PATH:-$VLLM_JUDGE_MODEL_PATH}"
-else
-  echo "ERROR: unknown JUDGE_BACKEND '$JUDGE_BACKEND' (use engine|server)" >&2
-  exit 1
 fi
-export VLLM_WORKER_MULTIPROC_METHOD=spawn
 
 # ── build model_args ──────────────────────────────────────────────────
 MODEL_ARGS="model_version=${MODEL_VERSION},base_url=http://localhost:${PORT}/v1,api_key=${API_KEY},max_tool_iterations=${MAX_TOOL_ITERATIONS}"
