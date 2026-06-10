@@ -309,7 +309,7 @@ trainer:
   n_gpus_per_node: 8
   project_name: vero2_verl
   total_epochs: 1000
-  total_training_steps: 1000
+  total_training_steps: 400
   log_val_generations: 0
   esi_redundant_time: 1500
   resume_mode: auto
@@ -319,10 +319,10 @@ trainer:
   validation_data_dir: ${trainer.default_local_dir}/validation_data
   save_validation_crops: true
   comprehensive_debug_logging:
-    enabled: false
+    enabled: true
     dir: ${trainer.default_local_dir}/debug_logs
-    log_every_n_steps: 5
-    save_cropped_images: true
+    log_every_n_steps: ${trainer.test_freq}
+    save_cropped_images: false
     save_source_images: false
     max_text_chars: null
     gpu_memory_logging:
