@@ -16,6 +16,14 @@
 #      VLLM_JUDGE_CUDA_VISIBLE_DEVICES (empty=share GPU), VLLM_JUDGE_CHAT_TEMPLATE,
 #      VLLM_JUDGE_GPU_MEMORY_UTILIZATION, VLLM_JUDGE_MAX_MODEL_LEN.
 
+# Disable FlashInfer sampling to avoid JIT compilation issues with missing curand.h
+# on cluster nodes. Uses PyTorch-native sampler instead (minimal performance impact).
+export VLLM_USE_FLASHINFER_SAMPLER=0
+
+# The variable VLLM_USE_FLASH_ATTN_V3 is not recognized by vLLM.
+# Use the official attention config flag below to force FlashAttention v2.
+unset VLLM_USE_FLASH_ATTN_V3 || true
+
 : "${VERO_EVAL_DIR:?source set_paths.sh first (VERO_EVAL_DIR unset)}"
 _JUDGE_MODEL_PATH="${VLLM_JUDGE_MODEL_PATH:-$HF_HOME/Qwen/Qwen3-32B}"
 _JUDGE_MODEL_NAME="${VLLM_JUDGE_MODEL_NAME:-qwen_vllm}"
