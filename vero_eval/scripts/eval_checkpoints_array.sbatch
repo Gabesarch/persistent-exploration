@@ -5,7 +5,7 @@
 #SBATCH --time=4:00:00
 #SBATCH --mem=80G
 #SBATCH --cpus-per-task=10
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:2
 #SBATCH --partition=pli
 #SBATCH --account=vlmrl
 #SBATCH --output=vero_eval/logs/eval_ckpt_%A_%a.out

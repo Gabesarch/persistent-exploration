@@ -28,6 +28,15 @@ _JUDGE_MAXLEN="${VLLM_JUDGE_MAX_MODEL_LEN:-18432}"
 _JUDGE_LOG="$VERO_EVAL_DIR/logs/vllm/judge_$(date '+%Y-%m-%d_%H-%M-%S')_port${_JUDGE_PORT}.txt"
 mkdir -p "$(dirname "$_JUDGE_LOG")"
 
+# Reuse an already-running judge server on this port (idempotent across a domain loop).
+if curl --max-time 3 -s -o /dev/null "http://localhost:${_JUDGE_PORT}/v1/models"; then
+  echo "=== Reusing existing judge server on :$_JUDGE_PORT ==="
+  export VLLM_SERVER_JUDGE=1
+  export VLLM_JUDGE_BASE_URL="http://localhost:${_JUDGE_PORT}/v1"
+  export VLLM_JUDGE_PORT="$_JUDGE_PORT" VLLM_JUDGE_MODEL_NAME="$_JUDGE_MODEL_NAME"
+  return 0 2>/dev/null || exit 0
+fi
+
 echo "=== Launching dedicated vLLM judge: $_JUDGE_MODEL_PATH on :$_JUDGE_PORT (CUDA_VISIBLE_DEVICES=${VLLM_JUDGE_CUDA_VISIBLE_DEVICES:-inherit}) ==="
 _cvd=()
 [[ -n "${VLLM_JUDGE_CUDA_VISIBLE_DEVICES:-}" ]] && _cvd=(CUDA_VISIBLE_DEVICES="$VLLM_JUDGE_CUDA_VISIBLE_DEVICES")
