@@ -43,6 +43,7 @@ from verl.utils.debug.comprehensive_logging import (
     to_jsonable,
 )
 from verl.utils.profiler import simple_timer
+from verl.utils.response_display import apply_response_display_prefix, get_response_display_prefix
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput
 
@@ -134,6 +135,7 @@ class ToolAgentLoop(AgentLoopBase):
         self.tool_parser = ToolParser.get_tool_parser(self.rollout_config.multi_turn.format, self.tokenizer)
         self.tool_parser_name = self.rollout_config.multi_turn.format
         self.debug_options = get_debug_options(self.config)
+        self.response_display_prefix = get_response_display_prefix(self.config)
         lazy_multi_modal_config = self.rollout_config.get("lazy_multi_modal_inputs", {})
         self.crop_cache_root = str(resolve_crop_cache_root(lazy_multi_modal_config.get("crop_cache_root")))
 
@@ -313,6 +315,7 @@ class ToolAgentLoop(AgentLoopBase):
             assistant_message = await self.loop.run_in_executor(
                 None, lambda: self.tokenizer.decode(agent_data.response_ids, skip_special_tokens=True)
             )
+            assistant_message = apply_response_display_prefix(assistant_message, self.response_display_prefix)
             event = {
                 "event": "assistant_turn",
                 "request_id": agent_data.request_id,
@@ -741,6 +744,7 @@ class ToolAgentLoop(AgentLoopBase):
         final_response = await self.loop.run_in_executor(
             None, lambda: self.tokenizer.decode(output.response_ids, skip_special_tokens=True)
         )
+        final_response = apply_response_display_prefix(final_response, self.response_display_prefix)
         record = {
             "event": "sample_final",
             **self._debug_base_record(agent_data, kwargs, trajectory),

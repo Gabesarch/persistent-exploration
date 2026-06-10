@@ -15,7 +15,11 @@ from verl.utils.reward_score.math_verify_reward_type_boxed import (
     _number_list_reward,
     _numeric_reward,
 )
-from verl.utils.reward_score.text_normalization import normalize_text_for_match, search_string_reward
+from verl.utils.reward_score.text_normalization import (
+    _parse_simple_integer,
+    normalize_text_for_match,
+    search_string_reward,
+)
 
 __all__ = [
     "format_reward",
@@ -286,6 +290,10 @@ def _short_string_reward(predicted: str, truth: str, **_: Any) -> float:
     normalized_truth = normalize_text_for_match(truth)
     if not normalized_pred or not normalized_truth:
         return 0.0
+    pred_int = _parse_simple_integer(predicted)
+    truth_int = _parse_simple_integer(truth)
+    if pred_int is not None and truth_int is not None and pred_int == truth_int:
+        return 1.0
     return 1.0 if normalized_pred == normalized_truth else 0.0
 
 

@@ -40,6 +40,8 @@ Your response must include two parts:
 <think>
 Detailed reasoning goes here...
 </think>
+<answer>
 Self-contained response goes here...
-Following the response, if a concise final result exists, include: \boxed{final_result}.
+Following the response, if a concise final result exists, include: \boxed{final_result}. If open-ended or no concise result, respond naturally without \boxed.
+</answer>
 ```

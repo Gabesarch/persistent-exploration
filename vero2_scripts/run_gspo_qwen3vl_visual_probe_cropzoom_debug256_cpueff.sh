@@ -7,7 +7,6 @@
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=968G
 #SBATCH --time=24:00:00
-#SBATCH --array=1-3%1
 #SBATCH --output=slurm/output/%x_%j.log
 #SBATCH --error=slurm/error/%x_%j.log
 #SBATCH --dependency=afterany:8565758
@@ -71,9 +70,10 @@ if [ ! -e "$TRAINER_DEFAULT_LOCAL_DIR" ]; then
   fi
 fi
 
-DEBUG_LOGGING_ENABLED=0
-case "${VERO2_COMPREHENSIVE_DEBUG_LOGGING:-0}" in
-  1|true|TRUE|True|yes|YES|Yes) DEBUG_LOGGING_ENABLED=1 ;;
+DEBUG_LOGGING_ENABLED=1
+case "${VERO2_COMPREHENSIVE_DEBUG_LOGGING:-1}" in
+  0|false|FALSE|False|no|NO|No) DEBUG_LOGGING_ENABLED=0 ;;
+  *) DEBUG_LOGGING_ENABLED=1 ;;
 esac
 
 DEBUG_LOG_DIR="${TRAINER_DEFAULT_LOCAL_DIR}/debug_logs"
@@ -123,6 +123,17 @@ HYDRA_ARGS=(
   "data.val_files=$DEBUG_DATA"
   "${HYDRA_ARGS[@]}"
 )
+
+HAS_VAL_BEFORE_TRAIN_OVERRIDE=0
+for arg in "${HYDRA_ARGS[@]}"; do
+  if [[ "$arg" == trainer.val_before_train=* ]]; then
+    HAS_VAL_BEFORE_TRAIN_OVERRIDE=1
+    break
+  fi
+done
+if [ "$HAS_VAL_BEFORE_TRAIN_OVERRIDE" = "0" ]; then
+  HYDRA_ARGS=("trainer.val_before_train=true" "${HYDRA_ARGS[@]}")
+fi
 
 if [ "$DEBUG_LOGGING_ENABLED" = "1" ]; then
   HAS_DEBUG_OVERRIDE=0
