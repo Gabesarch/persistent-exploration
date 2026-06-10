@@ -4,6 +4,14 @@
 # MODEL_NAME, API_KEY, NUM_GPUS.
 set -euo pipefail
 
+# Disable FlashInfer sampling to avoid JIT compilation issues with missing curand.h
+# on cluster nodes. Uses PyTorch-native sampler instead (minimal performance impact).
+export VLLM_USE_FLASHINFER_SAMPLER=0
+
+# The variable VLLM_USE_FLASH_ATTN_V3 is not recognized by vLLM.
+# Use the official attention config flag below to force FlashAttention v2.
+unset VLLM_USE_FLASH_ATTN_V3 || true
+
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERO_EVAL_DIR="$(cd "$SELF/.." && pwd)"
 set +u
@@ -35,6 +43,7 @@ nohup vllm serve "$CHECKPOINT_PATH" \
   --port "$PORT" \
   --served-model-name "$MODEL_NAME" \
   --gpu-memory-utilization 0.9 \
+  --attention-config.flash_attn_version 2 \
   --tensor-parallel-size "$NUM_GPUS" \
   --uvicorn-log-level info \
   --max-model-len 32768 \

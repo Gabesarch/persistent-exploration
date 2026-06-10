@@ -35,6 +35,7 @@ nohup env "${_cvd[@]}" VLLM_SERVER_DEV_MODE=1 vllm serve "$_JUDGE_MODEL_PATH" \
   --port "$_JUDGE_PORT" \
   --served-model-name "$_JUDGE_MODEL_NAME" \
   --gpu-memory-utilization "$_JUDGE_MEM" \
+  --attention-config.flash_attn_version 2 \
   --tensor-parallel-size "$_JUDGE_TP" \
   --max-model-len "$_JUDGE_MAXLEN" \
   --enable-sleep-mode \
