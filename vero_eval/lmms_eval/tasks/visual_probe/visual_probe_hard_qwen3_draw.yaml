@@ -1,0 +1,30 @@
+# Qwen3-VL Instruct zero-shot + the DRAWING toolset (multi-turn tool calling).
+# Same sampling/prompt family as visual_probe_hard_qwen3_zs; tools are selected
+# per task via metadata.allowed_tools (read by the async_openai backend).
+# Mask tools are excluded (no segmentation tool produces a mask_path).
+# Run with TOOLS=on (mcp_server_path=lmms_eval/mcp/vero2_mcp.py).
+include: visual_probe_hard.yaml
+task: "visual_probe_hard_qwen3_draw"
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 40
+  presence_penalty: 2.0
+  do_sample: True
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: "You are given an image. Search the picture to answer the question. Use the drawing tools (for example draw_box, draw_numbered_points, or draw_grid) to mark and double-check candidate regions of the image whenever that would help. Respond with a short, specific phrase only. "
+    post_prompt: ""
+metadata:
+  version: 0.0
+  allowed_tools:
+    - draw_box
+    - draw_numbered_boxes
+    - draw_numbered_points
+    - draw_grid
+    - draw_circle
+    - draw_line
+    - draw_arrow
+    - draw_text
+    - draw_polygon

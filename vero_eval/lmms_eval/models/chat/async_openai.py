@@ -1,4 +1,5 @@
 import asyncio
+import fnmatch
 import json
 import os
 import re
@@ -135,6 +136,7 @@ class AsyncOpenAIChat(lmms):
         self.max_tool_images = int(max_tool_images)
         self.tool_image_as_user_turn = parse_bool(tool_image_as_user_turn)
         self._tool_functions = None
+        self._task_tools_cache = {}
 
         accelerator = Accelerator()
         # assert self.batch_size_per_gpu == 1, "Llava currently does not support batched generation. See https://github.com/haotian-liu/LLaVA/issues/754. HF Llava also has this issue."
@@ -172,6 +174,40 @@ class AsyncOpenAIChat(lmms):
     @property
     def world_size(self):
         return self._world_size
+
+    def _resolve_task_tools(self, task: str):
+        """Resolve the per-task tool view from the task yaml's `metadata` block:
+
+        - ``allowed_tools``: list of MCP tool names or fnmatch patterns (e.g.
+          ``["image_zoom_in_tool"]`` or ``["draw_*"]``). Absent/empty = offer
+          every tool the MCP server exposes (backwards-compatible default).
+        - ``extra_tools``: extra OpenAI function specs offered to the model but
+          NOT backed by the MCP server (answer-protocol tools such as
+          screenspot's ``computer_use``). Given verbatim in the yaml.
+        - ``terminal_tools``: tool names whose call ENDS the episode — the call
+          is recorded in the transcript as the final answer and never executed.
+
+        Returns ``(functions, terminal_tool_names)``; cached per task.
+        """
+        if task in self._task_tools_cache:
+            return self._task_tools_cache[task]
+        meta = self.task_metadata.get(task) or {}
+        functions = list(self._tool_functions or [])
+        allowed = meta.get("allowed_tools")
+        if allowed:
+            if isinstance(allowed, str):
+                allowed = [p.strip() for p in allowed.split(",") if p.strip()]
+            functions = [f for f in functions if any(fnmatch.fnmatchcase(f["function"]["name"], pat) for pat in allowed)]
+            if not functions:
+                server_tools = [f["function"]["name"] for f in (self._tool_functions or [])]
+                raise ValueError(f"Task '{task}': allowed_tools={allowed} matched none of the MCP server tools {server_tools}. " f"Fix the task yaml metadata or the MCP server at the configured mcp_server_path.")
+        extra = meta.get("extra_tools") or []
+        functions = functions + list(extra)
+        terminal = {str(name) for name in (meta.get("terminal_tools") or [])}
+        self._task_tools_cache[task] = (functions, terminal)
+        offered = [f["function"]["name"] for f in functions]
+        eval_logger.info(f"Task '{task}': offering tools {offered}" + (f" (terminal: {sorted(terminal)})" if terminal else ""))
+        return functions, terminal
 
     def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
         assert False, "TODO, not implemented"
@@ -270,12 +306,13 @@ class AsyncOpenAIChat(lmms):
             if _extra_body:
                 payload["extra_body"] = _extra_body
 
+            terminal_tools = set()
             if self.mcp_client is not None:
                 # Fetch the tool/function list ONCE and cache it (avoids forking the
                 # MCP server subprocess on every request via get_function_list).
                 if self._tool_functions is None:
                     self._tool_functions = await self.mcp_client.get_function_list()
-                functions = self._tool_functions
+                functions, terminal_tools = self._resolve_task_tools(task)
                 payload["tools"] = functions
                 payload["tool_choice"] = "auto"
 
@@ -309,6 +346,7 @@ class AsyncOpenAIChat(lmms):
 
             tool_iteration = 0
             tool_image_count = 0
+            terminal_tool_called = False
             while response.choices[0].finish_reason == "tool_calls" and tool_iteration < self.max_tool_iterations:
                 tool_iteration += 1
                 assistant_message = response.choices[0].message
@@ -333,6 +371,12 @@ class AsyncOpenAIChat(lmms):
                 for call in (assistant_message.tool_calls or []):
                     eval_logger.debug(f"Calling {call.function.name}...")
                     all_response += f"<tool_call>{call.function.name} {call.function.arguments}</tool_call>"
+                    if call.function.name in terminal_tools:
+                        # Answer-protocol tool (e.g. screenspot's computer_use): the
+                        # call IS the final answer. It is recorded in the transcript
+                        # above for the task's parser; never executed, episode ends.
+                        terminal_tool_called = True
+                        break
                     try:
                         tool_args = json.loads(call.function.arguments) if call.function.arguments else {}
                         result = await self.mcp_client.run_tool(call.function.name, tool_args)
@@ -376,6 +420,9 @@ class AsyncOpenAIChat(lmms):
                     else:
                         messages.append({"role": "tool", "tool_call_id": call.id, "name": call.function.name, "content": kept_parts})
 
+                if terminal_tool_called:
+                    break
+
                 if pending_user_images:
                     messages.append({"role": "user", "content": pending_user_images + [{"type": "text", "text": "Above are the tool-returned image(s)."}]})
 
@@ -412,7 +459,7 @@ class AsyncOpenAIChat(lmms):
                 except Exception as e:
                     all_response += str(e)
 
-            if tool_iteration >= self.max_tool_iterations:
+            if tool_iteration >= self.max_tool_iterations and not terminal_tool_called:
                 eval_logger.warning(f"Max tool iterations ({self.max_tool_iterations}) reached for request {idx}")
                 all_response += f"\n[MAX_TOOL_ITERATIONS_REACHED]"
             return all_response, idx, TokenCounts(input_tokens=total_input_tokens, output_tokens=total_output_tokens, reasoning_tokens=total_reasoning_tokens)

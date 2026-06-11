@@ -26,7 +26,7 @@ from PIL import Image, ImageDraw
 # Import it LAZILY through a same-named factory so this MCP server starts in a
 # minimal/offline env. This is the single canonical tool server: it supersedes the
 # old offline_image_tools.py (PIL-only) and vision_tools.py — the PIL-only tools
-# image_crop / image_resize / draw_box keep working even without cv2/matplotlib.
+# image_zoom_in_tool / draw_box keep working even without cv2/matplotlib.
 _VISUALIZER_CLS = None
 
 
@@ -50,7 +50,7 @@ def Visualizer(*args, **kwargs):
     except ImportError as exc:
         raise RuntimeError(
             "This drawing tool needs the optional 'visualizer' deps (cv2 + matplotlib), "
-            "which are not installed. Use image_crop / image_resize / draw_box (PIL-only) "
+            "which are not installed. Use image_zoom_in_tool / draw_box (PIL-only) "
             f"instead, or install the extras. ({exc})"
         )
 
@@ -93,27 +93,64 @@ def _to_px_clamped(value: float, size: int) -> int:
 # ========== Offline-safe PIL-only tools (always available) ==========
 
 
-# @app.tool(name="image_crop", description="Crop a region from an image to zoom in on details. Coordinates use 0-1000 scale where (0,0)=top-left, (1000,1000)=bottom-right. Example: image_crop(image_path, 250, 250, 750, 750) crops the center 50%.")
-# def image_crop(image_path: str, x1: int, y1: int, x2: int, y2: int) -> ImageContent:
-#     """Crop [x1,y1,x2,y2] (0-1000 scale) out of the image. PIL-only (works offline)."""
-#     image = Image.open(image_path)
-#     w, h = image.size
-#     px1, py1 = _to_px_clamped(x1, w), _to_px_clamped(y1, h)
-#     px2, py2 = _to_px_clamped(x2, w), _to_px_clamped(y2, h)
-#     if px2 <= px1:
-#         px2 = min(w, px1 + 1)
-#     if py2 <= py1:
-#         py2 = min(h, py1 + 1)
-#     return _pil_to_content(image.crop((px1, py1, px2, py2)))
+# ---- Zooming ----
+# Eval-side twin of the RL training zoom tool (verl/tools/image_zoom_in_tool.py +
+# vero2_scripts/config/tool_config/image_zoom_in_tool.yaml): same name, same
+# bbox_2d/label arguments, same normalized_1000 coordinates and the same output
+# pixel budget, so tool behavior matches what tool-trained checkpoints saw.
+# Only difference: the source image is addressed by image_path (the eval loop
+# hands the model file paths) instead of the training-side img_idx.
+ZOOM_MIN_PIXELS = 518400  # = training cropped_min_pixels
+ZOOM_MAX_PIXELS = 1048576  # = training cropped_max_pixels
+ZOOM_MIN_SIDE_PX = 28
 
 
-# @app.tool(name="image_resize", description="Resize an image by a scale factor to see more (scale>1) or less detail. Example: image_resize(image_path, 2.0) doubles the size.")
-# def image_resize(image_path: str, scale: float = 2.0) -> ImageContent:
-#     """Resize the image by `scale` (LANCZOS). PIL-only (works offline)."""
-#     image = Image.open(image_path)
-#     scale = max(0.1, min(8.0, float(scale)))
-#     new_w, new_h = max(1, int(image.width * scale)), max(1, int(image.height * scale))
-#     return _pil_to_content(image.resize((new_w, new_h), Image.Resampling.LANCZOS))
+def _expand_to_min_side(lo: int, hi: int, size: int, min_side: int = ZOOM_MIN_SIDE_PX):
+    """Widen [lo, hi] around its center to at least min_side px, staying in [0, size]."""
+    if hi - lo >= min_side:
+        return lo, hi
+    center = (lo + hi) // 2
+    lo, hi = center - min_side // 2, center + (min_side + 1) // 2
+    if lo < 0:
+        lo, hi = 0, min(size, min_side)
+    if hi > size:
+        lo, hi = max(0, size - min_side), size
+    return lo, hi
+
+
+@app.tool(
+    name="image_zoom_in_tool",
+    description=(
+        "Zoom in on a specific region of an image by cropping it based on a bounding box (bbox_2d) "
+        "and an optional object label. Coordinates use the 0-1000 scale where (0,0)=top-left and "
+        "(1000,1000)=bottom-right. The crop is returned magnified so small details become readable. "
+        'Example: image_zoom_in_tool(image_path, [480, 90, 640, 210], "street sign").'
+    ),
+)
+def image_zoom_in_tool(image_path: str, bbox_2d: List[int], label: str = "") -> ImageContent:
+    """Crop bbox_2d=[x1,y1,x2,y2] (0-1000 scale) out of the image and resize the crop
+    into the training-time pixel budget. PIL-only (works offline)."""
+    image = Image.open(image_path).convert("RGB")
+    w, h = image.size
+    coords = [int(v) for v in list(bbox_2d)[:4]]
+    if len(coords) != 4:
+        raise ValueError(f"bbox_2d must be [x1, y1, x2, y2] on the 0-1000 scale, got {bbox_2d}")
+    x1, y1, x2, y2 = coords
+    px1, py1 = _to_px_clamped(min(x1, x2), w), _to_px_clamped(min(y1, y2), h)
+    px2, py2 = _to_px_clamped(max(x1, x2), w), _to_px_clamped(max(y1, y2), h)
+    px1, px2 = _expand_to_min_side(px1, px2, w)
+    py1, py2 = _expand_to_min_side(py1, py2, h)
+    crop = image.crop((px1, py1, max(px1 + 1, px2), max(py1 + 1, py2)))
+    pixels = crop.width * crop.height
+    if pixels < ZOOM_MIN_PIXELS:
+        scale = (ZOOM_MIN_PIXELS / pixels) ** 0.5
+    elif pixels > ZOOM_MAX_PIXELS:
+        scale = (ZOOM_MAX_PIXELS / pixels) ** 0.5
+    else:
+        scale = 1.0
+    if scale != 1.0:
+        crop = crop.resize((max(1, round(crop.width * scale)), max(1, round(crop.height * scale))), Image.Resampling.LANCZOS)
+    return _pil_to_content(crop)
 
 
 # ========== MCP Drawing Tools ==========

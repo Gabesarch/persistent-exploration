@@ -25,6 +25,9 @@ class lmms(abc.ABC):
         self._world_size = 1
         self.cache_hook = CacheHook(None)
         self.task_dict = {}
+        # Per-task config `metadata` (set by the evaluator alongside task_dict).
+        # Lets backends read task-level knobs such as allowed_tools/terminal_tools.
+        self.task_metadata = {}
 
     @staticmethod
     def _resolve_system_prompt(value: str) -> str:
