@@ -125,6 +125,7 @@ def _build_screenspotpro_dataset() -> Dataset:
     file_names: List[str] = []
     data_types: List[str] = []
     data_sources: List[str] = []
+    img_sizes: List[List[int]] = []
 
     for ann_path in sorted(ann_dir.glob("*.json")):
         with ann_path.open("r", encoding="utf-8") as handle:
@@ -157,6 +158,11 @@ def _build_screenspotpro_dataset() -> Dataset:
             file_names.append(str(entry.get("id") or img_filename))
             data_types.append(data_type)
             data_sources.append(data_source)
+            # Keep the size as plain ints: process_results docs have the image
+            # column stripped (dataset_no_image), and without dimensions the
+            # abs->rel1000 GT-bbox conversion silently zeroes the box.
+            img_size = entry.get("img_size") or []
+            img_sizes.append([int(img_size[0]), int(img_size[1])] if len(img_size) >= 2 else [0, 0])
 
     features = Features(
         {
@@ -166,6 +172,7 @@ def _build_screenspotpro_dataset() -> Dataset:
             "file_name": Value("string"),
             "data_type": Value("string"),
             "data_source": Value("string"),
+            "img_size": Sequence(Value("int32")),
         }
     )
     return Dataset.from_dict(
@@ -176,6 +183,7 @@ def _build_screenspotpro_dataset() -> Dataset:
             "file_name": file_names,
             "data_type": data_types,
             "data_source": data_sources,
+            "img_size": img_sizes,
         },
         features=features,
     )
@@ -224,6 +232,11 @@ def _get_image_size(doc):
     image = doc.get("image")
     if hasattr(image, "size"):
         return image.size
+    # process_results receives docs from dataset_no_image (image column stripped);
+    # fall back to the plain img_size column carried by the offline builder.
+    size = doc.get("img_size")
+    if isinstance(size, (list, tuple)) and len(size) >= 2 and size[0] and size[1]:
+        return int(size[0]), int(size[1])
     return None, None
 
 
