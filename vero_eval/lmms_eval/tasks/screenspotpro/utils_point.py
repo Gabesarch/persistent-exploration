@@ -466,6 +466,17 @@ def screenspot_point_process_docs_abs(dataset: Dataset) -> Dataset:
     return _annotate_point_format(dataset, "abs_pixel", "abs_pixel")
 
 
+def screenspotpro_builder():
+    """Dataset builder for offline runs (wired as dataset_kwargs.builder_fn in
+    _default_template_point_yaml): the likaixin/ScreenSpot-Pro snapshot carries raw
+    annotations/ + images/ with no loadable data files, so datasets.load_dataset on
+    the bare repo id fails under HF_HUB_OFFLINE=1. Build the Dataset from the local
+    snapshot instead. The 'train' split matches the screenspotpro yamls' test_split."""
+    from datasets import DatasetDict
+
+    return DatasetDict({"train": _build_screenspotpro_dataset()})
+
+
 def screenspot_point_process_docs_rel1000(dataset: Dataset) -> Dataset:
     if "instruction" not in dataset.column_names or "bbox" not in dataset.column_names:
         dataset = _build_screenspotpro_dataset()

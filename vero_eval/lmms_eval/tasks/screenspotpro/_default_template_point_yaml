@@ -1,4 +1,6 @@
 dataset_path: likaixin/ScreenSpot-Pro
+dataset_kwargs:
+  builder_fn: !function utils_point.screenspotpro_builder
 output_type: generate_until
 doc_to_visual: !function utils_point.screenspot_point_doc_to_visual
 doc_to_text: !function utils_point.screenspot_point_doc_to_text_abs
