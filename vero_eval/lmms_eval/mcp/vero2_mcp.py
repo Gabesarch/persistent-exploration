@@ -93,27 +93,27 @@ def _to_px_clamped(value: float, size: int) -> int:
 # ========== Offline-safe PIL-only tools (always available) ==========
 
 
-@app.tool(name="image_crop", description="Crop a region from an image to zoom in on details. Coordinates use 0-1000 scale where (0,0)=top-left, (1000,1000)=bottom-right. Example: image_crop(image_path, 250, 250, 750, 750) crops the center 50%.")
-def image_crop(image_path: str, x1: int, y1: int, x2: int, y2: int) -> ImageContent:
-    """Crop [x1,y1,x2,y2] (0-1000 scale) out of the image. PIL-only (works offline)."""
-    image = Image.open(image_path)
-    w, h = image.size
-    px1, py1 = _to_px_clamped(x1, w), _to_px_clamped(y1, h)
-    px2, py2 = _to_px_clamped(x2, w), _to_px_clamped(y2, h)
-    if px2 <= px1:
-        px2 = min(w, px1 + 1)
-    if py2 <= py1:
-        py2 = min(h, py1 + 1)
-    return _pil_to_content(image.crop((px1, py1, px2, py2)))
+# @app.tool(name="image_crop", description="Crop a region from an image to zoom in on details. Coordinates use 0-1000 scale where (0,0)=top-left, (1000,1000)=bottom-right. Example: image_crop(image_path, 250, 250, 750, 750) crops the center 50%.")
+# def image_crop(image_path: str, x1: int, y1: int, x2: int, y2: int) -> ImageContent:
+#     """Crop [x1,y1,x2,y2] (0-1000 scale) out of the image. PIL-only (works offline)."""
+#     image = Image.open(image_path)
+#     w, h = image.size
+#     px1, py1 = _to_px_clamped(x1, w), _to_px_clamped(y1, h)
+#     px2, py2 = _to_px_clamped(x2, w), _to_px_clamped(y2, h)
+#     if px2 <= px1:
+#         px2 = min(w, px1 + 1)
+#     if py2 <= py1:
+#         py2 = min(h, py1 + 1)
+#     return _pil_to_content(image.crop((px1, py1, px2, py2)))
 
 
-@app.tool(name="image_resize", description="Resize an image by a scale factor to see more (scale>1) or less detail. Example: image_resize(image_path, 2.0) doubles the size.")
-def image_resize(image_path: str, scale: float = 2.0) -> ImageContent:
-    """Resize the image by `scale` (LANCZOS). PIL-only (works offline)."""
-    image = Image.open(image_path)
-    scale = max(0.1, min(8.0, float(scale)))
-    new_w, new_h = max(1, int(image.width * scale)), max(1, int(image.height * scale))
-    return _pil_to_content(image.resize((new_w, new_h), Image.Resampling.LANCZOS))
+# @app.tool(name="image_resize", description="Resize an image by a scale factor to see more (scale>1) or less detail. Example: image_resize(image_path, 2.0) doubles the size.")
+# def image_resize(image_path: str, scale: float = 2.0) -> ImageContent:
+#     """Resize the image by `scale` (LANCZOS). PIL-only (works offline)."""
+#     image = Image.open(image_path)
+#     scale = max(0.1, min(8.0, float(scale)))
+#     new_w, new_h = max(1, int(image.width * scale)), max(1, int(image.height * scale))
+#     return _pil_to_content(image.resize((new_w, new_h), Image.Resampling.LANCZOS))
 
 
 # ========== MCP Drawing Tools ==========
