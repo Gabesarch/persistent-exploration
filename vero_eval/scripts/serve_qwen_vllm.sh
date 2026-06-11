@@ -34,8 +34,11 @@ LOGFILE="$LOG_DIR/vllm_$(date '+%Y-%m-%d_%H-%M-%S')_port${PORT}.txt"
 echo "CHECKPOINT_PATH: $CHECKPOINT_PATH"
 echo "PORT: $PORT   NUM_GPUS: $NUM_GPUS   served-model-name: $MODEL_NAME"
 
-if pgrep -f "vllm serve" >/dev/null 2>&1; then
-  echo "Killing existing vLLM server(s)..."; pkill -f "vllm serve" || true; sleep 3
+# Only kill a server on OUR port: on shared nodes a blanket `pkill -f "vllm serve"`
+# would murder a sibling job's policy server mid-eval (give concurrent jobs unique
+# PORTs; the trailing space anchors the match so 9001 doesn't match 90011).
+if pgrep -f "vllm serve.*--port ${PORT} " >/dev/null 2>&1; then
+  echo "Killing existing vLLM server(s) on port ${PORT}..."; pkill -f "vllm serve.*--port ${PORT} " || true; sleep 3
 fi
 
 echo "Starting vLLM server (log: $LOGFILE)..."
