@@ -128,6 +128,8 @@ class ToolAgentLoop(AgentLoopBase):
         self.max_parallel_calls = self.rollout_config.multi_turn.max_parallel_calls
         self.max_tool_response_length = self.rollout_config.multi_turn.max_tool_response_length
         self.tool_response_truncate_side = self.rollout_config.multi_turn.tool_response_truncate_side
+        self.force_tool_calls_until_final_turn = self.rollout_config.multi_turn.force_tool_calls_until_final_turn
+        self.final_answer_token_margin = self.rollout_config.multi_turn.final_answer_token_margin
         tool_config_path = self.rollout_config.multi_turn.tool_config_path
         tool_list = initialize_tools_from_config(tool_config_path) if tool_config_path else []
         self.tools = {tool.name: tool for tool in tool_list}
@@ -272,11 +274,31 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.prompt_ids = prompt_ids
         return AgentState.GENERATING
 
+    def _must_answer_now(self, agent_data: AgentData) -> bool:
+        """Whether the upcoming assistant turn must produce a final answer rather than a tool call.
+
+        True on the final allowable assistant turn, when max user turns is reached, or when the
+        remaining response budget is too small to safely fit another tool round plus a final answer.
+        """
+        return (
+            (self.max_assistant_turns and agent_data.assistant_turns + 1 >= self.max_assistant_turns)
+            or (self.max_user_turns and agent_data.user_turns >= self.max_user_turns)
+            or (len(agent_data.response_mask) + self.final_answer_token_margin >= self.response_length)
+        )
+
     async def _handle_generating_state(
         self, agent_data: AgentData, sampling_params: dict[str, Any], ignore_termination: bool = False
     ) -> AgentState:
         """Handle the generating state: generate model response and check for tool calls."""
         add_messages: list[dict[str, Any]] = []
+
+        if self.force_tool_calls_until_final_turn:
+            # Ban <answer> until the final allowable turn (forcing tool calls), then ban <tool_call>
+            # to force a final answer. New dict to avoid leaking bad_words across turns / callers.
+            sampling_params = {
+                **sampling_params,
+                "bad_words": ["<tool_call>"] if self._must_answer_now(agent_data) else ["<answer>"],
+            }
 
         with simple_timer("generate_sequences", agent_data.metrics):
             output: TokenOutput = await self.server_manager.generate(

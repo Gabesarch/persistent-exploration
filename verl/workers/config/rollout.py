@@ -87,6 +87,8 @@ class MultiTurnConfig(BaseConfig):
     tokenization_sanity_check_mode: str = "strict"
     format: str = "hermes"
     num_repeat_rollouts: Optional[int] = None
+    force_tool_calls_until_final_turn: bool = False
+    final_answer_token_margin: int = 2048
 
 
 @dataclass

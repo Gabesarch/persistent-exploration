@@ -212,6 +212,14 @@ multi_turn:
   # Number of repeat rollouts for each interaction
   num_repeat_rollouts: null
 
+  # Force <tool_call> until the final allowable assistant turn (ban <answer> early),
+  # then force <answer> on the final turn. Implemented via vLLM bad_words.
+  force_tool_calls_until_final_turn: False
+
+  # Token headroom reserved for the final <answer> turn; if remaining response budget
+  # drops below this, switch to forcing an answer to avoid an answerless overflow.
+  final_answer_token_margin: 2048
+
 # support logging rollout prob for debugging purpose
 # "Truncated importance sampling" requires rollout log probs, set to True when turning on Truncated importance sampling
 calculate_log_probs: False
