@@ -98,6 +98,42 @@ MAX_TOOL_ITERATIONS=5 SYSTEM_PROMPT=prompts/countqa_system_prompt.txt \
   bash examples/eval_tasks.sh --tasks countqa_reasoning
 ```
 
+### 4b. Per-task toolsets (zoom vs draw) — task yaml `metadata`
+
+A task yaml can select which of the MCP server's tools the model is offered, so
+different tasks in the SAME run get different toolsets. `async_openai` reads
+three optional keys from the task's `metadata` block:
+
+| Key | Meaning |
+|---|---|
+| `allowed_tools` | list of MCP tool names or fnmatch patterns (e.g. `[image_zoom_in_tool]`, `["draw_*"]`). Absent = all server tools. Matching nothing is a hard error. |
+| `extra_tools` | extra OpenAI function specs offered to the model but NOT backed by the MCP server (answer-protocol tools, e.g. screenspot's `computer_use`). |
+| `terminal_tools` | tool names whose call ENDS the episode: recorded in the transcript as the final answer, never executed. |
+
+Toolsets currently exposed by `lmms_eval/mcp/vero2_mcp.py`:
+- **zooming**: `image_zoom_in_tool` — eval-side twin of the RL training tool
+  (`verl/tools/image_zoom_in_tool.py`): `bbox_2d=[x1,y1,x2,y2]` on the 0-1000
+  scale + `label`, crop is upscaled into the training pixel budget.
+- **drawing**: `draw_box, draw_numbered_boxes, draw_numbered_points, draw_grid,
+  draw_circle, draw_line, draw_arrow, draw_text, draw_polygon` (+ mask tools,
+  unusable without a segmentation source).
+
+Ready-made tool-calling tasks (Qwen3-VL Instruct; same sampling/scorers as the
+`_qwen3_zs` baselines):
+`visual_probe_hard_qwen3_{zoom,draw}`, `screenspotpro_point_in_box_qwen3_{zoom,draw}`.
+
+```bash
+# submit from the repo root (visual_probe is a judge task -> default gpu:2):
+MODEL=qwen3vl TOOLS=on TASKS=visual_probe_hard_qwen3_zoom \
+  sbatch --export=ALL vero_eval/run_eval.sbatch
+# screenspotpro is exact-match -> gpu:1 is enough:
+MODEL=qwen3vl TOOLS=on TASKS=screenspotpro_point_in_box_qwen3_draw \
+  sbatch --gres=gpu:1 --export=ALL vero_eval/run_eval.sbatch
+```
+
+(NB: pass a comma-list `TASKS` as a real env var like above — putting it inside
+`--export=ALL,TASKS=a,b` would be split on the commas by sbatch.)
+
 ---
 
 ## 5. Running
