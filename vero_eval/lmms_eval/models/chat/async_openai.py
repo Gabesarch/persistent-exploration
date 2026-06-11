@@ -426,10 +426,17 @@ class AsyncOpenAIChat(lmms):
                 if pending_user_images:
                     messages.append({"role": "user", "content": pending_user_images + [{"type": "text", "text": "Above are the tool-returned image(s)."}]})
 
-                # Once the image budget is spent, stop offering tools so the model answers.
+                # Once the image budget is spent, stop offering image-producing tools
+                # so the model answers. Terminal (answer-protocol) tools stay offered:
+                # they return no images and may be the task's only answer channel
+                # (e.g. screenspot's computer_use).
                 if tool_image_count >= self.max_tool_images:
-                    payload.pop("tools", None)
-                    payload.pop("tool_choice", None)
+                    terminal_only = [f for f in payload.get("tools", []) if f["function"]["name"] in terminal_tools]
+                    if terminal_only:
+                        payload["tools"] = terminal_only
+                    else:
+                        payload.pop("tools", None)
+                        payload.pop("tool_choice", None)
 
                 payload["messages"] = messages
                 response = await self.client.chat.completions.create(**payload)
