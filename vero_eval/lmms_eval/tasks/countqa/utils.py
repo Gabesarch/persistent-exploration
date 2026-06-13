@@ -244,6 +244,63 @@ def countqa_cot_process_results_json(doc: Dict[str, Any], results):
     score = 1.0 if (pred_int is not None and gt_int is not None and pred_int == gt_int) else 0.0
     return {"exact_match": score}
 
+def countqa_drawing_process_results(doc: Dict[str, Any], results):
+    """Process results for tool-use / drawing mode.
+
+    Extracts the final count from responses that may contain tool calls.
+    Looks for patterns like "Final count: X" or falls back to last integer.
+    """
+    pred = results[0] if isinstance(results, (list, tuple)) else results
+    if isinstance(pred, (list, tuple)):
+        pred = pred[-1] if len(pred) > 0 else ""
+    if not isinstance(pred, str):
+        pred = str(pred) if pred is not None else ""
+
+    # Strip tool call/response markers to get cleaner text
+    text = pred
+    # Remove tool_call blocks
+    text = re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL)
+    # Remove tool_response blocks but keep for fallback
+    text = re.sub(r"<tool_response>.*?</tool_response>", "", text, flags=re.DOTALL)
+
+    # Priority 1: Look for explicit "Final count: X" pattern (from post_prompt)
+    final_count_match = re.search(r"[Ff]inal\s+[Cc]ount[:\s]+(\d+)", text)
+    if final_count_match:
+        pred_int = int(final_count_match.group(1))
+        gt_int = _get_ground_truth_count(doc)
+        score = 1.0 if (gt_int is not None and pred_int == gt_int) else 0.0
+        return {"exact_match": score}
+
+    # Priority 2: Look for <answer>X</answer> tag
+    answer_match = re.search(r"<answer>\s*(\d+)\s*</answer>", text, re.IGNORECASE)
+    if answer_match:
+        pred_int = int(answer_match.group(1))
+        gt_int = _get_ground_truth_count(doc)
+        score = 1.0 if (gt_int is not None and pred_int == gt_int) else 0.0
+        return {"exact_match": score}
+
+    # Priority 3: Look for "the answer is X" or "there are X"
+    answer_patterns = [
+        r"[Tt]he\s+(?:final\s+)?answer\s+is[:\s]+(\d+)",
+        r"[Tt]here\s+are\s+(\d+)",
+        r"[Cc]ount[:\s]+(\d+)",
+        r"[Tt]otal[:\s]+(\d+)",
+    ]
+    for pattern in answer_patterns:
+        match = re.search(pattern, text)
+        if match:
+            pred_int = int(match.group(1))
+            gt_int = _get_ground_truth_count(doc)
+            score = 1.0 if (gt_int is not None and pred_int == gt_int) else 0.0
+            return {"exact_match": score}
+
+    # Priority 4: Fall back to last integer in text
+    pred_int = _extract_last_int_from_text(text)
+    gt_int = _get_ground_truth_count(doc)
+    score = 1.0 if (pred_int is not None and gt_int is not None and pred_int == gt_int) else 0.0
+    return {"exact_match": score}
+
+
 class FinalAnswerNumberFilter(RegexFilter):
     """Extract the final integer, preferring content after </think>."""
 

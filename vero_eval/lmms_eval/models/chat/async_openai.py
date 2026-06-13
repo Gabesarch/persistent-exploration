@@ -136,6 +136,32 @@ class AsyncOpenAIChat(lmms):
         self.tool_image_as_user_turn = parse_bool(tool_image_as_user_turn)
         self._tool_functions = None
 
+        # If system_prompt contains placeholders, fill them in
+        if self.system_prompt and self.mcp_client is not None:
+            from datetime import datetime
+            # Handle YAML-like format (Section: | content) by extracting just the content
+            if "Role: |" in self.system_prompt or "Tools: |" in self.system_prompt:
+                import re
+                sections = re.split(r'\n[A-Z][a-z]+:\s*\|\n', self.system_prompt)
+                # Remove empty first element and join sections
+                self.system_prompt = "\n".join(s.strip() for s in sections if s.strip())
+
+            if "{tools}" in self.system_prompt:
+                tool_list = self.mcp_client.get_function_list_sync()
+                self._tool_functions = tool_list  # Cache for later use
+                tools_str = "\n".join(json.dumps(t) for t in tool_list)
+                self.system_prompt = self.system_prompt.replace("{tools}", tools_str)
+                eval_logger.info(f"Injected {len(tool_list)} tools into system prompt")
+
+            # Handle other placeholders
+            if "{date}" in self.system_prompt:
+                self.system_prompt = self.system_prompt.replace("{date}", datetime.now().strftime("%Y-%m-%d"))
+            if "{examples}" in self.system_prompt:
+                self.system_prompt = self.system_prompt.replace("{examples}", "(No examples provided)")
+            if "{schema}" in self.system_prompt:
+                schema = '{"name": "<function-name>", "arguments": <args-json-object>}'
+                self.system_prompt = self.system_prompt.replace("{schema}", schema)
+
         accelerator = Accelerator()
         # assert self.batch_size_per_gpu == 1, "Llava currently does not support batched generation. See https://github.com/haotian-liu/LLaVA/issues/754. HF Llava also has this issue."
         if accelerator.num_processes > 1:

@@ -186,3 +186,42 @@ def vstar_aggregate_results(results):
         return overall_acc
 
     return 0.0
+
+
+def vstar_drawing_process_results(doc, results):
+    """Process results for tool-use / drawing mode.
+
+    Extracts the answer letter from responses that may contain tool calls.
+    """
+    pred = results[0] if results else ""
+
+    # Strip tool call/response markers
+    text = pred
+    text = re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<tool_response>.*?</tool_response>", "", text, flags=re.DOTALL)
+
+    # Priority 1: Look for <answer>X</answer> tag
+    answer_match = re.search(r"<answer>\s*([A-D])\s*</answer>", text, re.IGNORECASE)
+    if answer_match:
+        pred_letter = answer_match.group(1).upper()
+    else:
+        # Priority 2: Look for "Final answer: X" pattern
+        final_match = re.search(r"[Ff]inal\s+[Aa]nswer[:\s]+([A-D])", text)
+        if final_match:
+            pred_letter = final_match.group(1).upper()
+        else:
+            # Priority 3: Fall back to standard extraction
+            pred_letter = extract_answer_letter(text)
+
+    gt_letter = doc["label"].strip().upper()
+    score = 1.0 if pred_letter == gt_letter else 0.0
+    category = doc.get("category", "unknown")
+
+    if score == 0:
+        eval_logger.debug(f"Question: {doc['text'][:100]}...")
+        eval_logger.debug(f"Predicted: {pred_letter}, Ground Truth: {gt_letter}")
+        eval_logger.debug(f"Raw prediction: {pred}")
+
+    result = {"question_id": doc["question_id"], "category": category, "score": score, "prediction": pred_letter, "ground_truth": gt_letter}
+
+    return {f"vstar_{category}_acc": result, "vstar_overall_acc": result}
