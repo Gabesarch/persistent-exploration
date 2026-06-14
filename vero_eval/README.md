@@ -98,41 +98,85 @@ MAX_TOOL_ITERATIONS=5 SYSTEM_PROMPT=prompts/countqa_system_prompt.txt \
   bash examples/eval_tasks.sh --tasks countqa_reasoning
 ```
 
-### 4b. Per-task toolsets (zoom vs draw) — task yaml `metadata`
+### 4b. Tool-calling tasks: modular toolsets + system prompts
 
-A task yaml can select which of the MCP server's tools the model is offered, so
-different tasks in the SAME run get different toolsets. `async_openai` reads
-three optional keys from the task's `metadata` block:
+A tool-calling task is composed from three independent, reusable pieces, so you
+never copy prompt/tool config between tasks:
 
-| Key | Meaning |
-|---|---|
-| `allowed_tools` | list of MCP tool names or fnmatch patterns (e.g. `[image_zoom_in_tool]`, `["draw_*"]`). Absent = all server tools. Matching nothing is a hard error. |
-| `extra_tools` | extra OpenAI function specs offered to the model but NOT backed by the MCP server (answer-protocol tools, e.g. screenspot's `computer_use`). |
-| `terminal_tools` | tool names whose call ENDS the episode: recorded in the transcript as the final answer, never executed. |
+1. **A dataset template** — the existing per-benchmark template (`visual_probe_hard.yaml`,
+   `_default_template_point_yaml`, …): dataset, scorer, `doc_to_*`.
+2. **A toolset template** (`lmms_eval/tasks/_tool_templates/_toolset_*_yaml`) — the
+   single source of truth for one toolset: which tools, and which system-prompt
+   fragments.
+3. **(optional) An answer-protocol template** (`_answerproto_*_yaml`) — for
+   grounding tasks that answer by "calling" a non-MCP tool (ScreenSpot's `computer_use`).
 
-Toolsets currently exposed by `lmms_eval/mcp/vero2_mcp.py`:
-- **zooming**: `image_zoom_in_tool` — eval-side twin of the RL training tool
-  (`verl/tools/image_zoom_in_tool.py`): `bbox_2d=[x1,y1,x2,y2]` on the 0-1000
-  scale + `label`, crop is upscaled into the training pixel budget.
-- **drawing**: `draw_box, draw_numbered_boxes, draw_numbered_points, draw_grid,
-  draw_circle, draw_line, draw_arrow, draw_text, draw_polygon` (+ mask tools,
-  unusable without a segmentation source).
+A task yaml just `include`s these; their `metadata` blocks **deep-merge** (see
+`load_yaml_config`), and `async_openai` reads the merged result:
 
-Ready-made tool-calling tasks (Qwen3-VL Instruct; same sampling/scorers as the
-`_qwen3_zs` baselines):
-`visual_probe_hard_qwen3_{zoom,draw}`, `screenspotpro_point_in_box_qwen3_{zoom,draw}`.
+| `metadata` key | Meaning | Set by |
+|---|---|---|
+| `allowed_tools` | MCP tool names / fnmatch patterns offered to the model (`[image_zoom_in_tool]`, `["draw_*"]`). Absent = all server tools; matching nothing is a hard error. | toolset template |
+| `system_prompt_files` | files concatenated (in order, after any run-wide `SYSTEM_PROMPT`) into the turn-0 system message. Paths resolve against the `vero_eval/` root. | toolset template |
+| `extra_tools` | OpenAI function specs offered but NOT backed by MCP (answer protocols). | answer-protocol template |
+| `terminal_tools` | tool names whose call ENDS the episode — recorded as the final answer, never executed. | answer-protocol template |
 
+**How the system prompt is built.** The final turn-0 system message is
+`[run-wide SYSTEM_PROMPT?] + [system_prompt_files…]`, and the model's chat
+template then appends its own `# Tools` / `<tools>` schema block. So for a zoom
+task it is: `system_base.txt` ⊕ `system_zoom.txt` ⊕ (auto-rendered tool schemas).
+The fragments live in `prompts/tools/` (`system_base.txt`, `system_zoom.txt`,
+`system_draw.txt`) — edit those to change behavior across **all** tasks of a
+toolset at once. The system message persists across every tool turn (the loop
+only appends tool calls/results).
+
+Toolsets exposed by `lmms_eval/mcp/vero2_mcp.py`:
+- **zoom** (`_toolset_zoom_yaml`): `image_zoom_in_tool` — eval twin of the RL
+  training tool (`verl/tools/image_zoom_in_tool.py`): `bbox_2d=[x1,y1,x2,y2]` on
+  the 0-1000 scale + `label`, crop upscaled into the training pixel budget.
+- **draw** (`_toolset_draw_yaml`): `draw_box, draw_numbered_boxes,
+  draw_numbered_points, draw_grid, draw_circle, draw_line, draw_arrow, draw_text,
+  draw_polygon`.
+
+Ready-made tasks (Qwen3-VL Instruct; same sampling/scorers as the `_qwen3_zs`
+baselines): `visual_probe_hard_qwen3_{zoom,draw}`,
+`screenspotpro_point_in_box_qwen3_{zoom,draw}`.
+
+**Submit all of them with one script** (judge-aware GRES, unique PORT per job):
 ```bash
-# submit from the repo root (visual_probe is a judge task -> default gpu:2):
-MODEL=qwen3vl TOOLS=on TASKS=visual_probe_hard_qwen3_zoom \
-  sbatch --export=ALL vero_eval/run_eval.sbatch
-# screenspotpro is exact-match -> gpu:1 is enough:
-MODEL=qwen3vl TOOLS=on TASKS=screenspotpro_point_in_box_qwen3_draw \
-  sbatch --gres=gpu:1 --export=ALL vero_eval/run_eval.sbatch
+bash vero_eval/examples/submit_tool_evals.sh                       # the 4 tasks
+TASKS="visual_probe_hard_qwen3_zoom screenspotpro_point_in_box_qwen3_draw" \
+  bash vero_eval/examples/submit_tool_evals.sh                     # a subset
+DRY_RUN=1 bash vero_eval/examples/submit_tool_evals.sh             # preview
+# pli/H100 instead of ailab/H200:  PARTITION=pli ACCOUNT=vlmrl GPU_TYPE=h100 …
 ```
 
-(NB: pass a comma-list `TASKS` as a real env var like above — putting it inside
-`--export=ALL,TASKS=a,b` would be split on the commas by sbatch.)
+#### Authoring a new tool-calling task
+
+1. **New toolset?** Add `prompts/tools/system_<name>.txt` and a template
+   `lmms_eval/tasks/_tool_templates/_toolset_<name>_yaml` with `metadata.allowed_tools`
+   + `metadata.system_prompt_files: [prompts/tools/system_base.txt, prompts/tools/system_<name>.txt]`.
+   (The tools themselves must be registered in `lmms_eval/mcp/vero2_mcp.py`.)
+2. **New task** — create `tasks/<bench>/<bench>_<model>_<toolset>.yaml`:
+   ```yaml
+   include:
+     - <dataset_template>                          # e.g. visual_probe_hard.yaml
+     - ../_tool_templates/_toolset_<name>_yaml
+     # - ../_tool_templates/_answerproto_computer_use_yaml   # grounding only
+   task: "<bench>_<model>_<toolset>"
+   generation_kwargs: { … }                        # copy from the _qwen3_zs sibling
+   lmms_eval_specific_kwargs:
+     default: { pre_prompt: "<benchmark/answer framing>", post_prompt: "" }
+   ```
+   Put **tool behavior** in the system fragments and **answer framing** in
+   `pre_prompt`. Do **not** add a `metadata` block unless you need an extra key —
+   `allowed_tools`/`system_prompt_files`/`version` come from the includes.
+3. **Run** it: `MODEL=qwen3vl TOOLS=on TASKS=<task> sbatch --export=ALL vero_eval/run_eval.sbatch`
+   (add it to `TASKS=...` in `submit_tool_evals.sh` for the batch path).
+
+(NB: when passing a comma-list `TASKS`, give it as a real env var, not inside
+`--export=ALL,TASKS=a,b` — sbatch splits that on the commas. `submit_tool_evals.sh`
+submits one task per job to avoid this.)
 
 ---
 
