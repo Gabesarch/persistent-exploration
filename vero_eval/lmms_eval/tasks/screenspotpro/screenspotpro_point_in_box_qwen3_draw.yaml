@@ -1,9 +1,11 @@
 # Qwen3-VL Instruct zero-shot + the DRAWING toolset (multi-turn tool calling).
-# See screenspotpro_point_in_box_qwen3_zoom.yaml for how tools and the
-# computer_use answer protocol are wired; this variant only swaps the image
-# toolset to the drawing tools (mask tools excluded — no segmentation source).
-# Run with TOOLS=on (mcp_server_path=lmms_eval/mcp/vero2_mcp.py).
-include: _default_template_point_yaml
+# Same modular composition as screenspotpro_point_in_box_qwen3_zoom but swaps the
+# zoom toolset template for the draw one; the computer_use answer protocol is
+# unchanged. Run with TOOLS=on.
+include:
+  - _default_template_point_yaml
+  - ../_tool_templates/_toolset_draw_yaml
+  - ../_tool_templates/_answerproto_computer_use_yaml
 task: "screenspotpro_point_in_box_qwen3_draw"
 test_split: train
 process_docs: !function utils_point.screenspot_point_process_docs_rel1000
@@ -20,39 +22,5 @@ generation_kwargs:
   do_sample: True
 lmms_eval_specific_kwargs:
   default:
-    pre_prompt: "Locate the UI element described by the instruction on the screenshot. You may use the drawing tools (for example draw_box, draw_circle, or draw_grid) to mark and verify candidate locations on the screenshot before deciding. When you have located the element, finish by calling computer_use with action \"left_click\" and the target coordinate. "
+    pre_prompt: "Locate the UI element described by the instruction on the screenshot. When you have located it, finish by calling computer_use with action \"left_click\" at the target coordinate. "
     post_prompt: ""
-metadata:
-  version: 0.0
-  allowed_tools:
-    - draw_box
-    - draw_numbered_boxes
-    - draw_numbered_points
-    - draw_grid
-    - draw_circle
-    - draw_line
-    - draw_arrow
-    - draw_text
-    - draw_polygon
-  terminal_tools:
-    - computer_use
-  extra_tools:
-    - type: function
-      function:
-        name: computer_use
-        description: "Use a mouse to interact with a computer.\n* The screen's resolution is 1000x1000.\n* Make sure to click any buttons, links, icons, etc with the cursor tip in the center of the element. Don't click boxes on their edges unless asked.\n* you can only use the left_click and mouse_move action to interact with the computer. if you can't find the element, you should terminate the task and report the failure."
-        parameters:
-          type: object
-          properties:
-            action:
-              description: "The action to perform. The available actions are:\n* `mouse_move`: Move the cursor to a specified (x, y) pixel coordinate on the screen.\n* `left_click`: Click the left mouse button with coordinate (x, y).\n* `terminate`: Terminate the current task and report its completion status."
-              enum: ["mouse_move", "left_click"]
-              type: string
-            coordinate:
-              description: "(x, y): The x (pixels from the left edge) and y (pixels from the top edge) coordinates to move the mouse to. Required only by `action=mouse_move` and `action=left_click`."
-              type: array
-            status:
-              description: "The status of the task. Required only by `action=terminate`."
-              type: string
-              enum: ["success", "failure"]
-          required: ["action"]

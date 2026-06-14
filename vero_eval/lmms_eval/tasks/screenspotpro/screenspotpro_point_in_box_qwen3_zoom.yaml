@@ -1,15 +1,16 @@
 # Qwen3-VL Instruct zero-shot + the ZOOMING toolset (multi-turn tool calling).
-# Differences vs screenspotpro_point_in_box_qwen3_zs:
-#   - tools (computer_use + image_zoom_in_tool) are passed via the API and rendered
-#     natively by the chat template, instead of baking a <tools> block into the user
-#     text (doc_to_text_qwen3_mcp_tool vs doc_to_text_qwen3_tool);
-#   - computer_use is declared in metadata.extra_tools (it is an answer protocol,
-#     not an MCP tool) and in metadata.terminal_tools, so the async_openai loop
-#     records the call as the final answer instead of trying to execute it.
-# The answer convention (computer_use left_click at 0-1000 coordinates) and the
-# scorer (screenspot_point_process_result_qwen3, rel1000) match the _qwen3_zs
-# baseline. Run with TOOLS=on (mcp_server_path=lmms_eval/mcp/vero2_mcp.py).
-include: _default_template_point_yaml
+# Modular composition of three templates:
+#   _default_template_point_yaml          dataset + scorer wiring (+ version)
+#   _toolset_zoom_yaml                     allowed_tools + zoom system prompt
+#   _answerproto_computer_use_yaml         computer_use extra/terminal tool
+# metadata deep-merges across all three. doc_to_text_qwen3_mcp_tool passes tools
+# through the API (rendered natively by the chat template) instead of baking a
+# <tools> block into the user text. The scorer (rel1000) matches the _qwen3_zs
+# baseline. Run with TOOLS=on.
+include:
+  - _default_template_point_yaml
+  - ../_tool_templates/_toolset_zoom_yaml
+  - ../_tool_templates/_answerproto_computer_use_yaml
 task: "screenspotpro_point_in_box_qwen3_zoom"
 test_split: train
 process_docs: !function utils_point.screenspot_point_process_docs_rel1000
@@ -26,31 +27,5 @@ generation_kwargs:
   do_sample: True
 lmms_eval_specific_kwargs:
   default:
-    pre_prompt: "Locate the UI element described by the instruction on the screenshot. You may use image_zoom_in_tool to inspect parts of the screenshot more closely before deciding. When you have located the element, finish by calling computer_use with action \"left_click\" and the target coordinate. "
+    pre_prompt: "Locate the UI element described by the instruction on the screenshot. When you have located it, finish by calling computer_use with action \"left_click\" at the target coordinate. "
     post_prompt: ""
-metadata:
-  version: 0.0
-  allowed_tools:
-    - image_zoom_in_tool
-  terminal_tools:
-    - computer_use
-  extra_tools:
-    - type: function
-      function:
-        name: computer_use
-        description: "Use a mouse to interact with a computer.\n* The screen's resolution is 1000x1000.\n* Make sure to click any buttons, links, icons, etc with the cursor tip in the center of the element. Don't click boxes on their edges unless asked.\n* you can only use the left_click and mouse_move action to interact with the computer. if you can't find the element, you should terminate the task and report the failure."
-        parameters:
-          type: object
-          properties:
-            action:
-              description: "The action to perform. The available actions are:\n* `mouse_move`: Move the cursor to a specified (x, y) pixel coordinate on the screen.\n* `left_click`: Click the left mouse button with coordinate (x, y).\n* `terminate`: Terminate the current task and report its completion status."
-              enum: ["mouse_move", "left_click"]
-              type: string
-            coordinate:
-              description: "(x, y): The x (pixels from the left edge) and y (pixels from the top edge) coordinates to move the mouse to. Required only by `action=mouse_move` and `action=left_click`."
-              type: array
-            status:
-              description: "The status of the task. Required only by `action=terminate`."
-              type: string
-              enum: ["success", "failure"]
-          required: ["action"]

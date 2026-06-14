@@ -43,6 +43,10 @@ cpu, _ = optional_import("decord", "cpu")
 # request finishes.
 _TOOL_SAVED_IMAGE_RE = re.compile(r"Saved drawn image to:\s*(\S+)")
 
+# vero_eval package root (parent of lmms_eval), used to resolve the relative
+# system_prompt_files paths declared in task yamls (e.g. prompts/tools/*.txt).
+_VERO_EVAL_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
 load_dotenv(verbose=True)
 
 
@@ -137,6 +141,7 @@ class AsyncOpenAIChat(lmms):
         self.tool_image_as_user_turn = parse_bool(tool_image_as_user_turn)
         self._tool_functions = None
         self._task_tools_cache = {}
+        self._task_system_prompt_cache = {}
 
         accelerator = Accelerator()
         # assert self.batch_size_per_gpu == 1, "Llava currently does not support batched generation. See https://github.com/haotian-liu/LLaVA/issues/754. HF Llava also has this issue."
@@ -174,6 +179,46 @@ class AsyncOpenAIChat(lmms):
     @property
     def world_size(self):
         return self._world_size
+
+    def _resolve_task_system_prompt(self, task: str) -> Optional[str]:
+        """Build the turn-0 system prompt for a task by concatenating, in order:
+
+        1. the run-wide ``system_prompt`` model_arg (if set, e.g. via SYSTEM_PROMPT);
+        2. each file listed in the task yaml's ``metadata.system_prompt_files``.
+
+        This is what makes the prompt modular: a task includes a toolset template
+        (``prompts/tools/system_base.txt`` + ``system_zoom.txt`` / ``system_draw.txt``)
+        and the fragments concatenate here. The model's chat template then appends
+        its own ``# Tools`` / ``<tools>`` schema block after this system text, so the
+        final system message is base (+ run-wide) (+ toolset) (+ rendered schemas).
+
+        Paths in ``system_prompt_files`` resolve as-is if absolute/cwd-relative,
+        else against the vero_eval package root. A listed-but-missing file is a
+        hard error (a silently dropped system prompt would corrupt the whole run).
+        Returns ``None`` when neither source yields any text. Cached per task.
+        """
+        if task in self._task_system_prompt_cache:
+            return self._task_system_prompt_cache[task]
+        fragments: List[str] = []
+        if self.system_prompt:
+            fragments.append(self.system_prompt.strip())
+        meta = self.task_metadata.get(task) or {}
+        files = meta.get("system_prompt_files") or []
+        if isinstance(files, str):
+            files = [files]
+        for rel in files:
+            path = rel if os.path.isabs(rel) else rel
+            if not os.path.isfile(path):
+                path = os.path.join(_VERO_EVAL_ROOT, rel)
+            if not os.path.isfile(path):
+                raise ValueError(f"Task '{task}': system_prompt_files entry '{rel}' not found " f"(looked at '{rel}' and '{os.path.join(_VERO_EVAL_ROOT, rel)}'). Fix the path in the task yaml metadata.")
+            with open(path, "r") as fh:
+                fragments.append(fh.read().strip())
+        resolved = "\n\n".join(f for f in fragments if f) or None
+        self._task_system_prompt_cache[task] = resolved
+        if resolved:
+            eval_logger.info(f"Task '{task}': system prompt = {len(fragments)} fragment(s), {len(resolved)} chars")
+        return resolved
 
     def _resolve_task_tools(self, task: str):
         """Resolve the per-task tool view from the task yaml's `metadata` block:
@@ -238,7 +283,8 @@ class AsyncOpenAIChat(lmms):
             messages = chat_messages.to_qwen3_vl_openai_messages(video_kwargs)
         else:
             messages = chat_messages.to_openai_messages(video_kwargs)
-        messages = self._apply_system_prompt(messages, self.system_prompt) if self.system_prompt else messages
+        task_system_prompt = self._resolve_task_system_prompt(task)
+        messages = self._apply_system_prompt(messages, task_system_prompt) if task_system_prompt else messages
         images, videos, audios = chat_messages.extract_media()
         # Track every image file that belongs to this request so we can
         # delete them after the model finishes answering (avoids unbounded
