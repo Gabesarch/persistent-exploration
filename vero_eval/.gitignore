@@ -11,3 +11,5 @@ results/countqa_10_lc1556/
 results/countqa_10_postfix/
 results/eval_chris_*
 results/smoke_eval_chris*
+# local gpu-test quick-run launcher (A100 qos=gpu-test)
+run_eval_gputest.sbatch
