@@ -62,14 +62,32 @@ app = FastMCP("SimpleVQA Tools")
 COORD_SCALE = 1000  # Coordinate system uses 0-1000
 
 
+# Cap the size of every image a tool returns. Full-resolution PNGs of natural
+# photos (e.g. a 2000x1398 visual_probe image -> ~5 MB base64) otherwise overflow
+# both the MCP stdio transport (intermittent "TaskGroup" failures under concurrency)
+# and the model's 32768-token context. 1 MP matches the zoom tool's output budget.
+DRAW_MAX_PIXELS = 1048576
+DRAW_JPEG_QUALITY = 85
+
+
+def _bounded_jpeg_content(image: Image.Image) -> ImageContent:
+    """Downscale `image` to <= DRAW_MAX_PIXELS and JPEG-encode it as an MCP
+    ImageContent. Used by every drawing/zoom tool so returned images stay small
+    enough for the stdio transport and the context window."""
+    image = image.convert("RGB")
+    pixels = image.width * image.height
+    if pixels > DRAW_MAX_PIXELS:
+        scale = (DRAW_MAX_PIXELS / pixels) ** 0.5
+        image = image.resize((max(1, round(image.width * scale)), max(1, round(image.height * scale))), Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG", quality=DRAW_JPEG_QUALITY)
+    buf.seek(0)
+    return ImageContent(type="image", data=base64.b64encode(buf.getvalue()).decode("utf-8"), mimeType="image/jpeg")
+
+
 def _image_to_content(image: np.ndarray) -> ImageContent:
-    """Convert numpy RGB array to ImageContent."""
-    pil_image = Image.fromarray(image)
-    image_bytes = io.BytesIO()
-    pil_image.save(image_bytes, format="PNG")
-    image_bytes.seek(0)
-    data = base64.b64encode(image_bytes.getvalue()).decode("utf-8")
-    return ImageContent(type="image", data=data, mimeType="image/png")
+    """Convert numpy RGB array to a size-bounded JPEG ImageContent."""
+    return _bounded_jpeg_content(Image.fromarray(image))
 
 
 def _to_pixel(value: int, size: int) -> float:
@@ -78,11 +96,8 @@ def _to_pixel(value: int, size: int) -> float:
 
 
 def _pil_to_content(image: Image.Image) -> ImageContent:
-    """Encode a PIL image as an MCP ImageContent (base64 PNG)."""
-    buf = io.BytesIO()
-    image.convert("RGB").save(buf, format="PNG")
-    buf.seek(0)
-    return ImageContent(type="image", data=base64.b64encode(buf.getvalue()).decode("utf-8"), mimeType="image/png")
+    """Encode a PIL image as a size-bounded JPEG MCP ImageContent."""
+    return _bounded_jpeg_content(image)
 
 
 def _to_px_clamped(value: float, size: int) -> int:
