@@ -1,0 +1,23 @@
+# Vero (RL thinking checkpoint) + DRAWING toolset on ScreenSpot-Pro.
+# Same point_2d answer format + abs-pixel scoring as
+# screenspotpro_point_in_box_reasoning_zoom; only the toolset differs. Vero was
+# trained with the zoom tool only, so this measures zero-shot drawing-tool use.
+include:
+  - _default_template_point_yaml
+  - ../_tool_templates/_toolset_draw_yaml
+task: "screenspotpro_point_in_box_reasoning_draw"
+test_split: train
+process_docs: !function utils_point.screenspot_point_process_docs_abs
+doc_to_text: !function utils_point.screenspot_point_doc_to_text_abs
+generation_kwargs:
+  until:
+    - "ASSISTANT:"
+  max_new_tokens: 16384
+  temperature: 0.6
+  do_sample: True
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: "Provide the point for the command:"
+    post_prompt: ' Output the point in a JSON array format: [{"point_2d": [x, y]}].'
+metadata:
+  system_prompt_files: []
