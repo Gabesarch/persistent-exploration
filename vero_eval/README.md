@@ -148,7 +148,8 @@ bash vero_eval/examples/submit_tool_evals.sh                       # the 4 tasks
 TASKS="visual_probe_hard_qwen3_zoom screenspotpro_point_in_box_qwen3_draw" \
   bash vero_eval/examples/submit_tool_evals.sh                     # a subset
 DRY_RUN=1 bash vero_eval/examples/submit_tool_evals.sh             # preview
-# pli/H100 instead of ailab/H200:  PARTITION=pli ACCOUNT=vlmrl GPU_TYPE=h100 …
+# defaults to pli/H100 (--account=vlmrl); for ailab/H200 instead:
+#   PARTITION=ailab ACCOUNT=zhuangl GPU_TYPE=h200 bash vero_eval/examples/submit_tool_evals.sh
 ```
 
 #### Authoring a new tool-calling task

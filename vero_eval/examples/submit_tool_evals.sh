@@ -11,9 +11,9 @@
 #
 # Env knobs:
 #   MODEL (qwen3vl) · TOOLS (on) · TASKS (4 zoom/draw tasks) · LIMIT (full split)
-#   PARTITION (ailab) · ACCOUNT (zhuangl) · GPU_TYPE (h200) · BASE_PORT (9001)
+#   PARTITION (pli) · ACCOUNT (vlmrl) · GPU_TYPE (h100) · BASE_PORT (9001)
 #   TIME_JUDGE (04:00:00) · TIME_PLAIN (10:00:00) · DRY_RUN (0)
-#   For the pli/H100 partition:  PARTITION=pli ACCOUNT=vlmrl GPU_TYPE=h100
+#   For the ailab/H200 partition:  PARTITION=ailab ACCOUNT=zhuangl GPU_TYPE=h200
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -21,9 +21,9 @@ cd "$REPO_ROOT"
 
 MODEL="${MODEL:-qwen3vl}"
 TOOLS="${TOOLS:-on}"
-PARTITION="${PARTITION:-ailab}"
-ACCOUNT="${ACCOUNT:-zhuangl}"
-GPU_TYPE="${GPU_TYPE:-h200}"
+PARTITION="${PARTITION:-pli}"
+ACCOUNT="${ACCOUNT:-vlmrl}"
+GPU_TYPE="${GPU_TYPE:-h100}"
 BASE_PORT="${BASE_PORT:-9001}"
 LIMIT="${LIMIT:-}"
 DRY_RUN="${DRY_RUN:-0}"
