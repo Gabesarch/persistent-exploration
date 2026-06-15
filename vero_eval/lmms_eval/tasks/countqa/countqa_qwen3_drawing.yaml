@@ -1,0 +1,12 @@
+include: countqa.yaml
+task: "countqa_qwen3_drawing"
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 0.6
+  top_p: 0.95
+  do_sample: True
+process_results: !function utils.countqa_drawing_process_results
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: ""
+    post_prompt: " Use the available tools to help count if needed. After your analysis, state your answer as: Final count: NUMBER"
