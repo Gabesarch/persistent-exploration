@@ -8,8 +8,11 @@
 #
 import base64
 import io
+import json
 import logging
 import os
+import tempfile
+import uuid
 from typing import List, Optional, Union
 
 # Offline mode for HuggingFace models
@@ -19,7 +22,7 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 import numpy as np
 from mcp.server.fastmcp import FastMCP
-from mcp.types import ImageContent
+from mcp.types import ImageContent, TextContent
 from PIL import Image, ImageDraw
 
 # The rich drawing tools below render via the heavy Visualizer (cv2 + matplotlib).
@@ -60,6 +63,7 @@ logger = logging.getLogger(__name__)
 app = FastMCP("SimpleVQA Tools")
 
 COORD_SCALE = 1000  # Coordinate system uses 0-1000
+_IMAGE_REGISTRY_ENV = "LMMS_EVAL_IMAGE_REGISTRY"
 
 
 def _image_to_content(image: np.ndarray) -> ImageContent:
@@ -85,6 +89,32 @@ def _pil_to_content(image: Image.Image) -> ImageContent:
     return ImageContent(type="image", data=base64.b64encode(buf.getvalue()).decode("utf-8"), mimeType="image/png")
 
 
+def _save_output_image(image: Image.Image) -> List[Union[TextContent, ImageContent]]:
+    output_path = os.path.join(tempfile.gettempdir(), f"lmms_eval_drawn_{uuid.uuid4()}.png")
+    image.convert("RGB").save(output_path, format="PNG")
+    return [
+        TextContent(type="text", text=f"Saved drawn image to: {output_path}"),
+        _pil_to_content(image),
+    ]
+
+
+def _resolve_image_path(img_idx: int) -> str:
+    raw_registry = os.environ.get(_IMAGE_REGISTRY_ENV)
+    if not raw_registry:
+        raise ValueError("Image registry was not provided to the MCP tool process.")
+    try:
+        registry = json.loads(raw_registry)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid image registry payload: {exc}") from exc
+    image_path = registry.get(str(img_idx))
+    if image_path is None:
+        available = sorted(int(key) for key in registry.keys()) if registry else []
+        if available:
+            raise ValueError(f"img_idx {img_idx} is not available. Available: {available[0]}-{available[-1]}")
+        raise ValueError(f"img_idx {img_idx} is not available. Registry is empty.")
+    return image_path
+
+
 def _to_px_clamped(value: float, size: int) -> int:
     """0-1000 coordinate -> pixel, clamped to [0, size]."""
     return max(0, min(size, int((value / COORD_SCALE) * size)))
@@ -93,26 +123,23 @@ def _to_px_clamped(value: float, size: int) -> int:
 # ========== MCP Drawing Tools ==========
 
 
-@app.tool(name="draw_points", description="Draw one or more point markers on an image. Coordinates use 0-1000 scale where (0,0)=top-left, (1000,1000)=bottom-right. For a single point, pass [x, y]. For multiple points, pass [[x1, y1], [x2, y2], ...]. Example: draw_points(img, [[500, 500], [600, 600]]) draws 2 points.")
+@app.tool(name="draw_points", description="Draw one or more point markers on an image. Coordinates use 0-1000 scale where (0,0)=top-left, (1000,1000)=bottom-right. For a single point, pass [x, y]. For multiple points, pass [[x1, y1], [x2, y2], ...]. Example: draw_points(img_idx=0, points=[[500, 500], [600, 600]]) draws 2 points.")
 def draw_points(
-    image_path: str,
+    img_idx: int,
     points: Union[List[int], List[List[int]]],
     color: str = "lime",
     radius: int = 15,
-    show_numbers: bool = True,
-    show_total: bool = True,
-) -> ImageContent:
+) -> List[Union[TextContent, ImageContent]]:
     """
     Draw one or more point markers on an image.
 
-    :param image_path: Path to the input image.
+    :param img_idx: Image index supplied by the caller.
     :param points: Either [x, y] for a single point, or [[x1, y1], [x2, y2], ...] for multiple points. Coordinates use 0-1000 scale.
     :param color: Color name for markers.
     :param radius: Radius of the circle markers (0-1000, relative to image width).
-    :param show_numbers: If True, display number labels next to each point.
-    :param show_total: If True, display total count at top of image.
     :return: Image with point markers.
     """
+    image_path = _resolve_image_path(img_idx)
     img = np.array(Image.open(image_path).convert("RGB"))
     h, w = img.shape[:2]
     vis = Visualizer(img)
@@ -126,31 +153,27 @@ def draw_points(
         x, y = point
         px, py = _to_pixel(x, w), _to_pixel(y, h)
         vis.draw_circle((px, py), color=color, radius=pr)
-        if show_numbers:
-            vis.draw_text(str(i + 1), (px, py - pr - 5), color=color, font_size=12)
 
-    if show_total and len(points) > 1:
-        vis.draw_text(f"Count: {len(points)}", (10, 10), color="white", font_size=18)
-
-    return _image_to_content(vis.get_output().get_image())
+    return _save_output_image(Image.fromarray(vis.get_output().get_image()))
 
 
-@app.tool(name="draw_lines", description="Draw one or more lines on an image. Coordinates use 0-1000 scale. For a single line, pass [x1, y1, x2, y2]. For multiple lines, pass [[x1, y1, x2, y2], [x1, y1, x2, y2], ...]. Example: draw_lines(img, [[200, 300, 800, 700]]) draws one diagonal line.")
+@app.tool(name="draw_lines", description="Draw one or more lines on an image. Coordinates use 0-1000 scale. For a single line, pass [x1, y1, x2, y2]. For multiple lines, pass [[x1, y1, x2, y2], [x1, y1, x2, y2], ...]. Example: draw_lines(img_idx=0, lines=[[200, 300, 800, 700]]) draws one diagonal line.")
 def draw_lines(
-    image_path: str,
+    img_idx: int,
     lines: Union[List[int], List[List[int]]],
     color: str = "red",
     linewidth: float = 3,
-) -> ImageContent:
+) -> List[Union[TextContent, ImageContent]]:
     """
     Draw one or more lines on an image.
 
-    :param image_path: Path to the input image.
+    :param img_idx: Image index supplied by the caller.
     :param lines: Either [x1, y1, x2, y2] for a single line, or [[x1, y1, x2, y2], ...] for multiple lines. Coordinates use 0-1000 scale.
     :param color: Color name.
     :param linewidth: Width of the lines in pixels.
     :return: Image with lines drawn.
     """
+    image_path = _resolve_image_path(img_idx)
     img = np.array(Image.open(image_path).convert("RGB"))
     h, w = img.shape[:2]
     vis = Visualizer(img)
@@ -165,31 +188,28 @@ def draw_lines(
         px2, py2 = _to_pixel(x2, w), _to_pixel(y2, h)
         vis.draw_line([px1, px2], [py1, py2], color=color, linewidth=linewidth)
 
-    return _image_to_content(vis.get_output().get_image())
+    return _save_output_image(Image.fromarray(vis.get_output().get_image()))
 
 
-@app.tool(name="draw_boxes", description="Draw one or more bounding boxes on an image. Coordinates use 0-1000 scale where (0,0)=top-left, (1000,1000)=bottom-right. For a single box, pass [x1, y1, x2, y2]. For multiple boxes, pass [[x1, y1, x2, y2], ...]. Example: draw_boxes(img, [[100, 100, 200, 200], [300, 300, 400, 400]]) draws 2 boxes.")
+@app.tool(name="draw_boxes", description="Draw one or more bounding boxes on an image. Coordinates use 0-1000 scale where (0,0)=top-left, (1000,1000)=bottom-right. For a single box, pass [x1, y1, x2, y2]. For multiple boxes, pass [[x1, y1, x2, y2], ...]. Example: draw_boxes(img_idx=0, boxes=[[100, 100, 200, 200], [300, 300, 400, 400]]) draws 2 boxes.")
 def draw_boxes(
-    image_path: str,
+    img_idx: int,
     boxes: Union[List[int], List[List[int]]],
     color: str = "lime",
     alpha: float = 0.8,
     linewidth: int = 3,
-    show_numbers: bool = True,
-    show_total: bool = True,
-) -> ImageContent:
+) -> List[Union[TextContent, ImageContent]]:
     """
     Draw one or more bounding boxes on an image.
 
-    :param image_path: Path to the input image.
+    :param img_idx: Image index supplied by the caller.
     :param boxes: Either [x1, y1, x2, y2] for a single box, or [[x1, y1, x2, y2], ...] for multiple boxes. Coordinates use 0-1000 scale.
     :param color: Color name for all boxes (e.g., 'lime', 'red', 'blue').
     :param alpha: Opacity of the box outlines.
     :param linewidth: Width of box outlines in pixels.
-    :param show_numbers: If True, display number labels on each box.
-    :param show_total: If True, display total count at top of image.
     :return: Image with boxes drawn.
     """
+    image_path = _resolve_image_path(img_idx)
     img = np.array(Image.open(image_path).convert("RGB"))
     h, w = img.shape[:2]
 
@@ -204,13 +224,8 @@ def draw_boxes(
             px1, py1 = _to_pixel(x1, w), _to_pixel(y1, h)
             px2, py2 = _to_pixel(x2, w), _to_pixel(y2, h)
             vis.draw_box([px1, py1, px2, py2], edge_color=color, alpha=alpha, linewidth=linewidth)
-            if show_numbers:
-                vis.draw_text(str(i + 1), (px1 + 2, py1 + 2), color=color, font_size=14)
 
-        if show_total and len(boxes) > 1:
-            vis.draw_text(f"Count: {len(boxes)}", (10, 10), color="white", font_size=18)
-
-        return _image_to_content(vis.get_output().get_image())
+        return _save_output_image(Image.fromarray(vis.get_output().get_image()))
     except RuntimeError:
         # Offline fallback: plain PIL rectangle (no cv2/matplotlib).
         pil_img = Image.fromarray(img)
@@ -220,25 +235,26 @@ def draw_boxes(
             px1, py1 = _to_pixel(x1, w), _to_pixel(y1, h)
             px2, py2 = _to_pixel(x2, w), _to_pixel(y2, h)
             draw.rectangle([px1, py1, px2, py2], outline=color, width=max(1, int(linewidth)))
-        return _pil_to_content(pil_img)
+        return _save_output_image(pil_img)
 
 
-@app.tool(name="draw_texts", description="Add one or more text annotations to an image. Coordinates use 0-1000 scale. For a single text, pass {\"x\": x, \"y\": y, \"text\": \"label\"}. For multiple, pass a list. Example: draw_texts(img, [{\"x\": 500, \"y\": 100, \"text\": \"Title\"}]) adds text at top center.")
+@app.tool(name="draw_texts", description="Add one or more text annotations to an image. Coordinates use 0-1000 scale. For a single text, pass {\"x\": x, \"y\": y, \"text\": \"label\"}. For multiple, pass a list. Example: draw_texts(img_idx=0, texts=[{\"x\": 500, \"y\": 100, \"text\": \"Title\"}]) adds text at top center.")
 def draw_texts(
-    image_path: str,
+    img_idx: int,
     texts: Union[dict, List[dict]],
     color: str = "red",
     font_size: int = 18,
-) -> ImageContent:
+) -> List[Union[TextContent, ImageContent]]:
     """
     Add one or more text annotations to an image.
 
-    :param image_path: Path to the input image.
+    :param img_idx: Image index supplied by the caller.
     :param texts: Either {"x": x, "y": y, "text": "label"} for a single text, or a list of such dicts for multiple texts. Coordinates use 0-1000 scale.
     :param color: Text color name.
     :param font_size: Size of the font in pixels.
     :return: Image with text drawn.
     """
+    image_path = _resolve_image_path(img_idx)
     img = np.array(Image.open(image_path).convert("RGB"))
     h, w = img.shape[:2]
     vis = Visualizer(img)
@@ -254,25 +270,26 @@ def draw_texts(
         px, py = _to_pixel(x, w), _to_pixel(y, h)
         vis.draw_text(text, (px, py), color=color, font_size=font_size)
 
-    return _image_to_content(vis.get_output().get_image())
+    return _save_output_image(Image.fromarray(vis.get_output().get_image()))
 
 
-@app.tool(name="draw_polygons", description="Draw one or more polygons on an image. Coordinates use 0-1000 scale. For a single polygon, pass [[x1,y1], [x2,y2], [x3,y3], ...]. For multiple polygons, pass [[[x1,y1], ...], [[x1,y1], ...], ...]. Example: draw_polygons(img, [[[200,200], [800,200], [500,800]]]) draws a triangle.")
+@app.tool(name="draw_polygons", description="Draw one or more polygons on an image. Coordinates use 0-1000 scale. For a single polygon, pass [[x1,y1], [x2,y2], [x3,y3], ...]. For multiple polygons, pass [[[x1,y1], ...], [[x1,y1], ...], ...]. Example: draw_polygons(img_idx=0, polygons=[[[200,200], [800,200], [500,800]]]) draws a triangle.")
 def draw_polygons(
-    image_path: str,
+    img_idx: int,
     polygons: Union[List[List[int]], List[List[List[int]]]],
     color: str = "red",
     alpha: float = 0.5,
-) -> ImageContent:
+) -> List[Union[TextContent, ImageContent]]:
     """
     Draw one or more polygons on an image.
 
-    :param image_path: Path to the input image.
+    :param img_idx: Image index supplied by the caller.
     :param polygons: Either [[x1,y1], [x2,y2], ...] for a single polygon, or [[[x1,y1], ...], [[x1,y1], ...]] for multiple polygons. Coordinates use 0-1000 scale.
     :param color: Color name.
     :param alpha: Opacity of the fill.
     :return: Image with polygons drawn.
     """
+    image_path = _resolve_image_path(img_idx)
     img = np.array(Image.open(image_path).convert("RGB"))
     h, w = img.shape[:2]
     vis = Visualizer(img)
@@ -286,7 +303,7 @@ def draw_polygons(
         pixel_points = [[_to_pixel(p[0], w), _to_pixel(p[1], h)] for p in polygon]
         vis.draw_polygon(np.array(pixel_points), color=color, alpha=alpha)
 
-    return _image_to_content(vis.get_output().get_image())
+    return _save_output_image(Image.fromarray(vis.get_output().get_image()))
 
 
 if __name__ == "__main__":
