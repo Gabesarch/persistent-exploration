@@ -1,6 +1,7 @@
 import asyncio
+import os
 from datetime import timedelta
-from typing import List, Union
+from typing import Dict, List, Optional, Union
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -31,14 +32,21 @@ class MCPClient:
                     functions.append({"type": "function", "function": {"name": tool.name, "description": tool.description or "", "parameters": tool.inputSchema}})
                 return functions
 
-    async def run_tool(self, tool_name: str, tool_args: dict):
+    async def run_tool(self, tool_name: str, tool_args: dict, env: Optional[Dict[str, str]] = None):
         """
         Run a specific tool with the given arguments.
         :param tool_name: Name of the tool to run.
         :param tool_args: Arguments for the tool.
+        :param env: Extra env vars merged into the subprocess environment (used to
+            pass the per-call image registry, LMMS_EVAL_IMAGE_REGISTRY, so the tool
+            can resolve img_idx -> file path). Without this, stdio_client would give
+            the subprocess only a minimal default environment.
         :return: Result of the tool execution.
         """
-        server_params = StdioServerParameters(command="python", args=[self.server_path])
+        child_env = os.environ.copy()
+        if env:
+            child_env.update(env)
+        server_params = StdioServerParameters(command="python", args=[self.server_path], env=child_env)
         async with stdio_client(server=server_params) as (read_stream, write_stream):
             async with ClientSession(read_stream, write_stream, read_timeout_seconds=self.timeout) as session:
                 await session.initialize()
@@ -79,17 +87,18 @@ class MCPClient:
         finally:
             loop.close()
 
-    def run_tool_sync(self, tool_name: str, tool_args: dict):
+    def run_tool_sync(self, tool_name: str, tool_args: dict, env: Optional[Dict[str, str]] = None):
         """
         Synchronous wrapper for run_tool.
         Run a specific tool with the given arguments.
         :param tool_name: Name of the tool to run.
         :param tool_args: Arguments for the tool.
+        :param env: Extra env vars merged into the subprocess environment.
         :return: Result of the tool execution.
         """
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            return loop.run_until_complete(self.run_tool(tool_name, tool_args))
+            return loop.run_until_complete(self.run_tool(tool_name, tool_args, env=env))
         finally:
             loop.close()

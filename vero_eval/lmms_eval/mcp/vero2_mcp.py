@@ -8,8 +8,10 @@
 #
 import base64
 import io
+import json
 import logging
 import os
+import tempfile
 from typing import List
 
 # Offline mode for HuggingFace models
@@ -19,7 +21,7 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 import numpy as np
 from mcp.server.fastmcp import FastMCP
-from mcp.types import ImageContent
+from mcp.types import ImageContent, TextContent
 from PIL import Image, ImageDraw
 
 # The rich drawing tools below render via the heavy Visualizer (cv2 + matplotlib).
@@ -70,24 +72,58 @@ DRAW_MAX_PIXELS = 1048576
 DRAW_JPEG_QUALITY = 85
 
 
-def _bounded_jpeg_content(image: Image.Image) -> ImageContent:
-    """Downscale `image` to <= DRAW_MAX_PIXELS and JPEG-encode it as an MCP
-    ImageContent. Used by every drawing/zoom tool so returned images stay small
-    enough for the stdio transport and the context window."""
+_IMAGE_REGISTRY_ENV = "LMMS_EVAL_IMAGE_REGISTRY"
+
+
+def _resolve_image_path(img_idx: int) -> str:
+    """Resolve an image INDEX to a real file path via the registry the eval
+    backend passes in the LMMS_EVAL_IMAGE_REGISTRY env var (one snapshot per
+    tool call). Mirrors training, where a tool addresses images by img_idx into
+    agent_data.image_data[img_idx] (verl/tools/image_zoom_in_tool.py)."""
+    raw = os.environ.get(_IMAGE_REGISTRY_ENV)
+    if not raw:
+        raise ValueError("No image registry available (LMMS_EVAL_IMAGE_REGISTRY unset); pass img_idx for an image the eval registered.")
+    registry = json.loads(raw)
+    path = registry.get(str(int(img_idx)))
+    if path is None:
+        avail = sorted(int(k) for k in registry)
+        raise ValueError(f"img_idx {img_idx} is not available. Available indices: {avail}.")
+    return path
+
+
+def _bound_image(image: Image.Image) -> Image.Image:
+    """Downscale to <= DRAW_MAX_PIXELS so tool outputs stay small for the MCP
+    stdio transport and the model context. 1 MP matches the zoom output budget."""
     image = image.convert("RGB")
     pixels = image.width * image.height
     if pixels > DRAW_MAX_PIXELS:
         scale = (DRAW_MAX_PIXELS / pixels) ** 0.5
         image = image.resize((max(1, round(image.width * scale)), max(1, round(image.height * scale))), Image.Resampling.LANCZOS)
+    return image
+
+
+def _encode_jpeg_content(image: Image.Image) -> ImageContent:
     buf = io.BytesIO()
     image.save(buf, format="JPEG", quality=DRAW_JPEG_QUALITY)
     buf.seek(0)
     return ImageContent(type="image", data=base64.b64encode(buf.getvalue()).decode("utf-8"), mimeType="image/jpeg")
 
 
-def _image_to_content(image: np.ndarray) -> ImageContent:
-    """Convert numpy RGB array to a size-bounded JPEG ImageContent."""
-    return _bounded_jpeg_content(Image.fromarray(image))
+def _save_and_emit(image: Image.Image):
+    """Bound `image`, persist it to a temp file so a later tool call can address
+    it by a fresh img_idx, and return [sentinel-text, bounded-JPEG-image]. The
+    eval backend turns the 'Saved drawn image to:' sentinel into a new img_idx
+    (mirrors training appending tool-output crops to agent_data.image_data)."""
+    bounded = _bound_image(image)
+    fd, path = tempfile.mkstemp(suffix=".jpg", prefix="vero2_tool_out_")
+    os.close(fd)
+    bounded.save(path, format="JPEG", quality=DRAW_JPEG_QUALITY)
+    return [TextContent(type="text", text=f"Saved drawn image to: {path}"), _encode_jpeg_content(bounded)]
+
+
+def _image_to_content(image: np.ndarray):
+    """Numpy RGB array -> [sentinel, bounded JPEG] (re-addressable by img_idx)."""
+    return _save_and_emit(Image.fromarray(image))
 
 
 def _to_pixel(value: int, size: int) -> float:
@@ -95,9 +131,9 @@ def _to_pixel(value: int, size: int) -> float:
     return (value / COORD_SCALE) * size
 
 
-def _pil_to_content(image: Image.Image) -> ImageContent:
-    """Encode a PIL image as a size-bounded JPEG MCP ImageContent."""
-    return _bounded_jpeg_content(image)
+def _pil_to_content(image: Image.Image):
+    """PIL image -> [sentinel, bounded JPEG] (re-addressable by img_idx)."""
+    return _save_and_emit(image)
 
 
 def _to_px_clamped(value: float, size: int) -> int:
@@ -111,10 +147,10 @@ def _to_px_clamped(value: float, size: int) -> int:
 # ---- Zooming ----
 # Eval-side twin of the RL training zoom tool (verl/tools/image_zoom_in_tool.py +
 # vero2_scripts/config/tool_config/image_zoom_in_tool.yaml): same name, same
-# bbox_2d/label arguments, same normalized_1000 coordinates and the same output
-# pixel budget, so tool behavior matches what tool-trained checkpoints saw.
-# Only difference: the source image is addressed by image_path (the eval loop
-# hands the model file paths) instead of the training-side img_idx.
+# bbox_2d/label/img_idx arguments, same normalized_1000 coordinates and the same
+# output pixel budget, so tool behavior matches what tool-trained checkpoints saw.
+# Images are addressed by img_idx (a 0-based image index), like training: the eval
+# backend maps img_idx -> the actual file via the LMMS_EVAL_IMAGE_REGISTRY env var.
 ZOOM_MIN_PIXELS = 518400  # = training cropped_min_pixels
 ZOOM_MAX_PIXELS = 1048576  # = training cropped_max_pixels
 ZOOM_MIN_SIDE_PX = 28
@@ -137,15 +173,16 @@ def _expand_to_min_side(lo: int, hi: int, size: int, min_side: int = ZOOM_MIN_SI
     name="image_zoom_in_tool",
     description=(
         "Zoom in on a specific region of an image by cropping it based on a bounding box (bbox_2d) "
-        "and an optional object label. Coordinates use the 0-1000 scale where (0,0)=top-left and "
-        "(1000,1000)=bottom-right. The crop is returned magnified so small details become readable. "
-        'Example: image_zoom_in_tool(image_path, [480, 90, 640, 210], "street sign").'
+        "and an object label. img_idx is the 0-based index of the image to zoom into. Coordinates "
+        "use the 0-1000 scale where (0,0)=top-left and (1000,1000)=bottom-right. The crop is returned "
+        "magnified so small details become readable. "
+        'Example: image_zoom_in_tool(img_idx=0, bbox_2d=[480, 90, 640, 210], label="street sign").'
     ),
 )
-def image_zoom_in_tool(image_path: str, bbox_2d: List[int], label: str = "") -> ImageContent:
-    """Crop bbox_2d=[x1,y1,x2,y2] (0-1000 scale) out of the image and resize the crop
-    into the training-time pixel budget. PIL-only (works offline)."""
-    image = Image.open(image_path).convert("RGB")
+def image_zoom_in_tool(img_idx: int, bbox_2d: List[int], label: str) -> list:
+    """Crop bbox_2d=[x1,y1,x2,y2] (0-1000 scale) out of image `img_idx` and resize the
+    crop into the training-time pixel budget. PIL-only (works offline)."""
+    image = Image.open(_resolve_image_path(img_idx)).convert("RGB")
     w, h = image.size
     coords = [int(v) for v in list(bbox_2d)[:4]]
     if len(coords) != 4:
@@ -173,9 +210,9 @@ def image_zoom_in_tool(image_path: str, bbox_2d: List[int], label: str = "") -> 
 
 # ========== Simple PIL-based tools (no distortion) ==========
 
-@app.tool(name="draw_box", description="Draw a bounding box on an image. Coordinates use 0-1000 scale where (0,0)=top-left, (1000,1000)=bottom-right. Example: draw_box(img, 100, 200, 500, 600, linewidth=5) draws a thick box.")
+@app.tool(name="draw_box", description="Draw a bounding box on an image. Coordinates use 0-1000 scale where (0,0)=top-left, (1000,1000)=bottom-right. Example: draw_box(img_idx=0,100, 200, 500, 600, linewidth=5) draws a thick box.")
 def draw_box(
-    image_path: str,
+    img_idx: int,
     x1: int,
     y1: int,
     x2: int,
@@ -183,7 +220,7 @@ def draw_box(
     color: str = "red",
     alpha: float = 0.8,
     linewidth: int = 3,
-) -> ImageContent:
+) -> list:
     """
     Draw a bounding box on an image.
 
@@ -197,7 +234,7 @@ def draw_box(
     :param linewidth: Width of the box outline in pixels.
     :return: Image with box drawn.
     """
-    pil_img = Image.open(image_path).convert("RGB")
+    pil_img = Image.open(_resolve_image_path(img_idx)).convert("RGB")
     w, h = pil_img.size
     px1, py1 = _to_pixel(x1, w), _to_pixel(y1, h)
     px2, py2 = _to_pixel(x2, w), _to_pixel(y2, h)
@@ -212,15 +249,15 @@ def draw_box(
         return _pil_to_content(pil_img)
 
 
-@app.tool(name="draw_numbered_boxes", description="Draw multiple numbered bounding boxes on an image. Coordinates use 0-1000 scale. Each box gets a unique number label. Example: draw_numbered_boxes(img, [[100,100,200,200], [300,300,400,400]], linewidth=4) draws 2 numbered boxes.")
+@app.tool(name="draw_numbered_boxes", description="Draw multiple numbered bounding boxes on an image. Coordinates use 0-1000 scale. Each box gets a unique number label. Example: draw_numbered_boxes(img_idx=0,[[100,100,200,200], [300,300,400,400]], linewidth=4) draws 2 numbered boxes.")
 def draw_numbered_boxes(
-    image_path: str,
+    img_idx: int,
     boxes: List[List[int]],
     color: str = "lime",
     alpha: float = 0.8,
     linewidth: int = 3,
     show_total: bool = True,
-) -> ImageContent:
+) -> list:
     """
     Draw multiple numbered bounding boxes on an image.
 
@@ -232,7 +269,7 @@ def draw_numbered_boxes(
     :param show_total: If True, display total number at top of image.
     :return: Image with numbered boxes.
     """
-    img = np.array(Image.open(image_path).convert("RGB"))
+    img = np.array(Image.open(_resolve_image_path(img_idx)).convert("RGB"))
     h, w = img.shape[:2]
     vis = Visualizer(img)
 
@@ -249,14 +286,14 @@ def draw_numbered_boxes(
     return _image_to_content(vis.get_output().get_image())
 
 
-@app.tool(name="draw_numbered_points", description="Draw numbered point markers on an image. Coordinates use 0-1000 scale. Example: draw_numbered_points(img, [[500,500], [600,600]]) marks 2 numbered points.")
+@app.tool(name="draw_numbered_points", description="Draw numbered point markers on an image. Coordinates use 0-1000 scale. Example: draw_numbered_points(img_idx=0,[[500,500], [600,600]]) marks 2 numbered points.")
 def draw_numbered_points(
-    image_path: str,
+    img_idx: int,
     points: List[List[int]],
     color: str = "lime",
     radius: int = 15,
     show_total: bool = True,
-) -> ImageContent:
+) -> list:
     """
     Draw numbered point markers on an image.
 
@@ -267,7 +304,7 @@ def draw_numbered_points(
     :param show_total: If True, display total number at top of image.
     :return: Image with numbered point markers.
     """
-    img = np.array(Image.open(image_path).convert("RGB"))
+    img = np.array(Image.open(_resolve_image_path(img_idx)).convert("RGB"))
     h, w = img.shape[:2]
     vis = Visualizer(img)
 
@@ -284,15 +321,15 @@ def draw_numbered_points(
     return _image_to_content(vis.get_output().get_image())
 
 
-@app.tool(name="draw_grid", description="Draw a grid overlay on an image. Specify rows and columns. Example: draw_grid(img, 3, 3) draws a 3x3 grid.")
+@app.tool(name="draw_grid", description="Draw a grid overlay on an image. Specify rows and columns. Example: draw_grid(img_idx=0,3, 3) draws a 3x3 grid.")
 def draw_grid(
-    image_path: str,
+    img_idx: int,
     rows: int = 3,
     cols: int = 3,
     color: str = "yellow",
     linewidth: float = 2,
     show_labels: bool = True,
-) -> ImageContent:
+) -> list:
     """
     Draw a grid overlay on an image.
 
@@ -306,7 +343,7 @@ def draw_grid(
     """
     from PIL import ImageDraw
 
-    img = Image.open(image_path).convert("RGB")
+    img = Image.open(_resolve_image_path(img_idx)).convert("RGB")
     w, h = img.size
     draw = ImageDraw.Draw(img)
 
@@ -335,14 +372,14 @@ def draw_grid(
     return _image_to_content(np.array(img))
 
 
-@app.tool(name="draw_circle", description="Draw a circle on an image. Coordinates use 0-1000 scale. Radius is also 0-1000 (relative to width). Example: draw_circle(img, 500, 500, 50) draws a circle at center.")
+@app.tool(name="draw_circle", description="Draw a circle on an image. Coordinates use 0-1000 scale. Radius is also 0-1000 (relative to width). Example: draw_circle(img_idx=0,500, 500, 50) draws a circle at center.")
 def draw_circle(
-    image_path: str,
+    img_idx: int,
     x: int,
     y: int,
     radius: int = 30,
     color: str = "red",
-) -> ImageContent:
+) -> list:
     """
     Draw a circle on an image.
 
@@ -353,7 +390,7 @@ def draw_circle(
     :param color: Color name.
     :return: Image with circle drawn.
     """
-    img = np.array(Image.open(image_path).convert("RGB"))
+    img = np.array(Image.open(_resolve_image_path(img_idx)).convert("RGB"))
     h, w = img.shape[:2]
     px, py = _to_pixel(x, w), _to_pixel(y, h)
     pr = _to_pixel(radius, w)
@@ -362,16 +399,16 @@ def draw_circle(
     return _image_to_content(vis.get_output().get_image())
 
 
-@app.tool(name="draw_line", description="Draw a line on an image. Coordinates use 0-1000 scale. Example: draw_line(img, 200, 300, 800, 700) draws a diagonal line.")
+@app.tool(name="draw_line", description="Draw a line on an image. Coordinates use 0-1000 scale. Example: draw_line(img_idx=0,200, 300, 800, 700) draws a diagonal line.")
 def draw_line(
-    image_path: str,
+    img_idx: int,
     x1: int,
     y1: int,
     x2: int,
     y2: int,
     color: str = "red",
     linewidth: float = 3,
-) -> ImageContent:
+) -> list:
     """
     Draw a line on an image.
 
@@ -384,7 +421,7 @@ def draw_line(
     :param linewidth: Width of the line in pixels.
     :return: Image with line drawn.
     """
-    img = np.array(Image.open(image_path).convert("RGB"))
+    img = np.array(Image.open(_resolve_image_path(img_idx)).convert("RGB"))
     h, w = img.shape[:2]
     px1, py1 = _to_pixel(x1, w), _to_pixel(y1, h)
     px2, py2 = _to_pixel(x2, w), _to_pixel(y2, h)
@@ -393,9 +430,9 @@ def draw_line(
     return _image_to_content(vis.get_output().get_image())
 
 
-@app.tool(name="draw_arrow", description="Draw an arrow from one point to another. Coordinates use 0-1000 scale. Example: draw_arrow(img, 200, 300, 800, 700) draws an arrow pointing toward (800, 700).")
+@app.tool(name="draw_arrow", description="Draw an arrow from one point to another. Coordinates use 0-1000 scale. Example: draw_arrow(img_idx=0,200, 300, 800, 700) draws an arrow pointing toward (800, 700).")
 def draw_arrow(
-    image_path: str,
+    img_idx: int,
     x1: int,
     y1: int,
     x2: int,
@@ -403,7 +440,7 @@ def draw_arrow(
     color: str = "red",
     linewidth: int = 3,
     head_size: int = 20,
-) -> ImageContent:
+) -> list:
     """
     Draw an arrow from (x1, y1) to (x2, y2) with an arrowhead.
 
@@ -420,7 +457,7 @@ def draw_arrow(
     import math
     from PIL import ImageDraw
 
-    img = Image.open(image_path).convert("RGB")
+    img = Image.open(_resolve_image_path(img_idx)).convert("RGB")
     w, h = img.size
     draw = ImageDraw.Draw(img)
 
@@ -446,15 +483,15 @@ def draw_arrow(
     return _image_to_content(np.array(img))
 
 
-@app.tool(name="draw_text", description="Add text annotation to an image. Coordinates use 0-1000 scale. Example: draw_text(img, 500, 100, 'Title') draws text at top center.")
+@app.tool(name="draw_text", description="Add text annotation to an image. Coordinates use 0-1000 scale. Example: draw_text(img_idx=0,500, 100, 'Title') draws text at top center.")
 def draw_text(
-    image_path: str,
+    img_idx: int,
     x: int,
     y: int,
     text: str,
     color: str = "red",
     font_size: int = 18,
-) -> ImageContent:
+) -> list:
     """
     Add text to an image at the specified position.
 
@@ -466,7 +503,7 @@ def draw_text(
     :param font_size: Size of the font in pixels.
     :return: Image with text drawn.
     """
-    img = np.array(Image.open(image_path).convert("RGB"))
+    img = np.array(Image.open(_resolve_image_path(img_idx)).convert("RGB"))
     h, w = img.shape[:2]
     px, py = _to_pixel(x, w), _to_pixel(y, h)
     vis = Visualizer(img)
@@ -474,13 +511,13 @@ def draw_text(
     return _image_to_content(vis.get_output().get_image())
 
 
-@app.tool(name="draw_polygon", description="Draw a polygon on an image. Coordinates use 0-1000 scale. Example: draw_polygon(img, [[200,200], [800,200], [500,800]]) draws a triangle.")
+@app.tool(name="draw_polygon", description="Draw a polygon on an image. Coordinates use 0-1000 scale. Example: draw_polygon(img_idx=0,[[200,200], [800,200], [500,800]]) draws a triangle.")
 def draw_polygon(
-    image_path: str,
+    img_idx: int,
     points: List[List[int]],
     color: str = "red",
     alpha: float = 0.5,
-) -> ImageContent:
+) -> list:
     """
     Draw a polygon on an image.
 
@@ -490,7 +527,7 @@ def draw_polygon(
     :param alpha: Opacity of the fill.
     :return: Image with polygon drawn.
     """
-    img = np.array(Image.open(image_path).convert("RGB"))
+    img = np.array(Image.open(_resolve_image_path(img_idx)).convert("RGB"))
     h, w = img.shape[:2]
     pixel_points = [[_to_pixel(p[0], w), _to_pixel(p[1], h)] for p in points]
     vis = Visualizer(img)
@@ -500,12 +537,12 @@ def draw_polygon(
 
 @app.tool(name="draw_mask", description="Draw a binary mask overlay on an image. Use this to highlight segmented regions.")
 def draw_mask(
-    image_path: str,
+    img_idx: int,
     mask_path: str,
     color: str = "blue",
     alpha: float = 0.5,
     text: str = None,
-) -> ImageContent:
+) -> list:
     """
     Draw a binary mask on an image.
 
@@ -516,7 +553,7 @@ def draw_mask(
     :param text: Optional text label to draw on the mask.
     :return: Image with mask drawn.
     """
-    img = np.array(Image.open(image_path).convert("RGB"))
+    img = np.array(Image.open(_resolve_image_path(img_idx)).convert("RGB"))
     mask = np.array(Image.open(mask_path).convert("L")) > 127
     vis = Visualizer(img)
     vis.draw_binary_mask(mask.astype(np.uint8), color=color, alpha=alpha, text=text)
@@ -525,14 +562,14 @@ def draw_mask(
 
 @app.tool(name="draw_numbered_mask", description="Draw a binary mask with a SoM-style numbered label at its center. Use this to mark and reference specific regions.")
 def draw_numbered_mask(
-    image_path: str,
+    img_idx: int,
     mask_path: str,
     number: int,
     color: str = None,
     alpha: float = 0.3,
     label_mode: str = "1",
     anno_mode: List[str] = ["Mask", "Mark"],
-) -> ImageContent:
+) -> list:
     """
     Draw a binary mask with a numbered label (Set-of-Mark style).
 
@@ -545,7 +582,7 @@ def draw_numbered_mask(
     :param anno_mode: List containing 'Mask', 'Box', and/or 'Mark'.
     :return: Image with numbered mask drawn.
     """
-    img = np.array(Image.open(image_path).convert("RGB"))
+    img = np.array(Image.open(_resolve_image_path(img_idx)).convert("RGB"))
     mask = np.array(Image.open(mask_path).convert("L")) > 127
     vis = Visualizer(img)
     vis.draw_binary_mask_with_number(
@@ -639,10 +676,10 @@ def draw_numbered_mask(
 
 # @app.tool(name="detect_objects", description="Detect objects matching a text description using GroundingDINO. Returns image with bounding boxes around detected objects and count. Use this to find specific objects like 'yellow flower' or 'person with red shirt'.")
 # def detect_objects(
-#     image_path: str,
+#     img_idx: int,
 #     prompt: str,
 #     threshold: float = 0.3,
-# ) -> ImageContent:
+# ) -> list:
 #     """
 #     Detect objects matching a text description.
 
@@ -653,7 +690,7 @@ def draw_numbered_mask(
 #     """
 #     import torch
 
-#     image = Image.open(image_path).convert("RGB")
+#     image = Image.open(_resolve_image_path(img_idx)).convert("RGB")
 #     img_array = np.array(image)
 #     h, w = img_array.shape[:2]
 
@@ -701,9 +738,9 @@ def draw_numbered_mask(
 
 # @app.tool(name="estimate_depth", description="Estimate depth map from an image using Depth Anything. Returns depth visualization where lower value/darker = closer, higher value/brighter = farther.")
 # def estimate_depth(
-#     image_path: str,
+#     img_idx: int,
 #     colormap: str = "inferno",
-# ) -> ImageContent:
+# ) -> list:
 #     """
 #     Estimate depth map from an image.
 
@@ -713,7 +750,7 @@ def draw_numbered_mask(
 #     """
 #     import matplotlib.cm as cm
 
-#     image = Image.open(image_path).convert("RGB")
+#     image = Image.open(_resolve_image_path(img_idx)).convert("RGB")
 #     depth_model = _get_depth_model()
 
 #     # Run depth estimation
@@ -732,13 +769,13 @@ def draw_numbered_mask(
 
 # @app.tool(name="estimate_depth_at_points", description="Estimate depth and mark two points A and B on the depth map. Lower depth value = closer to camera. Coordinates use 0-1000 scale.")
 # def estimate_depth_at_points(
-#     image_path: str,
+#     img_idx: int,
 #     point_a_x: int,
 #     point_a_y: int,
 #     point_b_x: int,
 #     point_b_y: int,
 #     colormap: str = "inferno",
-# ) -> ImageContent:
+# ) -> list:
 #     """
 #     Estimate depth and mark points A and B on the depth map.
 
@@ -752,7 +789,7 @@ def draw_numbered_mask(
 #     """
 #     import matplotlib.cm as cm
 
-#     image = Image.open(image_path).convert("RGB")
+#     image = Image.open(_resolve_image_path(img_idx)).convert("RGB")
 #     img_array = np.array(image)
 #     h, w = img_array.shape[:2]
 #     depth_model = _get_depth_model()
@@ -795,10 +832,10 @@ def draw_numbered_mask(
 
 # @app.tool(name="estimate_depth_overlay", description="Overlay depth estimation on the original image. Useful to see depth context with the scene.")
 # def estimate_depth_overlay(
-#     image_path: str,
+#     img_idx: int,
 #     alpha: float = 0.5,
 #     colormap: str = "inferno",
-# ) -> ImageContent:
+# ) -> list:
 #     """
 #     Overlay depth map on original image.
 
@@ -809,7 +846,7 @@ def draw_numbered_mask(
 #     """
 #     import matplotlib.cm as cm
 
-#     image = Image.open(image_path).convert("RGB")
+#     image = Image.open(_resolve_image_path(img_idx)).convert("RGB")
 #     img_array = np.array(image)
 #     depth_model = _get_depth_model()
 
@@ -836,12 +873,12 @@ def draw_numbered_mask(
 
 # @app.tool(name="segment_point", description="Segment an object at a specific point using SAM. Coordinates use 0-1000 scale. Returns the image with the segmented region highlighted.")
 # def segment_point(
-#     image_path: str,
+#     img_idx: int,
 #     x: int,
 #     y: int,
 #     color: str = "blue",
 #     alpha: float = 0.5,
-# ) -> ImageContent:
+# ) -> list:
 #     """
 #     Segment the object at a specific point.
 
@@ -854,7 +891,7 @@ def draw_numbered_mask(
 #     """
 #     import matplotlib.colors as mcolors
 
-#     image = Image.open(image_path).convert("RGB")
+#     image = Image.open(_resolve_image_path(img_idx)).convert("RGB")
 #     img_array = np.array(image)
 #     h, w = img_array.shape[:2]
 
@@ -894,14 +931,14 @@ def draw_numbered_mask(
 
 # @app.tool(name="segment_box", description="Segment objects within a bounding box using SAM. Coordinates use 0-1000 scale.")
 # def segment_box(
-#     image_path: str,
+#     img_idx: int,
 #     x1: int,
 #     y1: int,
 #     x2: int,
 #     y2: int,
 #     color: str = "blue",
 #     alpha: float = 0.5,
-# ) -> ImageContent:
+# ) -> list:
 #     """
 #     Segment objects within a bounding box.
 
@@ -916,7 +953,7 @@ def draw_numbered_mask(
 #     """
 #     import matplotlib.colors as mcolors
 
-#     image = Image.open(image_path).convert("RGB")
+#     image = Image.open(_resolve_image_path(img_idx)).convert("RGB")
 #     img_array = np.array(image)
 #     h, w = img_array.shape[:2]
 
@@ -954,11 +991,11 @@ def draw_numbered_mask(
 
 # @app.tool(name="segment_all", description="Segment all objects in an image using SAM automatic mask generation. Returns image with all segments colored. Use this to see all distinct objects/regions in the image.")
 # def segment_all(
-#     image_path: str,
+#     img_idx: int,
 #     min_area: int = 100,
 #     max_masks: int = 30,
 #     alpha: float = 0.5,
-# ) -> ImageContent:
+# ) -> list:
 #     """
 #     Automatically segment all objects in an image.
 
@@ -971,7 +1008,7 @@ def draw_numbered_mask(
 #     from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
 #     import matplotlib.colors as mcolors
 
-#     image = Image.open(image_path).convert("RGB")
+#     image = Image.open(_resolve_image_path(img_idx)).convert("RGB")
 #     img_array = np.array(image)
 
 #     # Get SAM model and create mask generator

@@ -8,7 +8,7 @@ import tempfile
 import time
 import uuid
 from multiprocessing import cpu_count
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from accelerate import Accelerator, DistributedType
 from dotenv import load_dotenv
@@ -42,6 +42,11 @@ cpu, _ = optional_import("decord", "cpu")
 # client can discover and clean up tool-generated image files after each
 # request finishes.
 _TOOL_SAVED_IMAGE_RE = re.compile(r"Saved drawn image to:\s*(\S+)")
+
+# Env var carrying the per-call image registry (img_idx -> file path) to the MCP
+# tool subprocess, so tools resolve img_idx the way training does. Keep in sync
+# with lmms_eval/mcp/vero2_mcp.py _IMAGE_REGISTRY_ENV.
+_IMAGE_REGISTRY_ENV = "LMMS_EVAL_IMAGE_REGISTRY"
 
 # vero_eval package root (parent of lmms_eval), used to resolve the relative
 # system_prompt_files paths declared in task yamls (e.g. prompts/tools/*.txt).
@@ -300,15 +305,25 @@ class AsyncOpenAIChat(lmms):
                 except OSError as exc:
                     eval_logger.debug(f"Failed to remove tool image {path}: {exc}")
 
+        # Image addressing by index (img_idx), matching training: the model is told
+        # each image's img_idx and never sees a path; tools resolve img_idx -> path
+        # via the registry passed in LMMS_EVAL_IMAGE_REGISTRY. Tool-produced images
+        # get appended with a new img_idx below (mirrors agent_data.image_data growth).
+        image_registry: Dict[int, str] = {}
+        next_img_idx = 0
         if self.mcp_client is not None:
             for image_idx, image in enumerate(images):
-                image_path = os.path.join(self.work_dir, f"{uuid.uuid4()}.jpg")
-                image.save(image_path)
+                # Save losslessly at ORIGINAL resolution (PNG), matching training's
+                # use_original_resolution_source — NOT a lossy/downscaled JPEG.
+                image_path = os.path.join(self.work_dir, f"{uuid.uuid4()}.png")
+                image.save(image_path, format="PNG")
                 request_image_paths.append(image_path)
+                image_registry[next_img_idx] = image_path
+                next_img_idx += 1
                 messages[-1]["content"].append(
                     {
                         "type": "text",
-                        "text": f"\nImage {image_idx} has image path: {image_path}",
+                        "text": f"\nImage {image_idx} is available as img_idx={image_idx}.",
                     }
                 )
             for video_idx, video in enumerate(videos):
@@ -425,7 +440,13 @@ class AsyncOpenAIChat(lmms):
                         break
                     try:
                         tool_args = json.loads(call.function.arguments) if call.function.arguments else {}
-                        result = await self.mcp_client.run_tool(call.function.name, tool_args)
+                        if "img_idx" in tool_args:
+                            _idx = int(tool_args["img_idx"])
+                            if _idx not in image_registry:
+                                raise ValueError(f"img_idx {_idx} is not available. Available indices: {sorted(image_registry)}.")
+                        # Snapshot the registry into the tool subprocess so it can map img_idx -> path.
+                        tool_env = {_IMAGE_REGISTRY_ENV: json.dumps({str(k): v for k, v in image_registry.items()})}
+                        result = await self.mcp_client.run_tool(call.function.name, tool_args, env=tool_env)
                         raw_parts = []
                         for content in result.content:
                             raw_parts.extend(self.mcp_client.convert_result_to_openai_format(content))
@@ -445,10 +466,22 @@ class AsyncOpenAIChat(lmms):
                             all_response += "<image_url>"
                             kept_parts.append(part)
                         elif part.get("type") == "text":
-                            all_response += part["text"]
-                            # Discover tool-generated image paths so we can clean them up.
-                            for match in _TOOL_SAVED_IMAGE_RE.finditer(part["text"]):
-                                request_image_paths.append(match.group(1))
+                            text = part["text"]
+                            # A tool-produced image announces itself with the
+                            # "Saved drawn image to: <path>" sentinel. Register each
+                            # under a NEW img_idx (so the model can address it in a
+                            # later tool call, like training appends crops to
+                            # image_data), track it for cleanup, and replace the raw
+                            # path the model sees with a clean img_idx message.
+                            for match in _TOOL_SAVED_IMAGE_RE.finditer(text):
+                                saved_path = match.group(1)
+                                request_image_paths.append(saved_path)
+                                assigned_idx = next_img_idx
+                                image_registry[assigned_idx] = saved_path
+                                next_img_idx += 1
+                                text = text.replace(match.group(0), f"Registered image as img_idx {assigned_idx}.")
+                            part = {"type": "text", "text": text}
+                            all_response += text
                             kept_parts.append(part)
                         else:
                             kept_parts.append(part)
