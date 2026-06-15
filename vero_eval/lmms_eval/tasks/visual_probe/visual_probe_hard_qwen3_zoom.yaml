@@ -16,5 +16,5 @@ generation_kwargs:
   do_sample: True
 lmms_eval_specific_kwargs:
   default:
-    pre_prompt: "You are given an image. Search the picture to answer the question. Respond with a short, specific phrase only. "
+    pre_prompt: "You are given an image. Search the picture to answer the question. Your final answer should be a short, specific phrase. "
     post_prompt: ""

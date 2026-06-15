@@ -172,6 +172,15 @@ DRY_RUN=1 bash vero_eval/examples/submit_tool_evals.sh             # preview
    Put **tool behavior** in the system fragments and **answer framing** in
    `pre_prompt`. Do **not** add a `metadata` block unless you need an extra key —
    `allowed_tools`/`system_prompt_files`/`version` come from the includes.
+
+   > **Wording matters for tool use.** Phrase `pre_prompt`'s answer constraint as
+   > *"Your final answer should be a short phrase"*, **not** *"Respond with a short
+   > phrase only"*. The latter reads as "answer directly/tersely" and suppresses
+   > tool calls. `system_base.txt` already states that the answer-format applies to
+   > the FINAL answer only and that the model should inspect with tools first — so
+   > the `pre_prompt` only needs to describe the final answer's shape. (This is a
+   > common trap when adapting a no-tool `_qwen3_zs` baseline yaml — its
+   > "respond … only" wording is fine without tools but self-defeating with them.)
 3. **Run** it: `MODEL=qwen3vl TOOLS=on TASKS=<task> sbatch --export=ALL vero_eval/run_eval.sbatch`
    (add it to `TASKS=...` in `submit_tool_evals.sh` for the batch path).
 
