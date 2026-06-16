@@ -130,3 +130,6 @@ logs
 log
 outputs
 .history
+
+vero_eval/results/*
+vero_eval/results/.*
