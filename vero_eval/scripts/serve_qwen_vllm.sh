@@ -41,6 +41,15 @@ if pgrep -f "vllm serve.*--port ${PORT} " >/dev/null 2>&1; then
   echo "Killing existing vLLM server(s) on port ${PORT}..."; pkill -f "vllm serve.*--port ${PORT} " || true; sleep 3
 fi
 
+# Optional explicit chat template. Needed for the RL-trained Vero checkpoints:
+# vLLM otherwise serves the base template embedded in tokenizer_config.json, which
+# does NOT force the <think> block or the training tool-call format, so Vero answers
+# directly without thinking/tool use. Point CHAT_TEMPLATE at the training template
+# (e.g. the checkpoint's chat_template.jinja) to reproduce training behavior.
+CHAT_TEMPLATE="${CHAT_TEMPLATE:-}"
+CHAT_TEMPLATE_ARGS=()
+[[ -n "$CHAT_TEMPLATE" ]] && CHAT_TEMPLATE_ARGS=(--chat-template "$CHAT_TEMPLATE") && echo "Using chat template: $CHAT_TEMPLATE"
+
 echo "Starting vLLM server (log: $LOGFILE)..."
 nohup vllm serve "$CHECKPOINT_PATH" \
   --port "$PORT" \
@@ -55,6 +64,7 @@ nohup vllm serve "$CHECKPOINT_PATH" \
   --api-key "$API_KEY" \
   --enable-auto-tool-choice \
   --tool-call-parser hermes \
+  "${CHAT_TEMPLATE_ARGS[@]}" \
   --enforce-eager \
   > "$LOGFILE" 2>&1 &
 disown
