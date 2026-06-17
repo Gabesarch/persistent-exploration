@@ -265,6 +265,12 @@ class AsyncOpenAIChat(lmms):
         files = meta.get("system_prompt_files") or []
         if isinstance(files, str):
             files = [files]
+        # Some checkpoints' chat templates append a fixed "\n\n" + tool block right
+        # after the system message, so a fragment's own trailing newline is part of the
+        # byte-exact seam (e.g. Vero training: Layer A ends "...```\n" and the template
+        # adds "\n\n" -> 3 newlines before "# Tools"). Opt in per task to preserve it;
+        # default strips (intended for the single training-faithful fragment case).
+        preserve_trailing_newline = bool(meta.get("system_prompt_preserve_trailing_newline"))
         for rel in files:
             path = rel if os.path.isabs(rel) else rel
             if not os.path.isfile(path):
@@ -272,7 +278,8 @@ class AsyncOpenAIChat(lmms):
             if not os.path.isfile(path):
                 raise ValueError(f"Task '{task}': system_prompt_files entry '{rel}' not found " f"(looked at '{rel}' and '{os.path.join(_VERO_EVAL_ROOT, rel)}'). Fix the path in the task yaml metadata.")
             with open(path, "r") as fh:
-                fragments.append(fh.read().strip())
+                content = fh.read()
+            fragments.append(content if preserve_trailing_newline else content.strip())
         resolved = "\n\n".join(f for f in fragments if f) or None
         self._task_system_prompt_cache[task] = resolved
         if resolved:
@@ -307,11 +314,55 @@ class AsyncOpenAIChat(lmms):
                 raise ValueError(f"Task '{task}': allowed_tools={allowed} matched none of the MCP server tools {server_tools}. " f"Fix the task yaml metadata or the MCP server at the configured mcp_server_path.")
         extra = meta.get("extra_tools") or []
         functions = functions + list(extra)
+        # Per-task tool-schema overrides: replace the FastMCP-introspected `description`
+        # and/or `parameters` of a named tool with an authored schema. Used to render the
+        # offered tool JSON byte-identical to the RL training tool schema (whose property
+        # order/types/keys differ from the Python-signature-derived one). The tool stays
+        # backed by the MCP server (execution by name); only the advertised schema changes.
+        overrides = meta.get("tool_schema_overrides") or {}
+        if overrides:
+            pinned = []
+            for f in functions:
+                ov = overrides.get(f.get("function", {}).get("name"))
+                if ov:
+                    f = json.loads(json.dumps(f))  # deep copy; don't mutate the shared MCP spec
+                    if "description" in ov:
+                        f["function"]["description"] = ov["description"]
+                    if "parameters" in ov:
+                        f["function"]["parameters"] = json.loads(json.dumps(ov["parameters"]))
+                pinned.append(f)
+            functions = pinned
         terminal = {str(name) for name in (meta.get("terminal_tools") or [])}
         self._task_tools_cache[task] = (functions, terminal)
         offered = [f["function"]["name"] for f in functions]
         eval_logger.info(f"Task '{task}': offering tools {offered}" + (f" (terminal: {sorted(terminal)})" if terminal else ""))
         return functions, terminal
+
+    def _tool_image_registered_text(self, mode, tool_name, tool_args, assigned_idx):
+        """Model-visible text that replaces a tool's 'Saved drawn image to:' sentinel.
+
+        For the zoom tool under the training-faithful image_indexing modes, reproduce the
+        RL environment's <tool_response> wording 'Zoomed in on the image to the region
+        [x1, y1, x2, y2] with label {label}.' (built from the call's bbox_2d/label):
+          - ``training_faithful``: that sentence ONLY (training never announced new
+            indices; 581/581 training calls used img_idx 0).
+          - ``multi_index``: that sentence + a hint that the crop is available as a new
+            img_idx and can be zoomed into (the only divergence from training).
+        Otherwise (default) keep the generic 'Registered image as img_idx N.'.
+        """
+        if mode in ("training_faithful", "multi_index") and tool_name == "image_zoom_in_tool":
+            bbox = (tool_args or {}).get("bbox_2d")
+            label = (tool_args or {}).get("label")
+            if isinstance(bbox, (list, tuple)):
+                bbox_str = "[" + ", ".join(str(int(v)) for v in bbox) + "]"
+            else:
+                bbox_str = str(bbox)
+            wording = f"Zoomed in on the image to the region {bbox_str} with label {label}."
+            if mode == "multi_index":
+                wording += (f" The cropped view is now available as img_idx {assigned_idx}; "
+                            f"you can zoom into it (or img_idx 0, the original) for a closer look.")
+            return wording
+        return f"Registered image as img_idx {assigned_idx}."
 
     def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
         assert False, "TODO, not implemented"
@@ -423,6 +474,9 @@ class AsyncOpenAIChat(lmms):
                 functions, terminal_tools = self._resolve_task_tools(task)
                 payload["tools"] = functions
                 payload["tool_choice"] = "auto"
+            # Per-task image-indexing mode controls the model-visible tool_response wording
+            # (training_faithful | multi_index | None=default). See _tool_image_registered_text.
+            image_indexing_mode = (self.task_metadata.get(task) or {}).get("image_indexing")
 
             response = await self.client.chat.completions.create(**payload)
             last_response = response.choices[0].message.content or ""
@@ -517,7 +571,7 @@ class AsyncOpenAIChat(lmms):
                                 assigned_idx = next_img_idx
                                 image_registry[assigned_idx] = saved_path
                                 next_img_idx += 1
-                                text = text.replace(match.group(0), f"Registered image as img_idx {assigned_idx}.")
+                                text = text.replace(match.group(0), self._tool_image_registered_text(image_indexing_mode, call.function.name, tool_args, assigned_idx))
                             part = {"type": "text", "text": text}
                             all_response += text
                             kept_parts.append(part)
