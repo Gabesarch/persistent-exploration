@@ -364,6 +364,38 @@ class ImageZoomInTool(BaseTool):
         image_data = agent_data.image_data
         return len(image_data) if isinstance(image_data, list) else 1
 
+    def _image_provenance_store(self, agent_data: Any = None) -> Optional[dict]:
+        """Per-trajectory map {img_idx: (root_orig_idx, native_region [x1,y1,x2,y2])} stored on
+        agent_data. It lets every zoom crop from the ORIGINAL native-resolution image,
+        compositing the model's 0-1000 bbox through each crop's region back to original pixels
+        (so chained / multi-image-index zooms keep full detail instead of re-cropping the
+        already-resized crop). Lives on agent_data because the tool's _instance_dict does NOT
+        persist across calls (create()/execute()/release() run per tool call), whereas agent_data
+        persists for the whole trajectory. Regions are stored as floats (no premature rounding)."""
+        if agent_data is None:
+            return None
+        store = getattr(agent_data, "image_provenance", None)
+        if store is None:
+            store = {}
+            agent_data.image_provenance = store
+        return store
+
+    @staticmethod
+    def _composite_bbox_to_native(region: list[float], bbox_2d: list[float]) -> list[float]:
+        """Map a 0-1000 bbox, drawn on an image that represents `region`=[x1,y1,x2,y2] (native
+        pixels of the root original), into native pixel coords of the root original:
+        native = region_origin + (bbox/1000) * region_span. Kept as floats (no rounding) so
+        chained zooms compose without truncation drift. For the full-image region [0,0,W,H]
+        this reduces to (bbox/1000)*size, i.e. the normalized_1000 _convert_bbox_to_pixels."""
+        rx1, ry1, rx2, ry2 = region
+        rw, rh = rx2 - rx1, ry2 - ry1
+        return [
+            rx1 + float(bbox_2d[0]) / 1000.0 * rw,
+            ry1 + float(bbox_2d[1]) / 1000.0 * rh,
+            rx1 + float(bbox_2d[2]) / 1000.0 * rw,
+            ry1 + float(bbox_2d[3]) / 1000.0 * rh,
+        ]
+
     def _strip_image_size_control_keys(self, source: dict[str, Any]) -> dict[str, Any]:
         return {key: value for key, value in source.items() if key not in self.IMAGE_SIZE_CONTROL_KEYS}
 
@@ -526,11 +558,49 @@ class ImageZoomInTool(BaseTool):
         try:
             img_idx = self._parse_img_idx(parameters)
             debug_info["img_idx"] = img_idx
-            image, source_info = self._select_source_image(instance_id, img_idx, kwargs.get("agent_data"))
-            debug_info.update(source_info)
-            image_width, image_height = image.size
+            agent_data = kwargs.get("agent_data")
+            prov_store = self._image_provenance_store(agent_data)
+            original_sources = (
+                getattr(agent_data, "original_prompt_image_sources", None) if agent_data is not None else None
+            )
+            # Provenance path: always crop from the ORIGINAL native-resolution image and composite
+            # the 0-1000 bbox through this img_idx's region. Gated on use_original_resolution_source
+            # + normalized_1000 (the cropzoom setup). For img_idx 0 this is byte-identical to the
+            # existing use_original_resolution_source behavior; for crops (img_idx>=1) it fixes the
+            # detail blur of re-cropping the resized crop.
+            use_provenance = bool(
+                self.use_original_resolution_source
+                and self.coordinate_system == "normalized_1000"
+                and prov_store is not None
+                and original_sources
+            )
+            orig_idx = None
+            if use_provenance:
+                if img_idx in prov_store:
+                    orig_idx, region = prov_store[img_idx]
+                    image = self._load_original_source_image(original_sources[orig_idx])
+                elif img_idx < len(original_sources):
+                    orig_idx = img_idx
+                    image = self._load_original_source_image(original_sources[orig_idx])
+                    region = (0.0, 0.0, float(image.width), float(image.height))
+                    prov_store[img_idx] = (orig_idx, region)
+                else:
+                    raise IndexError(
+                        f"img_idx={img_idx} has no provenance and is not an initial prompt image "
+                        f"(have {len(original_sources)} originals)."
+                    )
+                image_width, image_height = image.size
+                # native = region_origin + (bbox/1000) * region_span  (scale-then-offset)
+                pixel_bbox = self._composite_bbox_to_native(region, bbox_2d)
+                debug_info.update(
+                    {"used_original_resolution_source": True, "root_orig_idx": orig_idx, "parent_region": list(region)}
+                )
+            else:
+                image, source_info = self._select_source_image(instance_id, img_idx, agent_data)
+                debug_info.update(source_info)
+                image_width, image_height = image.size
+                pixel_bbox = self._convert_bbox_to_pixels(bbox_2d, image_width=image_width, image_height=image_height)
             debug_info["source_image_size"] = [image_width, image_height]
-            pixel_bbox = self._convert_bbox_to_pixels(bbox_2d, image_width=image_width, image_height=image_height)
             debug_info["pixel_bbox"] = pixel_bbox
             clamped_bbox = self._validate_and_clamp_bbox(
                 pixel_bbox, image_width=image_width, image_height=image_height
@@ -569,6 +639,15 @@ class ImageZoomInTool(BaseTool):
             )
             debug_info["crop_image_ref"] = crop_ref
             debug_info["success"] = True
+            if use_provenance and prov_store is not None:
+                # Record this crop's region in the ROOT original (post clamp+expand, as floats)
+                # at the index it will occupy in agent_data.image_data, so a later zoom into it
+                # composites from the original again. The forced-think grammar emits one tool
+                # call per turn, so this index stays aligned with image_data.
+                new_prov_idx = self._processed_image_count(agent_data)
+                if new_prov_idx is not None:
+                    prov_store[new_prov_idx] = (orig_idx, [float(c) for c in resized_bbox])
+                    debug_info["provenance_region"] = prov_store[new_prov_idx][1]
             logger.info(f"Cropped image size: {cropped_image.size}")
         except Exception as e:
             logger.error(f"Error processing image zoom-in: {e}")
