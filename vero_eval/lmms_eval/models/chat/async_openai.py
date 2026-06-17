@@ -42,6 +42,8 @@ cpu, _ = optional_import("decord", "cpu")
 # client can discover and clean up tool-generated image files after each
 # request finishes.
 _TOOL_SAVED_IMAGE_RE = re.compile(r"Saved drawn image to:\s*(\S+)")
+_HIDDEN_TOOL_ARGS = {"image_path"}
+_IMAGE_REGISTRY_ENV = "LMMS_EVAL_IMAGE_REGISTRY"
 
 # Env var carrying the per-call image registry (img_idx -> file path) to the MCP
 # tool subprocess, so tools resolve img_idx the way training does. Keep in sync
@@ -148,6 +150,32 @@ class AsyncOpenAIChat(lmms):
         self._task_tools_cache = {}
         self._task_system_prompt_cache = {}
 
+        # If system_prompt contains placeholders, fill them in
+        if self.system_prompt and self.mcp_client is not None:
+            from datetime import datetime
+            # Handle YAML-like format (Section: | content) by extracting just the content
+            if "Role: |" in self.system_prompt or "Tools: |" in self.system_prompt:
+                import re
+                sections = re.split(r'\n[A-Z][a-z]+:\s*\|\n', self.system_prompt)
+                # Remove empty first element and join sections
+                self.system_prompt = "\n".join(s.strip() for s in sections if s.strip())
+
+            if "{tools}" in self.system_prompt:
+                tool_list = self._rewrite_tool_schemas_for_model(self.mcp_client.get_function_list_sync())
+                self._tool_functions = tool_list  # Cache for later use
+                tools_str = "\n".join(json.dumps(t) for t in tool_list)
+                self.system_prompt = self.system_prompt.replace("{tools}", tools_str)
+                eval_logger.info(f"Injected {len(tool_list)} tools into system prompt")
+
+            # Handle other placeholders
+            if "{date}" in self.system_prompt:
+                self.system_prompt = self.system_prompt.replace("{date}", datetime.now().strftime("%Y-%m-%d"))
+            if "{examples}" in self.system_prompt:
+                self.system_prompt = self.system_prompt.replace("{examples}", "(No examples provided)")
+            if "{schema}" in self.system_prompt:
+                schema = '{"name": "<function-name>", "arguments": <args-json-object>}'
+                self.system_prompt = self.system_prompt.replace("{schema}", schema)
+
         accelerator = Accelerator()
         # assert self.batch_size_per_gpu == 1, "Llava currently does not support batched generation. See https://github.com/haotian-liu/LLaVA/issues/754. HF Llava also has this issue."
         if accelerator.num_processes > 1:
@@ -176,6 +204,32 @@ class AsyncOpenAIChat(lmms):
     @property
     def batch_size(self):
         return self.batch_size_per_gpu
+
+    def _rewrite_tool_schemas_for_model(self, tool_list):
+        rewritten = []
+        for tool in tool_list:
+            if tool.get("type") != "function":
+                rewritten.append(tool)
+                continue
+            function = tool.get("function", {})
+            parameters = function.get("parameters")
+            if not isinstance(parameters, dict):
+                rewritten.append(tool)
+                continue
+            properties = parameters.get("properties")
+            if not isinstance(properties, dict):
+                rewritten.append(tool)
+                continue
+
+            tool_copy = json.loads(json.dumps(tool))
+            properties = tool_copy["function"]["parameters"].setdefault("properties", {})
+            for hidden_arg in _HIDDEN_TOOL_ARGS:
+                properties.pop(hidden_arg, None)
+            required = tool_copy["function"]["parameters"].get("required")
+            if isinstance(required, list):
+                tool_copy["function"]["parameters"]["required"] = [key for key in required if key not in _HIDDEN_TOOL_ARGS]
+            rewritten.append(tool_copy)
+        return rewritten
 
     @property
     def rank(self):
@@ -295,6 +349,8 @@ class AsyncOpenAIChat(lmms):
         # delete them after the model finishes answering (avoids unbounded
         # accumulation of input copies and chained tool outputs on disk).
         request_image_paths: List[str] = []
+        image_registry: Dict[int, str] = {}
+        next_img_idx = 0
 
         def _cleanup_request_images():
             for path in request_image_paths:
@@ -348,13 +404,6 @@ class AsyncOpenAIChat(lmms):
                 gen_kwargs["temperature"] = 0
             payload["max_tokens"] = gen_kwargs["max_new_tokens"]
             payload["temperature"] = gen_kwargs["temperature"]
-            # Forward the FULL per-yaml sampling. Previously only max_tokens+temperature
-            # were sent, silently dropping top_p/top_k/penalties and collapsing the
-            # per-model templates (see memory multiturn-tool-eval-design). top_p /
-            # presence_penalty / frequency_penalty are OpenAI-native; top_k /
-            # repetition_penalty / min_p are forwarded through vLLM's extra_body.
-            # NOTE: we deliberately do NOT forward 'until'/'stop' (the harness injects
-            # until=["\n\n"], which would truncate CoT/tool reasoning mid-stream).
             if gen_kwargs.get("top_p") is not None:
                 payload["top_p"] = gen_kwargs["top_p"]
             for _sp in ("presence_penalty", "frequency_penalty"):
@@ -369,8 +418,6 @@ class AsyncOpenAIChat(lmms):
 
             terminal_tools = set()
             if self.mcp_client is not None:
-                # Fetch the tool/function list ONCE and cache it (avoids forking the
-                # MCP server subprocess on every request via get_function_list).
                 if self._tool_functions is None:
                     self._tool_functions = await self.mcp_client.get_function_list()
                 functions, terminal_tools = self._resolve_task_tools(task)
@@ -379,7 +426,6 @@ class AsyncOpenAIChat(lmms):
 
             response = await self.client.chat.completions.create(**payload)
             last_response = response.choices[0].message.content or ""
-            # Extract usage metrics
             input_tokens = 0
             output_tokens = 0
             reasoning_tokens = 0
@@ -399,7 +445,6 @@ class AsyncOpenAIChat(lmms):
                 reasoning_tokens=reasoning_tokens,
                 source="model",
             )
-            # Sometimes asyncio return None, skip this case
             try:
                 all_response += last_response
             except Exception as e:
@@ -411,9 +456,6 @@ class AsyncOpenAIChat(lmms):
             while response.choices[0].finish_reason == "tool_calls" and tool_iteration < self.max_tool_iterations:
                 tool_iteration += 1
                 assistant_message = response.choices[0].message
-                # Canonical OpenAI shape: ONE assistant message carrying both the
-                # content and the tool_calls (each with its id), followed by one
-                # role="tool" message per call keyed by the matching tool_call_id.
                 assistant_dict = {"role": "assistant", "content": assistant_message.content or ""}
                 if assistant_message.tool_calls:
                     assistant_dict["tool_calls"] = [
@@ -425,8 +467,6 @@ class AsyncOpenAIChat(lmms):
                         for tc in assistant_message.tool_calls
                     ]
                 messages.append(assistant_dict)
-                # NOTE: assistant_message.content was already folded into all_response
-                # (before the loop on the 1st pass, at the loop tail afterwards).
 
                 pending_user_images = []
                 for call in (assistant_message.tool_calls or []):
@@ -451,8 +491,6 @@ class AsyncOpenAIChat(lmms):
                         for content in result.content:
                             raw_parts.extend(self.mcp_client.convert_result_to_openai_format(content))
                     except Exception as exc:
-                        # Fault-tolerant: feed the error back as the tool result so the
-                        # model can recover within the same request (Qwen-Agent pattern).
                         eval_logger.warning(f"Tool {call.function.name} failed: {exc}")
                         raw_parts = [{"type": "text", "text": f"Tool {call.function.name} failed: {exc}"}]
 
@@ -461,7 +499,7 @@ class AsyncOpenAIChat(lmms):
                     for part in raw_parts:
                         if part.get("type") == "image_url":
                             if tool_image_count >= self.max_tool_images:
-                                continue  # cap tool images to keep context under max-model-len
+                                continue
                             tool_image_count += 1
                             all_response += "<image_url>"
                             kept_parts.append(part)
@@ -488,9 +526,6 @@ class AsyncOpenAIChat(lmms):
                     all_response += "</tool_response>"
 
                     if self.tool_image_as_user_turn:
-                        # Fallback path: keep the tool result text-only and re-home any
-                        # returned image(s) as a follow-up user turn (for servers/chat
-                        # templates that drop image parts inside a role="tool" message).
                         text_parts = [p for p in kept_parts if p.get("type") == "text"]
                         if not text_parts:
                             text_parts = [{"type": "text", "text": "(tool returned an image; shown below)"}]
@@ -519,7 +554,6 @@ class AsyncOpenAIChat(lmms):
 
                 payload["messages"] = messages
                 response = await self.client.chat.completions.create(**payload)
-                # Extract usage metrics
                 input_tokens = 0
                 output_tokens = 0
                 reasoning_tokens = 0

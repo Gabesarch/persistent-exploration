@@ -49,7 +49,7 @@ fi
 set -u
 
 LIMIT="${LIMIT:-10}"
-PORT="${PORT:-9001}"; API_KEY="${API_KEY:-qwen}"
+PORT="${PORT:-9000}"; API_KEY="${API_KEY:-qwen}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-$VERO_EVAL_DIR/results/countqa_10}"
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-$VERO_EVAL_DIR/prompts/countqa_system_prompt.txt}"
 export VLLM_USE_FLASHINFER_SAMPLER=0

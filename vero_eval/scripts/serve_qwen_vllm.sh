@@ -26,6 +26,8 @@ set -u
 : "${CHECKPOINT_PATH:?set CHECKPOINT_PATH in set_paths.sh}"
 PORT="${PORT:-9001}"; MODEL_NAME="${MODEL_NAME:-qwen_vllm}"
 API_KEY="${API_KEY:-qwen}"; NUM_GPUS="${NUM_GPUS:-1}"
+# Set CUSTOM_CHAT_TEMPLATE to use a custom template (e.g., one that doesn't auto-inject tools)
+CUSTOM_CHAT_TEMPLATE="${CUSTOM_CHAT_TEMPLATE:-}"
 
 LOG_DIR="${LOG_DIR:-$VERO_EVAL_DIR/logs/vllm}"
 mkdir -p "$LOG_DIR"
@@ -51,6 +53,8 @@ CHAT_TEMPLATE_ARGS=()
 [[ -n "$CHAT_TEMPLATE" ]] && CHAT_TEMPLATE_ARGS=(--chat-template "$CHAT_TEMPLATE") && echo "Using chat template: $CHAT_TEMPLATE"
 
 echo "Starting vLLM server (log: $LOGFILE)..."
+CHAT_TEMPLATE_ARG=""
+[[ -n "$CUSTOM_CHAT_TEMPLATE" ]] && CHAT_TEMPLATE_ARG="--chat-template $CUSTOM_CHAT_TEMPLATE"
 nohup vllm serve "$CHECKPOINT_PATH" \
   --port "$PORT" \
   --served-model-name "$MODEL_NAME" \
@@ -66,6 +70,7 @@ nohup vllm serve "$CHECKPOINT_PATH" \
   --tool-call-parser hermes \
   "${CHAT_TEMPLATE_ARGS[@]}" \
   --enforce-eager \
+  $CHAT_TEMPLATE_ARG \
   > "$LOGFILE" 2>&1 &
 disown
 
