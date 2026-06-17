@@ -657,15 +657,12 @@ class ImageZoomInTool(BaseTool):
 
         response_text = f"Zoomed in on the image to the region {bbox_2d} with label {label}."
         if self.image_indexing == "multi_index":
-            # Announce the crop's new addressable index (it is appended to
-            # agent_data.image_data, so its index is the current image count) and hint that
-            # the model may zoom into it. Wording matches the vero_eval multi_index variant.
+            # Announce the crop's new addressable index (it is appended to agent_data.image_data,
+            # so its index is the current image count). Inform-only: it tells the model the crop
+            # is accessible without nudging it to always zoom further. Matches the vero_eval variant.
             new_idx = self._processed_image_count(kwargs.get("agent_data"))
             if new_idx is not None:
-                response_text += (
-                    f" The cropped view is now available as img_idx {new_idx}; "
-                    f"you can zoom into it (or img_idx 0, the original) for a closer look."
-                )
+                response_text += f" The cropped view is now available as img_idx {new_idx}."
 
         return (
             ToolResponse(

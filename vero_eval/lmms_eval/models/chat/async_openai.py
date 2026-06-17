@@ -390,8 +390,9 @@ class AsyncOpenAIChat(lmms):
                 bbox_str = str(bbox)
             wording = f"Zoomed in on the image to the region {bbox_str} with label {label}."
             if mode == "multi_index":
-                wording += (f" The cropped view is now available as img_idx {assigned_idx}; "
-                            f"you can zoom into it (or img_idx 0, the original) for a closer look.")
+                # Inform-only: announce the crop is addressable, without nudging the model to
+                # always zoom further (avoids biasing it toward an extra "closer look").
+                wording += f" The cropped view is now available as img_idx {assigned_idx}."
             return wording
         return f"Registered image as img_idx {assigned_idx}."
 
