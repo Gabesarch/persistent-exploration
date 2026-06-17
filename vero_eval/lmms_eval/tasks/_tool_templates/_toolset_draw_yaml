@@ -12,15 +12,11 @@
 # in the eval produces a mask_path for them to consume.
 metadata:
   allowed_tools:
-    - draw_box
-    - draw_numbered_boxes
-    - draw_numbered_points
-    - draw_grid
-    - draw_circle
-    - draw_line
-    - draw_arrow
-    - draw_text
-    - draw_polygon
+    - draw_boxes
+    - draw_points
+    - draw_lines
+    - draw_texts
+    - draw_polygons
   system_prompt_files:
     - prompts/tools/system_base.txt
     - prompts/tools/system_draw.txt
