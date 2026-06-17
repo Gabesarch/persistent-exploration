@@ -207,6 +207,17 @@ class ImageZoomInTool(BaseTool):
         self.use_original_resolution_source = bool(config.get("use_original_resolution_source", False))
         self.original_source_unavailable_policy = config.get("original_source_unavailable_policy", "fallback")
         self.crop_cache_root = config.get("crop_cache_root")
+        # image_indexing mirrors the vero_eval per-task knob so training and eval stay
+        # consistent. "training_faithful" (default) keeps the original tool-response wording.
+        # "multi_index" additionally tells the model the crop is available as a NEW img_idx it
+        # can zoom into; the crop is appended to agent_data.image_data, so that index resolves
+        # on a later call. Default preserves existing runs exactly.
+        self.image_indexing = config.get("image_indexing", "training_faithful")
+        if self.image_indexing not in ("training_faithful", "multi_index"):
+            raise ValueError(
+                "image_indexing must be 'training_faithful' or 'multi_index', "
+                f"got {self.image_indexing!r}."
+            )
         if self.original_source_unavailable_policy not in ("fallback", "error"):
             raise ValueError(
                 "original_source_unavailable_policy must be either 'fallback' or 'error', "
@@ -565,8 +576,17 @@ class ImageZoomInTool(BaseTool):
                 debug_info.update(e.source_info)
             return self._terminal_error_response(str(e), debug_info)
 
-        response_text = f"Zoomed in on the image to the region {bbox_2d}."
         response_text = f"Zoomed in on the image to the region {bbox_2d} with label {label}."
+        if self.image_indexing == "multi_index":
+            # Announce the crop's new addressable index (it is appended to
+            # agent_data.image_data, so its index is the current image count) and hint that
+            # the model may zoom into it. Wording matches the vero_eval multi_index variant.
+            new_idx = self._processed_image_count(kwargs.get("agent_data"))
+            if new_idx is not None:
+                response_text += (
+                    f" The cropped view is now available as img_idx {new_idx}; "
+                    f"you can zoom into it (or img_idx 0, the original) for a closer look."
+                )
 
         return (
             ToolResponse(
