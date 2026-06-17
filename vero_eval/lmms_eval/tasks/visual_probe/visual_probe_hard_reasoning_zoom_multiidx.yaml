@@ -1,0 +1,28 @@
+# Vero (RL thinking checkpoint) + ZOOM on VisualProbe-Hard — MULTI-INDEX variant.
+#
+# Single-variable ablation against visual_probe_hard_reasoning_zoom (the training-faithful
+# replication): the system prompt, tool schema, bare question and forced-<think> primer are
+# IDENTICAL (turn-1 input stays byte-identical to training). The ONLY difference is the
+# tool_response: each crop is registered as a NEW img_idx and the model is HINTED that it can
+# zoom into it (img_idx 1, 2, ...). Training never did this (581/581 calls used img_idx 0);
+# this tests whether Vero uses the added affordance. Keeping the hint in the tool_response
+# (not the system prompt) is what preserves turn-1 input parity.
+# Run with MODEL=vero TOOLS=on.
+include:
+  - visual_probe_hard.yaml
+  - ../_tool_templates/_toolset_zoom_vero_yaml
+task: "visual_probe_hard_reasoning_zoom_multiidx"
+tag: visual_search
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 0.7
+  do_sample: True
+lmms_eval_specific_kwargs:
+  default:
+    # Same training-faithful user turn as the replication task (see that file): pre_prompt
+    # "\n" reproduces training's "user\n\n{question}" byte-for-byte. Turn-1 input is identical
+    # to training; only the multi-turn tool_response differs (image_indexing: multi_index).
+    pre_prompt: "\n"
+    post_prompt: ""
+metadata:
+  image_indexing: multi_index
