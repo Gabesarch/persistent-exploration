@@ -1,0 +1,20 @@
+# Vero (RL thinking checkpoint) + DRAWING toolset on VisualProbe-Hard.
+# Vero bakes its own think/boxed prompt + tool instructions into its chat
+# template and ignores passed system messages, so we offer the draw tools but
+# pass no system fragments (system_prompt_files: []). NOTE: Vero was trained with
+# the zoom tool only, so this measures zero-shot use of the drawing tools.
+include:
+  - visual_probe_hard.yaml
+  - ../_tool_templates/_toolset_draw_yaml
+task: "visual_probe_hard_reasoning_draw"
+tag: visual_search
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 0.6
+  do_sample: True
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: ""
+    post_prompt: ""
+metadata:
+  system_prompt_files: []

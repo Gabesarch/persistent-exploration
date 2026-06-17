@@ -15,6 +15,7 @@ declare -gA DOMAIN_TASK_BASES=(
   [grounding_counting_search]="countbenchqa countqa mme_realworld_lite vstar_bench aerialvg_bbox visual_probe_easy visual_probe_medium visual_probe_hard screenspot_point_in_box screenspotpro_point_in_box"
   [instruction_following]="mia_bench mm_mt_bench mmifeval"
   [ball_drop]="balldrop"
+  [vlms_are_biased]="vlms_are_biased"
 )
 # The canonical content domains (order matters for `all`).
 VERO_DOMAINS=(chart_ocr stem spatial_action knowledge_rec grounding_counting_search instruction_following)

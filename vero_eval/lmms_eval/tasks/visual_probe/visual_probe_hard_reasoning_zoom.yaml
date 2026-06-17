@@ -1,0 +1,37 @@
+# Vero (RL thinking checkpoint) + ZOOM on VisualProbe-Hard — TRAINING-FAITHFUL REPLICATION.
+#
+# Reproduces the RL training INPUT word-by-word for image_zoom_in_tool (verified
+# byte-identical to the checkpoint's validation_data/403.jsonl turn-1 input):
+#   - system prompt = training Layer A (system_vero_reasoning.txt, passed as the system
+#     message) + the served chat_template's appended "# Tools" block + tool schema.
+#   - tool schema = the EXACT training schema (via _toolset_zoom_vero_yaml's
+#     tool_schema_overrides; the FastMCP-introspected schema differs in order/types/keys).
+#   - bare question (no pre/post prompt) + forced-<think> generation primer.
+#   - image_indexing: training_faithful -> tool_response is exactly
+#     "Zoomed in on the image to the region [x1, y1, x2, y2] with label {label}." (the crop
+#      is registered internally but NOT announced; training used img_idx 0 in 581/581 calls).
+#
+# IMPORTANT: the served chat_template.jinja renders the PASSED system message (Layer A),
+# then appends "# Tools" — it does NOT bake Layer A. So Layer A MUST be passed via
+# system_prompt_files (the _toolset_zoom_vero_yaml does this); passing [] drops all of it.
+# Run with MODEL=vero TOOLS=on. For the multi-image-index variant see
+# visual_probe_hard_reasoning_zoom_multiidx.yaml.
+include:
+  - visual_probe_hard.yaml
+  - ../_tool_templates/_toolset_zoom_vero_yaml
+task: "visual_probe_hard_reasoning_zoom"
+tag: visual_search
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 0.7
+  do_sample: True
+lmms_eval_specific_kwargs:
+  default:
+    # Training's user turn is "<image>\n{question}", which decodes to "user\n\n{question}".
+    # The served chat template emits no newline after the image, so that separator newline
+    # must live in the text. pre_prompt "\n" reproduces training's user turn byte-for-byte
+    # (verified against 403.jsonl). It does NOT add a final-answer instruction.
+    pre_prompt: "\n"
+    post_prompt: ""
+metadata:
+  image_indexing: training_faithful

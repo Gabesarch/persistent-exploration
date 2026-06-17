@@ -13,15 +13,15 @@ git clone https://github.com/gabesarch/vero2
 ### Create / Update Conda Environment
 We use a single environment matching `docker/Dockerfile.stable.vllm`:
 ```bash
-conda create -p /scratch/gpfs/ZHUANGL/gs1693/conda/vero2 python=3.12 -y
+conda create -n vero2 python=3.12 -y
 
-conda activate /scratch/gpfs/ZHUANGL/gs1693/conda/vero2
+conda activate vero2
 pip install uv
 module load cudatoolkit/12.9
 module load gcc/11
 
 python -m pip install --no-cache-dir --force-reinstall \
-  torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 \
+  torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
   --index-url https://download.pytorch.org/whl/cu129
 
 uv pip install -e ".[verl]"
@@ -42,6 +42,21 @@ python -m pip install --no-build-isolation flash-attn==2.8.3
 uv pip install pybase64 msgspec math_verify langdetect nltk latex2sympy2_extended 
 uv pip install liger-kernel
 uv pip install flash-linear-attention
+
+# Install lmms-eval dependencies for evaluation.
+# If a wheel download fails with IncompleteRead, rerun the same command with
+# --no-cache-dir so pip does not reuse the partial download.
+python -m pip install --no-cache-dir \
+    sacrebleu zss zstandard transformers-stream-generator yt-dlp \
+    timm tqdm-multiprocess evaluate sqlitedict tenacity sentence_transformers \
+    pytablewriter Levenshtein matplotlib
+
+# The bundled lmms_eval tree is not a standalone pip project. Run it from its
+# parent directory, or add that directory to PYTHONPATH before invoking it.
+export PYTHONPATH="$PWD/tools_scratch/eval:${PYTHONPATH:-}"
+cd tools_scratch/eval
+python -m lmms_eval --help
+cd ../..
 ```
 
 ### Setup

@@ -1,4 +1,5 @@
 import asyncio
+import fnmatch
 import json
 import os
 import re
@@ -7,7 +8,7 @@ import tempfile
 import time
 import uuid
 from multiprocessing import cpu_count
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from accelerate import Accelerator, DistributedType
 from dotenv import load_dotenv
@@ -41,6 +42,48 @@ cpu, _ = optional_import("decord", "cpu")
 # client can discover and clean up tool-generated image files after each
 # request finishes.
 _TOOL_SAVED_IMAGE_RE = re.compile(r"Saved drawn image to:\s*(\S+)")
+_HIDDEN_TOOL_ARGS = {"image_path"}
+_IMAGE_REGISTRY_ENV = "LMMS_EVAL_IMAGE_REGISTRY"
+
+# Env var carrying the per-call image registry (img_idx -> file path) to the MCP
+# tool subprocess, so tools resolve img_idx the way training does. Keep in sync
+# with lmms_eval/mcp/vero2_mcp.py _IMAGE_REGISTRY_ENV.
+_IMAGE_REGISTRY_ENV = "LMMS_EVAL_IMAGE_REGISTRY"
+
+# vero_eval package root (parent of lmms_eval), used to resolve the relative
+# system_prompt_files paths declared in task yamls (e.g. prompts/tools/*.txt).
+_VERO_EVAL_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+
+def _composite_zoom_to_original(image_provenance, img_idx, bbox):
+    """Remap a zoom-into-img_idx call so it crops the ROOT original at NATIVE resolution.
+
+    Each img_idx has provenance (orig_idx, region=[X1,Y1,X2,Y2]) = the native-pixel rectangle of
+    original `orig_idx` that this image represents. The model's 0-1000 bbox (on the image it sees)
+    is composited into the original's native pixels (region_origin + bbox/1000*region_span), then
+    re-expressed as a 0-1000 bbox of the ORIGINAL so the (unchanged) MCP tool, called with
+    img_idx=orig_idx, crops the original PNG at full resolution instead of re-cropping a resized
+    crop. Mirrors the training tool's in-tool compositing. Returns
+    (orig_idx, native_subregion, bbox_in_original_0_1000) or None if no provenance.
+    For an original (region = full image) this is a no-op: bbox' == bbox, orig_idx == img_idx."""
+    prov = image_provenance.get(img_idx)
+    root = image_provenance.get(prov[0]) if prov is not None else None
+    if prov is None or root is None:
+        return None
+    orig_idx, region = prov
+    x1, y1, x2, y2 = region
+    rw, rh = x2 - x1, y2 - y1
+    nsub = [
+        x1 + bbox[0] / 1000.0 * rw, y1 + bbox[1] / 1000.0 * rh,
+        x1 + bbox[2] / 1000.0 * rw, y1 + bbox[3] / 1000.0 * rh,
+    ]
+    w_orig, h_orig = root[1][2], root[1][3]  # root region is [0,0,W,H] (full original, native)
+    bbox_prime = [
+        nsub[0] / w_orig * 1000.0, nsub[1] / h_orig * 1000.0,
+        nsub[2] / w_orig * 1000.0, nsub[3] / h_orig * 1000.0,
+    ]
+    return orig_idx, nsub, bbox_prime
+
 
 load_dotenv(verbose=True)
 
@@ -135,6 +178,34 @@ class AsyncOpenAIChat(lmms):
         self.max_tool_images = int(max_tool_images)
         self.tool_image_as_user_turn = parse_bool(tool_image_as_user_turn)
         self._tool_functions = None
+        self._task_tools_cache = {}
+        self._task_system_prompt_cache = {}
+
+        # If system_prompt contains placeholders, fill them in
+        if self.system_prompt and self.mcp_client is not None:
+            from datetime import datetime
+            # Handle YAML-like format (Section: | content) by extracting just the content
+            if "Role: |" in self.system_prompt or "Tools: |" in self.system_prompt:
+                import re
+                sections = re.split(r'\n[A-Z][a-z]+:\s*\|\n', self.system_prompt)
+                # Remove empty first element and join sections
+                self.system_prompt = "\n".join(s.strip() for s in sections if s.strip())
+
+            if "{tools}" in self.system_prompt:
+                tool_list = self._rewrite_tool_schemas_for_model(self.mcp_client.get_function_list_sync())
+                self._tool_functions = tool_list  # Cache for later use
+                tools_str = "\n".join(json.dumps(t) for t in tool_list)
+                self.system_prompt = self.system_prompt.replace("{tools}", tools_str)
+                eval_logger.info(f"Injected {len(tool_list)} tools into system prompt")
+
+            # Handle other placeholders
+            if "{date}" in self.system_prompt:
+                self.system_prompt = self.system_prompt.replace("{date}", datetime.now().strftime("%Y-%m-%d"))
+            if "{examples}" in self.system_prompt:
+                self.system_prompt = self.system_prompt.replace("{examples}", "(No examples provided)")
+            if "{schema}" in self.system_prompt:
+                schema = '{"name": "<function-name>", "arguments": <args-json-object>}'
+                self.system_prompt = self.system_prompt.replace("{schema}", schema)
 
         accelerator = Accelerator()
         # assert self.batch_size_per_gpu == 1, "Llava currently does not support batched generation. See https://github.com/haotian-liu/LLaVA/issues/754. HF Llava also has this issue."
@@ -165,6 +236,32 @@ class AsyncOpenAIChat(lmms):
     def batch_size(self):
         return self.batch_size_per_gpu
 
+    def _rewrite_tool_schemas_for_model(self, tool_list):
+        rewritten = []
+        for tool in tool_list:
+            if tool.get("type") != "function":
+                rewritten.append(tool)
+                continue
+            function = tool.get("function", {})
+            parameters = function.get("parameters")
+            if not isinstance(parameters, dict):
+                rewritten.append(tool)
+                continue
+            properties = parameters.get("properties")
+            if not isinstance(properties, dict):
+                rewritten.append(tool)
+                continue
+
+            tool_copy = json.loads(json.dumps(tool))
+            properties = tool_copy["function"]["parameters"].setdefault("properties", {})
+            for hidden_arg in _HIDDEN_TOOL_ARGS:
+                properties.pop(hidden_arg, None)
+            required = tool_copy["function"]["parameters"].get("required")
+            if isinstance(required, list):
+                tool_copy["function"]["parameters"]["required"] = [key for key in required if key not in _HIDDEN_TOOL_ARGS]
+            rewritten.append(tool_copy)
+        return rewritten
+
     @property
     def rank(self):
         return self._rank
@@ -172,6 +269,132 @@ class AsyncOpenAIChat(lmms):
     @property
     def world_size(self):
         return self._world_size
+
+    def _resolve_task_system_prompt(self, task: str) -> Optional[str]:
+        """Build the turn-0 system prompt for a task by concatenating, in order:
+
+        1. the run-wide ``system_prompt`` model_arg (if set, e.g. via SYSTEM_PROMPT);
+        2. each file listed in the task yaml's ``metadata.system_prompt_files``.
+
+        This is what makes the prompt modular: a task includes a toolset template
+        (``prompts/tools/system_base.txt`` + ``system_zoom.txt`` / ``system_draw.txt``)
+        and the fragments concatenate here. The model's chat template then appends
+        its own ``# Tools`` / ``<tools>`` schema block after this system text, so the
+        final system message is base (+ run-wide) (+ toolset) (+ rendered schemas).
+
+        Paths in ``system_prompt_files`` resolve as-is if absolute/cwd-relative,
+        else against the vero_eval package root. A listed-but-missing file is a
+        hard error (a silently dropped system prompt would corrupt the whole run).
+        Returns ``None`` when neither source yields any text. Cached per task.
+        """
+        if task in self._task_system_prompt_cache:
+            return self._task_system_prompt_cache[task]
+        fragments: List[str] = []
+        if self.system_prompt:
+            fragments.append(self.system_prompt.strip())
+        meta = self.task_metadata.get(task) or {}
+        files = meta.get("system_prompt_files") or []
+        if isinstance(files, str):
+            files = [files]
+        # Some checkpoints' chat templates append a fixed "\n\n" + tool block right
+        # after the system message, so a fragment's own trailing newline is part of the
+        # byte-exact seam (e.g. Vero training: Layer A ends "...```\n" and the template
+        # adds "\n\n" -> 3 newlines before "# Tools"). Opt in per task to preserve it;
+        # default strips (intended for the single training-faithful fragment case).
+        preserve_trailing_newline = bool(meta.get("system_prompt_preserve_trailing_newline"))
+        for rel in files:
+            path = rel if os.path.isabs(rel) else rel
+            if not os.path.isfile(path):
+                path = os.path.join(_VERO_EVAL_ROOT, rel)
+            if not os.path.isfile(path):
+                raise ValueError(f"Task '{task}': system_prompt_files entry '{rel}' not found " f"(looked at '{rel}' and '{os.path.join(_VERO_EVAL_ROOT, rel)}'). Fix the path in the task yaml metadata.")
+            with open(path, "r") as fh:
+                content = fh.read()
+            fragments.append(content if preserve_trailing_newline else content.strip())
+        resolved = "\n\n".join(f for f in fragments if f) or None
+        self._task_system_prompt_cache[task] = resolved
+        if resolved:
+            eval_logger.info(f"Task '{task}': system prompt = {len(fragments)} fragment(s), {len(resolved)} chars")
+        return resolved
+
+    def _resolve_task_tools(self, task: str):
+        """Resolve the per-task tool view from the task yaml's `metadata` block:
+
+        - ``allowed_tools``: list of MCP tool names or fnmatch patterns (e.g.
+          ``["image_zoom_in_tool"]`` or ``["draw_*"]``). Absent/empty = offer
+          every tool the MCP server exposes (backwards-compatible default).
+        - ``extra_tools``: extra OpenAI function specs offered to the model but
+          NOT backed by the MCP server (answer-protocol tools such as
+          screenspot's ``computer_use``). Given verbatim in the yaml.
+        - ``terminal_tools``: tool names whose call ENDS the episode — the call
+          is recorded in the transcript as the final answer and never executed.
+
+        Returns ``(functions, terminal_tool_names)``; cached per task.
+        """
+        if task in self._task_tools_cache:
+            return self._task_tools_cache[task]
+        meta = self.task_metadata.get(task) or {}
+        functions = list(self._tool_functions or [])
+        allowed = meta.get("allowed_tools")
+        if allowed:
+            if isinstance(allowed, str):
+                allowed = [p.strip() for p in allowed.split(",") if p.strip()]
+            functions = [f for f in functions if any(fnmatch.fnmatchcase(f["function"]["name"], pat) for pat in allowed)]
+            if not functions:
+                server_tools = [f["function"]["name"] for f in (self._tool_functions or [])]
+                raise ValueError(f"Task '{task}': allowed_tools={allowed} matched none of the MCP server tools {server_tools}. " f"Fix the task yaml metadata or the MCP server at the configured mcp_server_path.")
+        extra = meta.get("extra_tools") or []
+        functions = functions + list(extra)
+        # Per-task tool-schema overrides: replace the FastMCP-introspected `description`
+        # and/or `parameters` of a named tool with an authored schema. Used to render the
+        # offered tool JSON byte-identical to the RL training tool schema (whose property
+        # order/types/keys differ from the Python-signature-derived one). The tool stays
+        # backed by the MCP server (execution by name); only the advertised schema changes.
+        overrides = meta.get("tool_schema_overrides") or {}
+        if overrides:
+            pinned = []
+            for f in functions:
+                ov = overrides.get(f.get("function", {}).get("name"))
+                if ov:
+                    f = json.loads(json.dumps(f))  # deep copy; don't mutate the shared MCP spec
+                    if "description" in ov:
+                        f["function"]["description"] = ov["description"]
+                    if "parameters" in ov:
+                        f["function"]["parameters"] = json.loads(json.dumps(ov["parameters"]))
+                pinned.append(f)
+            functions = pinned
+        terminal = {str(name) for name in (meta.get("terminal_tools") or [])}
+        self._task_tools_cache[task] = (functions, terminal)
+        offered = [f["function"]["name"] for f in functions]
+        eval_logger.info(f"Task '{task}': offering tools {offered}" + (f" (terminal: {sorted(terminal)})" if terminal else ""))
+        return functions, terminal
+
+    def _tool_image_registered_text(self, mode, tool_name, tool_args, assigned_idx):
+        """Model-visible text that replaces a tool's 'Saved drawn image to:' sentinel.
+
+        For the zoom tool under the training-faithful image_indexing modes, reproduce the
+        RL environment's <tool_response> wording 'Zoomed in on the image to the region
+        [x1, y1, x2, y2] with label {label}.' (built from the call's bbox_2d/label):
+          - ``training_faithful``: that sentence ONLY (training never announced new
+            indices; 581/581 training calls used img_idx 0).
+          - ``multi_index``: that sentence + a hint that the crop is available as a new
+            img_idx and can be zoomed into (the only divergence from training).
+        Otherwise (default) keep the generic 'Registered image as img_idx N.'.
+        """
+        if mode in ("training_faithful", "multi_index") and tool_name == "image_zoom_in_tool":
+            bbox = (tool_args or {}).get("bbox_2d")
+            label = (tool_args or {}).get("label")
+            if isinstance(bbox, (list, tuple)):
+                bbox_str = "[" + ", ".join(str(int(v)) for v in bbox) + "]"
+            else:
+                bbox_str = str(bbox)
+            wording = f"Zoomed in on the image to the region {bbox_str} with label {label}."
+            if mode == "multi_index":
+                # Inform-only: announce the crop is addressable, without nudging the model to
+                # always zoom further (avoids biasing it toward an extra "closer look").
+                wording += f" The cropped view is now available as img_idx {assigned_idx}."
+            return wording
+        return f"Registered image as img_idx {assigned_idx}."
 
     def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
         assert False, "TODO, not implemented"
@@ -202,12 +425,15 @@ class AsyncOpenAIChat(lmms):
             messages = chat_messages.to_qwen3_vl_openai_messages(video_kwargs)
         else:
             messages = chat_messages.to_openai_messages(video_kwargs)
-        messages = self._apply_system_prompt(messages, self.system_prompt) if self.system_prompt else messages
+        task_system_prompt = self._resolve_task_system_prompt(task)
+        messages = self._apply_system_prompt(messages, task_system_prompt) if task_system_prompt else messages
         images, videos, audios = chat_messages.extract_media()
         # Track every image file that belongs to this request so we can
         # delete them after the model finishes answering (avoids unbounded
         # accumulation of input copies and chained tool outputs on disk).
         request_image_paths: List[str] = []
+        image_registry: Dict[int, str] = {}
+        next_img_idx = 0
 
         def _cleanup_request_images():
             for path in request_image_paths:
@@ -218,15 +444,32 @@ class AsyncOpenAIChat(lmms):
                 except OSError as exc:
                     eval_logger.debug(f"Failed to remove tool image {path}: {exc}")
 
+        # Image addressing by index (img_idx), matching training: the model is told
+        # each image's img_idx and never sees a path; tools resolve img_idx -> path
+        # via the registry passed in LMMS_EVAL_IMAGE_REGISTRY. Tool-produced images
+        # get appended with a new img_idx below (mirrors agent_data.image_data growth).
+        image_registry: Dict[int, str] = {}
+        # Provenance for original-resolution crop compositing: {img_idx: (orig_idx, [x1,y1,x2,y2])}
+        # = the native-pixel rectangle of original `orig_idx` that this image represents. Seeded
+        # for each initial image as (itself, full native bounds); crops get composited regions.
+        # A zoom into a crop is remapped to crop the ROOT original at native resolution (see
+        # _composite_zoom_to_original) so chained / multi-index zooms keep full detail.
+        image_provenance: Dict[int, tuple] = {}
+        next_img_idx = 0
         if self.mcp_client is not None:
             for image_idx, image in enumerate(images):
-                image_path = os.path.join(self.work_dir, f"{uuid.uuid4()}.jpg")
-                image.save(image_path)
+                # Save losslessly at ORIGINAL resolution (PNG), matching training's
+                # use_original_resolution_source — NOT a lossy/downscaled JPEG.
+                image_path = os.path.join(self.work_dir, f"{uuid.uuid4()}.png")
+                image.save(image_path, format="PNG")
                 request_image_paths.append(image_path)
+                image_registry[next_img_idx] = image_path
+                image_provenance[next_img_idx] = (next_img_idx, [0.0, 0.0, float(image.width), float(image.height)])
+                next_img_idx += 1
                 messages[-1]["content"].append(
                     {
                         "type": "text",
-                        "text": f"\nImage {image_idx} has image path: {image_path}",
+                        "text": f"\nImage {image_idx} is available as img_idx={image_idx}.",
                     }
                 )
             for video_idx, video in enumerate(videos):
@@ -251,13 +494,6 @@ class AsyncOpenAIChat(lmms):
                 gen_kwargs["temperature"] = 0
             payload["max_tokens"] = gen_kwargs["max_new_tokens"]
             payload["temperature"] = gen_kwargs["temperature"]
-            # Forward the FULL per-yaml sampling. Previously only max_tokens+temperature
-            # were sent, silently dropping top_p/top_k/penalties and collapsing the
-            # per-model templates (see memory multiturn-tool-eval-design). top_p /
-            # presence_penalty / frequency_penalty are OpenAI-native; top_k /
-            # repetition_penalty / min_p are forwarded through vLLM's extra_body.
-            # NOTE: we deliberately do NOT forward 'until'/'stop' (the harness injects
-            # until=["\n\n"], which would truncate CoT/tool reasoning mid-stream).
             if gen_kwargs.get("top_p") is not None:
                 payload["top_p"] = gen_kwargs["top_p"]
             for _sp in ("presence_penalty", "frequency_penalty"):
@@ -270,18 +506,19 @@ class AsyncOpenAIChat(lmms):
             if _extra_body:
                 payload["extra_body"] = _extra_body
 
+            terminal_tools = set()
             if self.mcp_client is not None:
-                # Fetch the tool/function list ONCE and cache it (avoids forking the
-                # MCP server subprocess on every request via get_function_list).
                 if self._tool_functions is None:
                     self._tool_functions = await self.mcp_client.get_function_list()
-                functions = self._tool_functions
+                functions, terminal_tools = self._resolve_task_tools(task)
                 payload["tools"] = functions
                 payload["tool_choice"] = "auto"
+            # Per-task image-indexing mode controls the model-visible tool_response wording
+            # (training_faithful | multi_index | None=default). See _tool_image_registered_text.
+            image_indexing_mode = (self.task_metadata.get(task) or {}).get("image_indexing")
 
             response = await self.client.chat.completions.create(**payload)
             last_response = response.choices[0].message.content or ""
-            # Extract usage metrics
             input_tokens = 0
             output_tokens = 0
             reasoning_tokens = 0
@@ -301,7 +538,6 @@ class AsyncOpenAIChat(lmms):
                 reasoning_tokens=reasoning_tokens,
                 source="model",
             )
-            # Sometimes asyncio return None, skip this case
             try:
                 all_response += last_response
             except Exception as e:
@@ -309,12 +545,10 @@ class AsyncOpenAIChat(lmms):
 
             tool_iteration = 0
             tool_image_count = 0
+            terminal_tool_called = False
             while response.choices[0].finish_reason == "tool_calls" and tool_iteration < self.max_tool_iterations:
                 tool_iteration += 1
                 assistant_message = response.choices[0].message
-                # Canonical OpenAI shape: ONE assistant message carrying both the
-                # content and the tool_calls (each with its id), followed by one
-                # role="tool" message per call keyed by the matching tool_call_id.
                 assistant_dict = {"role": "assistant", "content": assistant_message.content or ""}
                 if assistant_message.tool_calls:
                     assistant_dict["tool_calls"] = [
@@ -326,22 +560,45 @@ class AsyncOpenAIChat(lmms):
                         for tc in assistant_message.tool_calls
                     ]
                 messages.append(assistant_dict)
-                # NOTE: assistant_message.content was already folded into all_response
-                # (before the loop on the 1st pass, at the loop tail afterwards).
 
                 pending_user_images = []
                 for call in (assistant_message.tool_calls or []):
                     eval_logger.debug(f"Calling {call.function.name}...")
                     all_response += f"<tool_call>{call.function.name} {call.function.arguments}</tool_call>"
+                    if call.function.name in terminal_tools:
+                        # Answer-protocol tool (e.g. screenspot's computer_use): the
+                        # call IS the final answer. It is recorded in the transcript
+                        # above for the task's parser; never executed, episode ends.
+                        terminal_tool_called = True
+                        break
                     try:
                         tool_args = json.loads(call.function.arguments) if call.function.arguments else {}
-                        result = await self.mcp_client.run_tool(call.function.name, tool_args)
+                        call_args = tool_args  # what the tool actually runs (may be remapped below)
+                        zoom_provenance = None   # (orig_idx, native_subregion) of the crop this call yields
+                        if "img_idx" in tool_args:
+                            _idx = int(tool_args["img_idx"])
+                            if _idx not in image_registry:
+                                raise ValueError(f"img_idx {_idx} is not available. Available indices: {sorted(image_registry)}.")
+                            # Original-resolution crop: remap a zoom into ANY image to crop the ROOT
+                            # original at native resolution (composite the 0-1000 bbox through
+                            # provenance). No-op for originals (img_idx whose region is the full image).
+                            # tool_args is kept as-is for the model-visible tool_response wording; only
+                            # the executed call_args is remapped.
+                            if call.function.name == "image_zoom_in_tool" and isinstance(tool_args.get("bbox_2d"), (list, tuple)) and len(tool_args["bbox_2d"]) >= 4:
+                                composited = _composite_zoom_to_original(image_provenance, _idx, [float(v) for v in tool_args["bbox_2d"][:4]])
+                                if composited is not None:
+                                    orig_idx, nsub, bbox_prime = composited
+                                    zoom_provenance = (orig_idx, nsub)
+                                    call_args = dict(tool_args)
+                                    call_args["img_idx"] = orig_idx
+                                    call_args["bbox_2d"] = bbox_prime
+                        # Snapshot the registry into the tool subprocess so it can map img_idx -> path.
+                        tool_env = {_IMAGE_REGISTRY_ENV: json.dumps({str(k): v for k, v in image_registry.items()})}
+                        result = await self.mcp_client.run_tool(call.function.name, call_args, env=tool_env)
                         raw_parts = []
                         for content in result.content:
                             raw_parts.extend(self.mcp_client.convert_result_to_openai_format(content))
                     except Exception as exc:
-                        # Fault-tolerant: feed the error back as the tool result so the
-                        # model can recover within the same request (Qwen-Agent pattern).
                         eval_logger.warning(f"Tool {call.function.name} failed: {exc}")
                         raw_parts = [{"type": "text", "text": f"Tool {call.function.name} failed: {exc}"}]
 
@@ -350,24 +607,37 @@ class AsyncOpenAIChat(lmms):
                     for part in raw_parts:
                         if part.get("type") == "image_url":
                             if tool_image_count >= self.max_tool_images:
-                                continue  # cap tool images to keep context under max-model-len
+                                continue
                             tool_image_count += 1
                             all_response += "<image_url>"
                             kept_parts.append(part)
                         elif part.get("type") == "text":
-                            all_response += part["text"]
-                            # Discover tool-generated image paths so we can clean them up.
-                            for match in _TOOL_SAVED_IMAGE_RE.finditer(part["text"]):
-                                request_image_paths.append(match.group(1))
+                            text = part["text"]
+                            # A tool-produced image announces itself with the
+                            # "Saved drawn image to: <path>" sentinel. Register each
+                            # under a NEW img_idx (so the model can address it in a
+                            # later tool call, like training appends crops to
+                            # image_data), track it for cleanup, and replace the raw
+                            # path the model sees with a clean img_idx message.
+                            for match in _TOOL_SAVED_IMAGE_RE.finditer(text):
+                                saved_path = match.group(1)
+                                request_image_paths.append(saved_path)
+                                assigned_idx = next_img_idx
+                                image_registry[assigned_idx] = saved_path
+                                if zoom_provenance is not None:
+                                    # Carry provenance so a later zoom into this crop composites
+                                    # back to the ROOT original at native resolution again.
+                                    image_provenance[assigned_idx] = zoom_provenance
+                                next_img_idx += 1
+                                text = text.replace(match.group(0), self._tool_image_registered_text(image_indexing_mode, call.function.name, tool_args, assigned_idx))
+                            part = {"type": "text", "text": text}
+                            all_response += text
                             kept_parts.append(part)
                         else:
                             kept_parts.append(part)
                     all_response += "</tool_response>"
 
                     if self.tool_image_as_user_turn:
-                        # Fallback path: keep the tool result text-only and re-home any
-                        # returned image(s) as a follow-up user turn (for servers/chat
-                        # templates that drop image parts inside a role="tool" message).
                         text_parts = [p for p in kept_parts if p.get("type") == "text"]
                         if not text_parts:
                             text_parts = [{"type": "text", "text": "(tool returned an image; shown below)"}]
@@ -376,17 +646,26 @@ class AsyncOpenAIChat(lmms):
                     else:
                         messages.append({"role": "tool", "tool_call_id": call.id, "name": call.function.name, "content": kept_parts})
 
+                if terminal_tool_called:
+                    break
+
                 if pending_user_images:
                     messages.append({"role": "user", "content": pending_user_images + [{"type": "text", "text": "Above are the tool-returned image(s)."}]})
 
-                # Once the image budget is spent, stop offering tools so the model answers.
+                # Once the image budget is spent, stop offering image-producing tools
+                # so the model answers. Terminal (answer-protocol) tools stay offered:
+                # they return no images and may be the task's only answer channel
+                # (e.g. screenspot's computer_use).
                 if tool_image_count >= self.max_tool_images:
-                    payload.pop("tools", None)
-                    payload.pop("tool_choice", None)
+                    terminal_only = [f for f in payload.get("tools", []) if f["function"]["name"] in terminal_tools]
+                    if terminal_only:
+                        payload["tools"] = terminal_only
+                    else:
+                        payload.pop("tools", None)
+                        payload.pop("tool_choice", None)
 
                 payload["messages"] = messages
                 response = await self.client.chat.completions.create(**payload)
-                # Extract usage metrics
                 input_tokens = 0
                 output_tokens = 0
                 reasoning_tokens = 0
@@ -412,7 +691,7 @@ class AsyncOpenAIChat(lmms):
                 except Exception as e:
                     all_response += str(e)
 
-            if tool_iteration >= self.max_tool_iterations:
+            if tool_iteration >= self.max_tool_iterations and not terminal_tool_called:
                 eval_logger.warning(f"Max tool iterations ({self.max_tool_iterations}) reached for request {idx}")
                 all_response += f"\n[MAX_TOOL_ITERATIONS_REACHED]"
             return all_response, idx, TokenCounts(input_tokens=total_input_tokens, output_tokens=total_output_tokens, reasoning_tokens=total_reasoning_tokens)

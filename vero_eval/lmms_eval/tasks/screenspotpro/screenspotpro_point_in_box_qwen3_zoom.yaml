@@ -1,0 +1,31 @@
+# Qwen3-VL Instruct zero-shot + the ZOOMING toolset (multi-turn tool calling).
+# Modular composition of three templates:
+#   _default_template_point_yaml          dataset + scorer wiring (+ version)
+#   _toolset_zoom_yaml                     allowed_tools + zoom system prompt
+#   _answerproto_computer_use_yaml         computer_use extra/terminal tool
+# metadata deep-merges across all three. doc_to_text_qwen3_mcp_tool passes tools
+# through the API (rendered natively by the chat template) instead of baking a
+# <tools> block into the user text. The scorer (rel1000) matches the _qwen3_zs
+# baseline. Run with TOOLS=on.
+include:
+  - _default_template_point_yaml
+  - ../_tool_templates/_toolset_zoom_yaml
+  - ../_tool_templates/_answerproto_computer_use_yaml
+task: "screenspotpro_point_in_box_qwen3_zoom"
+test_split: train
+process_docs: !function utils_point.screenspot_point_process_docs_rel1000
+doc_to_text: !function utils_point.screenspot_point_doc_to_text_qwen3_mcp_tool
+process_results: !function utils_point.screenspot_point_process_result_qwen3
+generation_kwargs:
+  until:
+    - "ASSISTANT:"
+  max_new_tokens: 16384
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 40
+  presence_penalty: 2.0
+  do_sample: True
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: "Locate the UI element described by the instruction on the screenshot. When you have located it, finish by calling computer_use with action \"left_click\" at the target coordinate. "
+    post_prompt: ""

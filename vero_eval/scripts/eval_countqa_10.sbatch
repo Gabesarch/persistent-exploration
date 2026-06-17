@@ -19,9 +19,21 @@
 
 set -euo pipefail
 
-# SLURM copies this script elsewhere, so derive the package dir from the submit
-# directory (submit from the repo root, as the --output paths above assume).
-VERO_EVAL_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}/vero_eval"
+# SLURM copies this script elsewhere, so prefer the submit directory. In an
+# interactive allocation SLURM_SUBMIT_DIR may already be the package dir.
+SUBMIT_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
+if [[ -f "$SUBMIT_DIR/set_paths.sh.example" && "$(basename "$SUBMIT_DIR")" == "vero_eval" ]]; then
+  VERO_EVAL_DIR="$SUBMIT_DIR"
+else
+  VERO_EVAL_DIR="$SUBMIT_DIR/vero_eval"
+fi
+
+# When run directly with `bash path/to/script`, fall back to the script location
+# if SLURM_SUBMIT_DIR points somewhere unrelated.
+if [[ ! -f "$VERO_EVAL_DIR/set_paths.sh.example" ]]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  VERO_EVAL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+fi
 if [[ ! -f "$VERO_EVAL_DIR/set_paths.sh.example" ]]; then
   echo "ERROR: $VERO_EVAL_DIR not found. Submit from the repo root:" >&2
   echo "  sbatch vero_eval/scripts/eval_countqa_10.sbatch" >&2
@@ -37,7 +49,7 @@ fi
 set -u
 
 LIMIT="${LIMIT:-10}"
-PORT="${PORT:-9001}"; API_KEY="${API_KEY:-qwen}"
+PORT="${PORT:-9000}"; API_KEY="${API_KEY:-qwen}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-$VERO_EVAL_DIR/results/countqa_10}"
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-$VERO_EVAL_DIR/prompts/countqa_system_prompt.txt}"
 export VLLM_USE_FLASHINFER_SAMPLER=0

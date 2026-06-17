@@ -43,7 +43,7 @@ set -u
 
 LIMIT="${LIMIT:-}"                       # empty = full test split (1001)
 PORT="${PORT:-9001}"; API_KEY="${API_KEY:-qwen}"
-TASK="${TASK:-countqa_qwen3_zs}"
+TASK="${TASK:-countqa_qwen3_drawing}"
 MAX_TOOL_ITERATIONS="${MAX_TOOL_ITERATIONS:-10}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-$VERO_EVAL_DIR/results/countqa_qwen3vl}"
 export VLLM_USE_FLASHINFER_SAMPLER=0
@@ -66,12 +66,12 @@ SYSTEM_PROMPT="" MAX_TOOL_ITERATIONS="$MAX_TOOL_ITERATIONS" \
   OUTPUT_PATH="$OUTPUT_ROOT/with_tools" \
   bash examples/eval_domain.sh --tasks "$TASK" ${LIMIT:+--limit "$LIMIT"}
 
-# 2) WITHOUT tools (single-turn). Empty MCP_SERVER_PATH disables the tool loop.
-echo ""; echo "########## CountQA — WITHOUT tools (single-turn) ##########"
-SYSTEM_PROMPT="" MCP_SERVER_PATH="" \
-  OUTPUT_PATH="$OUTPUT_ROOT/no_tools" \
-  bash examples/eval_domain.sh --tasks "$TASK" ${LIMIT:+--limit "$LIMIT"}
+# # 2) WITHOUT tools (single-turn). Empty MCP_SERVER_PATH disables the tool loop.
+# echo ""; echo "########## CountQA — WITHOUT tools (single-turn) ##########"
+# SYSTEM_PROMPT="" MCP_SERVER_PATH="" \
+#   OUTPUT_PATH="$OUTPUT_ROOT/no_tools" \
+#   bash examples/eval_domain.sh --tasks "$TASK" ${LIMIT:+--limit "$LIMIT"}
 
-echo ""
-echo "=== CountQA qwen3vl eval complete. Results under: $OUTPUT_ROOT ==="
-echo "    with_tools/  vs  no_tools/   (metric: exact_match)"
+# echo ""
+# echo "=== CountQA qwen3vl eval complete. Results under: $OUTPUT_ROOT ==="
+# echo "    with_tools/  vs  no_tools/   (metric: exact_match)"

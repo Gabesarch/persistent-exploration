@@ -956,14 +956,34 @@ def load_yaml_config(yaml_path=None, yaml_config=None, yaml_dir=None, mode="full
 
             try:
                 included_yaml_config = load_yaml_config(yaml_path=path, mode=mode)
-                final_yaml_config.update(included_yaml_config)
+                _merge_yaml_config(final_yaml_config, included_yaml_config)
             except Exception as ex:
                 # If failed to load, ignore
                 raise ex
 
-        final_yaml_config.update(yaml_config)
+        _merge_yaml_config(final_yaml_config, yaml_config)
         return final_yaml_config
     return yaml_config
+
+
+# Top-level keys whose dict values are merged key-by-key across an `include`
+# chain instead of being replaced wholesale. This lets a task compose several
+# templates that each contribute part of the same block — e.g. one toolset
+# template sets metadata.allowed_tools while an answer-protocol template sets
+# metadata.extra_tools/terminal_tools, and both survive (see the _tool_templates
+# tasks). For any other key, last-writer-wins, exactly as before.
+_DEEP_MERGE_KEYS = ("metadata",)
+
+
+def _merge_yaml_config(dst: dict, src: dict) -> None:
+    """In-place: layer `src` over `dst`, deep-merging the keys in _DEEP_MERGE_KEYS."""
+    for key, value in src.items():
+        if key in _DEEP_MERGE_KEYS and isinstance(value, dict) and isinstance(dst.get(key), dict):
+            merged = dict(dst[key])
+            merged.update(value)
+            dst[key] = merged
+        else:
+            dst[key] = value
 
 
 def regex_replace(string, pattern, repl, count: int = 0):

@@ -241,3 +241,49 @@ def cv_bench_default_aggregate_results(results: List[Dict]):
     # original formula
     cv_bench_accuracy = 1 / 2 * ((ade20k_2d + coco_2d) / 2 + omni_3d)
     return cv_bench_accuracy
+
+
+def cv_bench_drawing_process_results(doc: Dict, result: List[str]) -> Dict[str, Dict]:
+    """Process results for tool-use / drawing mode.
+
+    Extracts the answer letter from responses that may contain tool calls.
+    """
+    key_name = "cv_bench_acc"
+    grounded_output = doc["answer"].strip("()")
+    response = result[0]
+
+    # Strip tool call/response markers
+    text = response
+    text = re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<tool_response>.*?</tool_response>", "", text, flags=re.DOTALL)
+
+    # Priority 1: Look for <answer>X</answer> tag
+    answer_match = re.search(r"<answer>\s*([A-E])\s*</answer>", text, re.IGNORECASE)
+    if answer_match:
+        pred_letter = answer_match.group(1).upper()
+        flag = pred_letter == grounded_output
+        cv_bench_submission = {"id": doc["idx"], "gt_content": grounded_output, "pred_parsed": pred_letter, "pred": response, "type": doc["type"], "task": doc["task"], "source": doc["source"], "is_correct": flag}
+        return {key_name: cv_bench_submission}
+
+    # Priority 2: Look for "Final answer: X" pattern
+    final_match = re.search(r"[Ff]inal\s+[Aa]nswer[:\s]+([A-E])", text)
+    if final_match:
+        pred_letter = final_match.group(1).upper()
+        flag = pred_letter == grounded_output
+        cv_bench_submission = {"id": doc["idx"], "gt_content": grounded_output, "pred_parsed": pred_letter, "pred": response, "type": doc["type"], "task": doc["task"], "source": doc["source"], "is_correct": flag}
+        return {key_name: cv_bench_submission}
+
+    # Priority 3: Fall back to standard extraction
+    text = extract_final_answer(text)
+    choices = doc.get("choices")
+    option_labels = _build_option_labels(choices)
+    index2ans = _build_index2ans(option_labels, choices)
+    pred_letter = _extract_answer_letter(
+        text,
+        option_labels=option_labels or None,
+        index2ans=index2ans or None,
+    )
+    flag = pred_letter == grounded_output
+
+    cv_bench_submission = {"id": doc["idx"], "gt_content": grounded_output, "pred_parsed": pred_letter, "pred": response, "type": doc["type"], "task": doc["task"], "source": doc["source"], "is_correct": flag}
+    return {key_name: cv_bench_submission}
