@@ -36,10 +36,21 @@ LOGFILE="$LOG_DIR/vllm_$(date '+%Y-%m-%d_%H-%M-%S')_port${PORT}.txt"
 echo "CHECKPOINT_PATH: $CHECKPOINT_PATH"
 echo "PORT: $PORT   NUM_GPUS: $NUM_GPUS   served-model-name: $MODEL_NAME"
 
-# Only kill vLLM servers on this specific port (avoids cross-job interference)
-if pgrep -f "vllm serve.*--port $PORT" >/dev/null 2>&1; then
-  echo "Killing existing vLLM server on port $PORT..."; pkill -f "vllm serve.*--port $PORT" || true; sleep 3
+# Only kill a server on OUR port: on shared nodes a blanket `pkill -f "vllm serve"`
+# would murder a sibling job's policy server mid-eval (give concurrent jobs unique
+# PORTs; the trailing space anchors the match so 9001 doesn't match 90011).
+if pgrep -f "vllm serve.*--port ${PORT} " >/dev/null 2>&1; then
+  echo "Killing existing vLLM server(s) on port ${PORT}..."; pkill -f "vllm serve.*--port ${PORT} " || true; sleep 3
 fi
+
+# Optional explicit chat template. Needed for the RL-trained Vero checkpoints:
+# vLLM otherwise serves the base template embedded in tokenizer_config.json, which
+# does NOT force the <think> block or the training tool-call format, so Vero answers
+# directly without thinking/tool use. Point CHAT_TEMPLATE at the training template
+# (e.g. the checkpoint's chat_template.jinja) to reproduce training behavior.
+CHAT_TEMPLATE="${CHAT_TEMPLATE:-}"
+CHAT_TEMPLATE_ARGS=()
+[[ -n "$CHAT_TEMPLATE" ]] && CHAT_TEMPLATE_ARGS=(--chat-template "$CHAT_TEMPLATE") && echo "Using chat template: $CHAT_TEMPLATE"
 
 echo "Starting vLLM server (log: $LOGFILE)..."
 CHAT_TEMPLATE_ARG=""
@@ -57,6 +68,7 @@ nohup vllm serve "$CHECKPOINT_PATH" \
   --api-key "$API_KEY" \
   --enable-auto-tool-choice \
   --tool-call-parser hermes \
+  "${CHAT_TEMPLATE_ARGS[@]}" \
   --enforce-eager \
   $CHAT_TEMPLATE_ARG \
   > "$LOGFILE" 2>&1 &

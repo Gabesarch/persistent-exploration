@@ -125,6 +125,7 @@ def _build_screenspotpro_dataset() -> Dataset:
     file_names: List[str] = []
     data_types: List[str] = []
     data_sources: List[str] = []
+    img_sizes: List[List[int]] = []
 
     for ann_path in sorted(ann_dir.glob("*.json")):
         with ann_path.open("r", encoding="utf-8") as handle:
@@ -157,6 +158,11 @@ def _build_screenspotpro_dataset() -> Dataset:
             file_names.append(str(entry.get("id") or img_filename))
             data_types.append(data_type)
             data_sources.append(data_source)
+            # Keep the size as plain ints: process_results docs have the image
+            # column stripped (dataset_no_image), and without dimensions the
+            # abs->rel1000 GT-bbox conversion silently zeroes the box.
+            img_size = entry.get("img_size") or []
+            img_sizes.append([int(img_size[0]), int(img_size[1])] if len(img_size) >= 2 else [0, 0])
 
     features = Features(
         {
@@ -166,6 +172,7 @@ def _build_screenspotpro_dataset() -> Dataset:
             "file_name": Value("string"),
             "data_type": Value("string"),
             "data_source": Value("string"),
+            "img_size": Sequence(Value("int32")),
         }
     )
     return Dataset.from_dict(
@@ -176,6 +183,7 @@ def _build_screenspotpro_dataset() -> Dataset:
             "file_name": file_names,
             "data_type": data_types,
             "data_source": data_sources,
+            "img_size": img_sizes,
         },
         features=features,
     )
@@ -224,6 +232,11 @@ def _get_image_size(doc):
     image = doc.get("image")
     if hasattr(image, "size"):
         return image.size
+    # process_results receives docs from dataset_no_image (image column stripped);
+    # fall back to the plain img_size column carried by the offline builder.
+    size = doc.get("img_size")
+    if isinstance(size, (list, tuple)) and len(size) >= 2 and size[0] and size[1]:
+        return int(size[0]), int(size[1])
     return None, None
 
 
@@ -248,6 +261,23 @@ def screenspot_point_doc_to_text_qwen3_tool(doc, lmms_eval_specific_kwargs=None)
     if prompt and not prompt.endswith((" ", "\n", "\t")):
         prompt = prompt + " "
     return f"{prompt}{instruction}"
+
+
+def screenspot_point_doc_to_text_qwen3_mcp_tool(doc, lmms_eval_specific_kwargs=None):
+    """User text for tool-calling runs where ALL tools — the computer_use answer
+    protocol AND the real image tools (zoom/draw) — are passed through the API and
+    rendered natively by the model's chat template. Unlike
+    screenspot_point_doc_to_text_qwen3_tool, no <tools> block is baked into the
+    user text (that would duplicate/conflict with the template's tools section).
+    The pre_prompt/post_prompt come from the task yaml's lmms_eval_specific_kwargs."""
+    kwargs = lmms_eval_specific_kwargs or {}
+    pre = kwargs.get("pre_prompt", "")
+    post = kwargs.get("post_prompt", "")
+    instruction = doc.get("instruction") or doc.get("instruction_cn") or ""
+    instruction = str(instruction).strip()
+    if instruction and not instruction.endswith((".", "?", "!")):
+        instruction += "."
+    return f"{pre}{instruction}{post}"
 
 
 def screenspot_point_doc_to_target(doc, model_specific_target_kwargs=None):
@@ -447,6 +477,17 @@ def screenspot_point_process_docs_abs(dataset: Dataset) -> Dataset:
     if "instruction" not in dataset.column_names or "bbox" not in dataset.column_names:
         dataset = _build_screenspotpro_dataset()
     return _annotate_point_format(dataset, "abs_pixel", "abs_pixel")
+
+
+def screenspotpro_builder():
+    """Dataset builder for offline runs (wired as dataset_kwargs.builder_fn in
+    _default_template_point_yaml): the likaixin/ScreenSpot-Pro snapshot carries raw
+    annotations/ + images/ with no loadable data files, so datasets.load_dataset on
+    the bare repo id fails under HF_HUB_OFFLINE=1. Build the Dataset from the local
+    snapshot instead. The 'train' split matches the screenspotpro yamls' test_split."""
+    from datasets import DatasetDict
+
+    return DatasetDict({"train": _build_screenspotpro_dataset()})
 
 
 def screenspot_point_process_docs_rel1000(dataset: Dataset) -> Dataset:

@@ -1,4 +1,5 @@
 import asyncio
+import fnmatch
 import json
 import os
 import re
@@ -43,6 +44,15 @@ cpu, _ = optional_import("decord", "cpu")
 _TOOL_SAVED_IMAGE_RE = re.compile(r"Saved drawn image to:\s*(\S+)")
 _HIDDEN_TOOL_ARGS = {"image_path"}
 _IMAGE_REGISTRY_ENV = "LMMS_EVAL_IMAGE_REGISTRY"
+
+# Env var carrying the per-call image registry (img_idx -> file path) to the MCP
+# tool subprocess, so tools resolve img_idx the way training does. Keep in sync
+# with lmms_eval/mcp/vero2_mcp.py _IMAGE_REGISTRY_ENV.
+_IMAGE_REGISTRY_ENV = "LMMS_EVAL_IMAGE_REGISTRY"
+
+# vero_eval package root (parent of lmms_eval), used to resolve the relative
+# system_prompt_files paths declared in task yamls (e.g. prompts/tools/*.txt).
+_VERO_EVAL_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 load_dotenv(verbose=True)
 
@@ -137,6 +147,8 @@ class AsyncOpenAIChat(lmms):
         self.max_tool_images = int(max_tool_images)
         self.tool_image_as_user_turn = parse_bool(tool_image_as_user_turn)
         self._tool_functions = None
+        self._task_tools_cache = {}
+        self._task_system_prompt_cache = {}
 
         # If system_prompt contains placeholders, fill them in
         if self.system_prompt and self.mcp_client is not None:
@@ -227,6 +239,80 @@ class AsyncOpenAIChat(lmms):
     def world_size(self):
         return self._world_size
 
+    def _resolve_task_system_prompt(self, task: str) -> Optional[str]:
+        """Build the turn-0 system prompt for a task by concatenating, in order:
+
+        1. the run-wide ``system_prompt`` model_arg (if set, e.g. via SYSTEM_PROMPT);
+        2. each file listed in the task yaml's ``metadata.system_prompt_files``.
+
+        This is what makes the prompt modular: a task includes a toolset template
+        (``prompts/tools/system_base.txt`` + ``system_zoom.txt`` / ``system_draw.txt``)
+        and the fragments concatenate here. The model's chat template then appends
+        its own ``# Tools`` / ``<tools>`` schema block after this system text, so the
+        final system message is base (+ run-wide) (+ toolset) (+ rendered schemas).
+
+        Paths in ``system_prompt_files`` resolve as-is if absolute/cwd-relative,
+        else against the vero_eval package root. A listed-but-missing file is a
+        hard error (a silently dropped system prompt would corrupt the whole run).
+        Returns ``None`` when neither source yields any text. Cached per task.
+        """
+        if task in self._task_system_prompt_cache:
+            return self._task_system_prompt_cache[task]
+        fragments: List[str] = []
+        if self.system_prompt:
+            fragments.append(self.system_prompt.strip())
+        meta = self.task_metadata.get(task) or {}
+        files = meta.get("system_prompt_files") or []
+        if isinstance(files, str):
+            files = [files]
+        for rel in files:
+            path = rel if os.path.isabs(rel) else rel
+            if not os.path.isfile(path):
+                path = os.path.join(_VERO_EVAL_ROOT, rel)
+            if not os.path.isfile(path):
+                raise ValueError(f"Task '{task}': system_prompt_files entry '{rel}' not found " f"(looked at '{rel}' and '{os.path.join(_VERO_EVAL_ROOT, rel)}'). Fix the path in the task yaml metadata.")
+            with open(path, "r") as fh:
+                fragments.append(fh.read().strip())
+        resolved = "\n\n".join(f for f in fragments if f) or None
+        self._task_system_prompt_cache[task] = resolved
+        if resolved:
+            eval_logger.info(f"Task '{task}': system prompt = {len(fragments)} fragment(s), {len(resolved)} chars")
+        return resolved
+
+    def _resolve_task_tools(self, task: str):
+        """Resolve the per-task tool view from the task yaml's `metadata` block:
+
+        - ``allowed_tools``: list of MCP tool names or fnmatch patterns (e.g.
+          ``["image_zoom_in_tool"]`` or ``["draw_*"]``). Absent/empty = offer
+          every tool the MCP server exposes (backwards-compatible default).
+        - ``extra_tools``: extra OpenAI function specs offered to the model but
+          NOT backed by the MCP server (answer-protocol tools such as
+          screenspot's ``computer_use``). Given verbatim in the yaml.
+        - ``terminal_tools``: tool names whose call ENDS the episode — the call
+          is recorded in the transcript as the final answer and never executed.
+
+        Returns ``(functions, terminal_tool_names)``; cached per task.
+        """
+        if task in self._task_tools_cache:
+            return self._task_tools_cache[task]
+        meta = self.task_metadata.get(task) or {}
+        functions = list(self._tool_functions or [])
+        allowed = meta.get("allowed_tools")
+        if allowed:
+            if isinstance(allowed, str):
+                allowed = [p.strip() for p in allowed.split(",") if p.strip()]
+            functions = [f for f in functions if any(fnmatch.fnmatchcase(f["function"]["name"], pat) for pat in allowed)]
+            if not functions:
+                server_tools = [f["function"]["name"] for f in (self._tool_functions or [])]
+                raise ValueError(f"Task '{task}': allowed_tools={allowed} matched none of the MCP server tools {server_tools}. " f"Fix the task yaml metadata or the MCP server at the configured mcp_server_path.")
+        extra = meta.get("extra_tools") or []
+        functions = functions + list(extra)
+        terminal = {str(name) for name in (meta.get("terminal_tools") or [])}
+        self._task_tools_cache[task] = (functions, terminal)
+        offered = [f["function"]["name"] for f in functions]
+        eval_logger.info(f"Task '{task}': offering tools {offered}" + (f" (terminal: {sorted(terminal)})" if terminal else ""))
+        return functions, terminal
+
     def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
         assert False, "TODO, not implemented"
 
@@ -256,7 +342,8 @@ class AsyncOpenAIChat(lmms):
             messages = chat_messages.to_qwen3_vl_openai_messages(video_kwargs)
         else:
             messages = chat_messages.to_openai_messages(video_kwargs)
-        messages = self._apply_system_prompt(messages, self.system_prompt) if self.system_prompt else messages
+        task_system_prompt = self._resolve_task_system_prompt(task)
+        messages = self._apply_system_prompt(messages, task_system_prompt) if task_system_prompt else messages
         images, videos, audios = chat_messages.extract_media()
         # Track every image file that belongs to this request so we can
         # delete them after the model finishes answering (avoids unbounded
@@ -274,10 +361,18 @@ class AsyncOpenAIChat(lmms):
                 except OSError as exc:
                     eval_logger.debug(f"Failed to remove tool image {path}: {exc}")
 
+        # Image addressing by index (img_idx), matching training: the model is told
+        # each image's img_idx and never sees a path; tools resolve img_idx -> path
+        # via the registry passed in LMMS_EVAL_IMAGE_REGISTRY. Tool-produced images
+        # get appended with a new img_idx below (mirrors agent_data.image_data growth).
+        image_registry: Dict[int, str] = {}
+        next_img_idx = 0
         if self.mcp_client is not None:
             for image_idx, image in enumerate(images):
-                image_path = os.path.join(self.work_dir, f"{uuid.uuid4()}.jpg")
-                image.save(image_path)
+                # Save losslessly at ORIGINAL resolution (PNG), matching training's
+                # use_original_resolution_source — NOT a lossy/downscaled JPEG.
+                image_path = os.path.join(self.work_dir, f"{uuid.uuid4()}.png")
+                image.save(image_path, format="PNG")
                 request_image_paths.append(image_path)
                 image_registry[next_img_idx] = image_path
                 next_img_idx += 1
@@ -321,10 +416,12 @@ class AsyncOpenAIChat(lmms):
             if _extra_body:
                 payload["extra_body"] = _extra_body
 
+            terminal_tools = set()
             if self.mcp_client is not None:
                 if self._tool_functions is None:
-                    self._tool_functions = self._rewrite_tool_schemas_for_model(await self.mcp_client.get_function_list())
-                payload["tools"] = self._tool_functions
+                    self._tool_functions = await self.mcp_client.get_function_list()
+                functions, terminal_tools = self._resolve_task_tools(task)
+                payload["tools"] = functions
                 payload["tool_choice"] = "auto"
 
             response = await self.client.chat.completions.create(**payload)
@@ -355,6 +452,7 @@ class AsyncOpenAIChat(lmms):
 
             tool_iteration = 0
             tool_image_count = 0
+            terminal_tool_called = False
             while response.choices[0].finish_reason == "tool_calls" and tool_iteration < self.max_tool_iterations:
                 tool_iteration += 1
                 assistant_message = response.choices[0].message
@@ -374,12 +472,19 @@ class AsyncOpenAIChat(lmms):
                 for call in (assistant_message.tool_calls or []):
                     eval_logger.debug(f"Calling {call.function.name}...")
                     all_response += f"<tool_call>{call.function.name} {call.function.arguments}</tool_call>"
+                    if call.function.name in terminal_tools:
+                        # Answer-protocol tool (e.g. screenspot's computer_use): the
+                        # call IS the final answer. It is recorded in the transcript
+                        # above for the task's parser; never executed, episode ends.
+                        terminal_tool_called = True
+                        break
                     try:
                         tool_args = json.loads(call.function.arguments) if call.function.arguments else {}
                         if "img_idx" in tool_args:
-                            img_idx = int(tool_args["img_idx"])
-                            if img_idx not in image_registry:
-                                raise ValueError(f"img_idx {img_idx} is not available. Available: 0-{max(image_registry) if image_registry else -1}")
+                            _idx = int(tool_args["img_idx"])
+                            if _idx not in image_registry:
+                                raise ValueError(f"img_idx {_idx} is not available. Available indices: {sorted(image_registry)}.")
+                        # Snapshot the registry into the tool subprocess so it can map img_idx -> path.
                         tool_env = {_IMAGE_REGISTRY_ENV: json.dumps({str(k): v for k, v in image_registry.items()})}
                         result = await self.mcp_client.run_tool(call.function.name, tool_args, env=tool_env)
                         raw_parts = []
@@ -399,21 +504,23 @@ class AsyncOpenAIChat(lmms):
                             all_response += "<image_url>"
                             kept_parts.append(part)
                         elif part.get("type") == "text":
-                            original_text = part["text"]
-                            display_lines = []
-                            for match in _TOOL_SAVED_IMAGE_RE.finditer(original_text):
+                            text = part["text"]
+                            # A tool-produced image announces itself with the
+                            # "Saved drawn image to: <path>" sentinel. Register each
+                            # under a NEW img_idx (so the model can address it in a
+                            # later tool call, like training appends crops to
+                            # image_data), track it for cleanup, and replace the raw
+                            # path the model sees with a clean img_idx message.
+                            for match in _TOOL_SAVED_IMAGE_RE.finditer(text):
                                 saved_path = match.group(1)
                                 request_image_paths.append(saved_path)
-                                if saved_path not in image_registry.values():
-                                    assigned_idx = next_img_idx
-                                    image_registry[assigned_idx] = saved_path
-                                    next_img_idx += 1
-                                    display_lines.append(f"Registered image as img_idx {assigned_idx}.")
-                            display_text = "\n".join(display_lines).strip()
-                            if not display_text and not _TOOL_SAVED_IMAGE_RE.search(original_text):
-                                display_text = original_text
-                            all_response += display_text
-                            kept_parts.append({"type": "text", "text": display_text})
+                                assigned_idx = next_img_idx
+                                image_registry[assigned_idx] = saved_path
+                                next_img_idx += 1
+                                text = text.replace(match.group(0), f"Registered image as img_idx {assigned_idx}.")
+                            part = {"type": "text", "text": text}
+                            all_response += text
+                            kept_parts.append(part)
                         else:
                             kept_parts.append(part)
                     all_response += "</tool_response>"
@@ -427,12 +534,23 @@ class AsyncOpenAIChat(lmms):
                     else:
                         messages.append({"role": "tool", "tool_call_id": call.id, "name": call.function.name, "content": kept_parts})
 
+                if terminal_tool_called:
+                    break
+
                 if pending_user_images:
                     messages.append({"role": "user", "content": pending_user_images + [{"type": "text", "text": "Above are the tool-returned image(s)."}]})
 
+                # Once the image budget is spent, stop offering image-producing tools
+                # so the model answers. Terminal (answer-protocol) tools stay offered:
+                # they return no images and may be the task's only answer channel
+                # (e.g. screenspot's computer_use).
                 if tool_image_count >= self.max_tool_images:
-                    payload.pop("tools", None)
-                    payload.pop("tool_choice", None)
+                    terminal_only = [f for f in payload.get("tools", []) if f["function"]["name"] in terminal_tools]
+                    if terminal_only:
+                        payload["tools"] = terminal_only
+                    else:
+                        payload.pop("tools", None)
+                        payload.pop("tool_choice", None)
 
                 payload["messages"] = messages
                 response = await self.client.chat.completions.create(**payload)
@@ -461,7 +579,7 @@ class AsyncOpenAIChat(lmms):
                 except Exception as e:
                     all_response += str(e)
 
-            if tool_iteration >= self.max_tool_iterations:
+            if tool_iteration >= self.max_tool_iterations and not terminal_tool_called:
                 eval_logger.warning(f"Max tool iterations ({self.max_tool_iterations}) reached for request {idx}")
                 all_response += f"\n[MAX_TOOL_ITERATIONS_REACHED]"
             return all_response, idx, TokenCounts(input_tokens=total_input_tokens, output_tokens=total_output_tokens, reasoning_tokens=total_reasoning_tokens)

@@ -1,0 +1,22 @@
+# Vero (RL thinking checkpoint) + ZOOM toolset on VisualProbe-Hard.
+# Vero bakes its own <think>/<tool_call>/<answer>\boxed{} system prompt AND the
+# tool-call instructions into its chat template, and ignores passed system
+# messages (see memory: vero-chat-template-system-prompt). So we offer the tool
+# (allowed_tools, from the zoom template) but pass NO system fragments
+# (system_prompt_files: [] overrides the template's). Same sampling as
+# visual_probe_hard_reasoning. Run with MODEL=vero TOOLS=on.
+include:
+  - visual_probe_hard.yaml
+  - ../_tool_templates/_toolset_zoom_yaml
+task: "visual_probe_hard_reasoning_zoom"
+tag: visual_search
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 0.6
+  do_sample: True
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: ""
+    post_prompt: ""
+metadata:
+  system_prompt_files: []

@@ -1,0 +1,26 @@
+# GPT-5.5 (teacher) + the DRAWING toolset on the SketchVLM ball-drop task.
+# Distillation-teacher twin of sketchvlm_ball_drop_gpt55_zoom (see its header for
+# why this goes through the Responses API harness, not lmms_eval). Only the
+# toolset differs: the draw toolset template supplies metadata.allowed_tools
+# (draw_*) + system_prompt_files (system_base + system_draw). The draw tools need
+# the optional cv2/matplotlib deps in the MCP subprocess env (draw_box falls back
+# to PIL; the richer draw_* tools require the Visualizer extras).
+include:
+  - _default_template_yaml
+  - ../_tool_templates/_toolset_draw_yaml
+task: "sketchvlm_ball_drop_gpt55_draw"
+generation_kwargs:
+  max_new_tokens: 16384
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: ""
+    post_prompt: ""
+    prompt_version: "v4"
+metadata:
+  distill:
+    teacher_model: "gpt-5.5"        # AI Sandbox (Portkey) model id; see /home/lc1556/repo/AI-sandbox
+    reasoning_effort: "medium"      # gpt-5* reasoning knob (Responses API)
+    reasoning_summary: "auto"       # capture a chain-of-thought summary per turn
+    max_output_tokens: 16384        # per Responses API call (caps reasoning+visible; avoids truncating hard traces)
+    max_tool_iterations: 8          # cap multi-turn tool rounds
+    max_tool_images: 8              # cap tool-returned images fed back to the model

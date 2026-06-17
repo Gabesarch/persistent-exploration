@@ -1,0 +1,19 @@
+# Qwen3-VL Instruct zero-shot + the DRAWING toolset (multi-turn tool calling).
+# Modular composition: dataset template + reusable draw toolset template (which
+# contributes allowed_tools=draw_* and system_prompt_files=system_base+system_draw).
+# Run with TOOLS=on.
+include:
+  - visual_probe_hard.yaml
+  - ../_tool_templates/_toolset_draw_yaml
+task: "visual_probe_hard_qwen3_draw"
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 40
+  presence_penalty: 2.0
+  do_sample: True
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: "You are given an image. Search the picture to answer the question. Your final answer should be a short, specific phrase. "
+    post_prompt: ""

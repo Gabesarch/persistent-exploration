@@ -93,6 +93,15 @@ def extract_final_answer(
     if not text:
         return ""
 
+    # Multi-turn tool transcripts (async_openai): the final answer always follows
+    # the last tool response — everything before it is tool-loop history. A
+    # terminal answer-protocol call (e.g. screenspot's computer_use <tool_call>)
+    # comes after the last </tool_response>, so it survives this cut.
+    if "</tool_response>" in text:
+        text = text.rsplit("</tool_response>", 1)[-1].strip()
+    if "[MAX_TOOL_ITERATIONS_REACHED]" in text:
+        text = text.replace("[MAX_TOOL_ITERATIONS_REACHED]", "").strip()
+
     if "</think>" in text and "<think>" not in text:
         text = f"<think>\n{text}"
     if "<answer>" in text and "</answer>" in text:

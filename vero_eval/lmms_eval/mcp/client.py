@@ -37,7 +37,10 @@ class MCPClient:
         Run a specific tool with the given arguments.
         :param tool_name: Name of the tool to run.
         :param tool_args: Arguments for the tool.
-        :param env: Optional environment overrides for the MCP subprocess.
+        :param env: Extra env vars merged into the subprocess environment (used to
+            pass the per-call image registry, LMMS_EVAL_IMAGE_REGISTRY, so the tool
+            can resolve img_idx -> file path). Without this, stdio_client would give
+            the subprocess only a minimal default environment.
         :return: Result of the tool execution.
         """
         child_env = os.environ.copy()
@@ -90,7 +93,7 @@ class MCPClient:
         Run a specific tool with the given arguments.
         :param tool_name: Name of the tool to run.
         :param tool_args: Arguments for the tool.
-        :param env: Optional environment overrides for the MCP subprocess.
+        :param env: Extra env vars merged into the subprocess environment.
         :return: Result of the tool execution.
         """
         loop = asyncio.new_event_loop()

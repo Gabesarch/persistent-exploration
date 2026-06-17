@@ -1,0 +1,30 @@
+# GPT-5.5 (teacher) + the ZOOMING toolset on the SketchVLM ball-drop task.
+# This is a DISTILLATION-teacher config, consumed by
+# vero_eval/distill/collect_ball_drop_traces.py (NOT the lmms_eval generate path):
+# gpt-5.5 tool-calling with reasoning_effort must go through the OpenAI Responses
+# API, which the lmms_eval async_openai (chat.completions) backend does not speak.
+#
+# Modular composition is unchanged: the zoom toolset template still supplies
+# metadata.allowed_tools (image_zoom_in_tool) + metadata.system_prompt_files
+# (system_base + system_zoom), so the teacher sees the SAME tools and the SAME
+# system prompt as the student tool tasks. The metadata.distill block below adds
+# only the teacher-specific knobs the harness needs.
+include:
+  - _default_template_yaml
+  - ../_tool_templates/_toolset_zoom_yaml
+task: "sketchvlm_ball_drop_gpt55_zoom"
+generation_kwargs:
+  max_new_tokens: 16384
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: ""
+    post_prompt: ""
+    prompt_version: "v4"
+metadata:
+  distill:
+    teacher_model: "gpt-5.5"        # AI Sandbox (Portkey) model id; see /home/lc1556/repo/AI-sandbox
+    reasoning_effort: "medium"      # gpt-5* reasoning knob (Responses API)
+    reasoning_summary: "auto"       # capture a chain-of-thought summary per turn
+    max_output_tokens: 16384        # per Responses API call (caps reasoning+visible; avoids truncating hard traces)
+    max_tool_iterations: 8          # cap multi-turn tool rounds
+    max_tool_images: 8              # cap tool-returned images fed back to the model

@@ -12,8 +12,7 @@ import json
 import logging
 import os
 import tempfile
-import uuid
-from typing import List, Optional, Union
+from typing import List, Union
 
 # Offline mode for HuggingFace models
 os.environ.setdefault("HF_HOME", "/scratch/gpfs/ZHUANGL/hf_cache")
@@ -29,7 +28,7 @@ from PIL import Image, ImageDraw
 # Import it LAZILY through a same-named factory so this MCP server starts in a
 # minimal/offline env. This is the single canonical tool server: it supersedes the
 # old offline_image_tools.py (PIL-only) and vision_tools.py — the PIL-only tools
-# image_crop / image_resize / draw_box keep working even without cv2/matplotlib.
+# image_zoom_in_tool / draw_box keep working even without cv2/matplotlib.
 _VISUALIZER_CLS = None
 
 
@@ -53,7 +52,7 @@ def Visualizer(*args, **kwargs):
     except ImportError as exc:
         raise RuntimeError(
             "This drawing tool needs the optional 'visualizer' deps (cv2 + matplotlib), "
-            "which are not installed. Use image_crop / image_resize / draw_box (PIL-only) "
+            "which are not installed. Use image_zoom_in_tool / draw_box (PIL-only) "
             f"instead, or install the extras. ({exc})"
         )
 
@@ -63,17 +62,68 @@ logger = logging.getLogger(__name__)
 app = FastMCP("SimpleVQA Tools")
 
 COORD_SCALE = 1000  # Coordinate system uses 0-1000
+
+
+# Cap the size of every image a tool returns. Full-resolution PNGs of natural
+# photos (e.g. a 2000x1398 visual_probe image -> ~5 MB base64) otherwise overflow
+# both the MCP stdio transport (intermittent "TaskGroup" failures under concurrency)
+# and the model's 32768-token context. 1 MP matches the zoom tool's output budget.
+DRAW_MAX_PIXELS = 1048576
+DRAW_JPEG_QUALITY = 85
+
+
 _IMAGE_REGISTRY_ENV = "LMMS_EVAL_IMAGE_REGISTRY"
 
 
-def _image_to_content(image: np.ndarray) -> ImageContent:
-    """Convert numpy RGB array to ImageContent."""
-    pil_image = Image.fromarray(image)
-    image_bytes = io.BytesIO()
-    pil_image.save(image_bytes, format="PNG")
-    image_bytes.seek(0)
-    data = base64.b64encode(image_bytes.getvalue()).decode("utf-8")
-    return ImageContent(type="image", data=data, mimeType="image/png")
+def _resolve_image_path(img_idx: int) -> str:
+    """Resolve an image INDEX to a real file path via the registry the eval
+    backend passes in the LMMS_EVAL_IMAGE_REGISTRY env var (one snapshot per
+    tool call). Mirrors training, where a tool addresses images by img_idx into
+    agent_data.image_data[img_idx] (verl/tools/image_zoom_in_tool.py)."""
+    raw = os.environ.get(_IMAGE_REGISTRY_ENV)
+    if not raw:
+        raise ValueError("No image registry available (LMMS_EVAL_IMAGE_REGISTRY unset); pass img_idx for an image the eval registered.")
+    registry = json.loads(raw)
+    path = registry.get(str(int(img_idx)))
+    if path is None:
+        avail = sorted(int(k) for k in registry)
+        raise ValueError(f"img_idx {img_idx} is not available. Available indices: {avail}.")
+    return path
+
+
+def _bound_image(image: Image.Image) -> Image.Image:
+    """Downscale to <= DRAW_MAX_PIXELS so tool outputs stay small for the MCP
+    stdio transport and the model context. 1 MP matches the zoom output budget."""
+    image = image.convert("RGB")
+    pixels = image.width * image.height
+    if pixels > DRAW_MAX_PIXELS:
+        scale = (DRAW_MAX_PIXELS / pixels) ** 0.5
+        image = image.resize((max(1, round(image.width * scale)), max(1, round(image.height * scale))), Image.Resampling.LANCZOS)
+    return image
+
+
+def _encode_jpeg_content(image: Image.Image) -> ImageContent:
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG", quality=DRAW_JPEG_QUALITY)
+    buf.seek(0)
+    return ImageContent(type="image", data=base64.b64encode(buf.getvalue()).decode("utf-8"), mimeType="image/jpeg")
+
+
+def _save_and_emit(image: Image.Image):
+    """Bound `image`, persist it to a temp file so a later tool call can address
+    it by a fresh img_idx, and return [sentinel-text, bounded-JPEG-image]. The
+    eval backend turns the 'Saved drawn image to:' sentinel into a new img_idx
+    (mirrors training appending tool-output crops to agent_data.image_data)."""
+    bounded = _bound_image(image)
+    fd, path = tempfile.mkstemp(suffix=".jpg", prefix="vero2_tool_out_")
+    os.close(fd)
+    bounded.save(path, format="JPEG", quality=DRAW_JPEG_QUALITY)
+    return [TextContent(type="text", text=f"Saved drawn image to: {path}"), _encode_jpeg_content(bounded)]
+
+
+def _image_to_content(image: np.ndarray):
+    """Numpy RGB array -> [sentinel, bounded JPEG] (re-addressable by img_idx)."""
+    return _save_and_emit(Image.fromarray(image))
 
 
 def _to_pixel(value: int, size: int) -> float:
@@ -81,38 +131,9 @@ def _to_pixel(value: int, size: int) -> float:
     return (value / COORD_SCALE) * size
 
 
-def _pil_to_content(image: Image.Image) -> ImageContent:
-    """Encode a PIL image as an MCP ImageContent (base64 PNG)."""
-    buf = io.BytesIO()
-    image.convert("RGB").save(buf, format="PNG")
-    buf.seek(0)
-    return ImageContent(type="image", data=base64.b64encode(buf.getvalue()).decode("utf-8"), mimeType="image/png")
-
-
-def _save_output_image(image: Image.Image) -> List[Union[TextContent, ImageContent]]:
-    output_path = os.path.join(tempfile.gettempdir(), f"lmms_eval_drawn_{uuid.uuid4()}.png")
-    image.convert("RGB").save(output_path, format="PNG")
-    return [
-        TextContent(type="text", text=f"Saved drawn image to: {output_path}"),
-        _pil_to_content(image),
-    ]
-
-
-def _resolve_image_path(img_idx: int) -> str:
-    raw_registry = os.environ.get(_IMAGE_REGISTRY_ENV)
-    if not raw_registry:
-        raise ValueError("Image registry was not provided to the MCP tool process.")
-    try:
-        registry = json.loads(raw_registry)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Invalid image registry payload: {exc}") from exc
-    image_path = registry.get(str(img_idx))
-    if image_path is None:
-        available = sorted(int(key) for key in registry.keys()) if registry else []
-        if available:
-            raise ValueError(f"img_idx {img_idx} is not available. Available: {available[0]}-{available[-1]}")
-        raise ValueError(f"img_idx {img_idx} is not available. Registry is empty.")
-    return image_path
+def _pil_to_content(image: Image.Image):
+    """PIL image -> [sentinel, bounded JPEG] (re-addressable by img_idx)."""
+    return _save_and_emit(image)
 
 
 def _to_px_clamped(value: float, size: int) -> int:
@@ -120,7 +141,85 @@ def _to_px_clamped(value: float, size: int) -> int:
     return max(0, min(size, int((value / COORD_SCALE) * size)))
 
 
-# ========== MCP Drawing Tools ==========
+# ========== Offline-safe PIL-only tools (always available) ==========
+
+
+# ---- Zooming ----
+# Eval-side twin of the RL training zoom tool (verl/tools/image_zoom_in_tool.py +
+# vero2_scripts/config/tool_config/image_zoom_in_tool.yaml): same name, same
+# bbox_2d/label/img_idx arguments, same normalized_1000 coordinates and the same
+# output pixel budget, so tool behavior matches what tool-trained checkpoints saw.
+# Images are addressed by img_idx (a 0-based image index), like training: the eval
+# backend maps img_idx -> the actual file via the LMMS_EVAL_IMAGE_REGISTRY env var.
+ZOOM_MIN_PIXELS = 518400  # = training cropped_min_pixels
+ZOOM_MAX_PIXELS = 1048576  # = training cropped_max_pixels
+ZOOM_MIN_SIDE_PX = 28
+
+
+def _expand_to_min_side(lo: int, hi: int, size: int, min_side: int = ZOOM_MIN_SIDE_PX):
+    """Widen [lo, hi] around its center to at least min_side px, staying in [0, size]."""
+    if hi - lo >= min_side:
+        return lo, hi
+    center = (lo + hi) // 2
+    lo, hi = center - min_side // 2, center + (min_side + 1) // 2
+    if lo < 0:
+        lo, hi = 0, min(size, min_side)
+    if hi > size:
+        lo, hi = max(0, size - min_side), size
+    return lo, hi
+
+
+@app.tool(
+    name="image_zoom_in_tool",
+    description=(
+        "Zoom in on a specific region of an image by cropping it based on a bounding box (bbox_2d) "
+        "and an object label. img_idx is the 0-based index of the image to zoom into. Coordinates "
+        "use the 0-1000 scale where (0,0)=top-left and (1000,1000)=bottom-right. The crop is returned "
+        "magnified so small details become readable. "
+        'Example: image_zoom_in_tool(img_idx=0, bbox_2d=[480, 90, 640, 210], label="street sign").'
+    ),
+)
+def image_zoom_in_tool(img_idx: int, bbox_2d: List[int], label: str) -> list:
+    """Crop bbox_2d=[x1,y1,x2,y2] (0-1000 scale) out of image `img_idx` and resize the
+    crop into the training-time pixel budget. PIL-only (works offline)."""
+    image = Image.open(_resolve_image_path(img_idx)).convert("RGB")
+    w, h = image.size
+    coords = [int(v) for v in list(bbox_2d)[:4]]
+    if len(coords) != 4:
+        raise ValueError(f"bbox_2d must be [x1, y1, x2, y2] on the 0-1000 scale, got {bbox_2d}")
+    x1, y1, x2, y2 = coords
+    px1, py1 = _to_px_clamped(min(x1, x2), w), _to_px_clamped(min(y1, y2), h)
+    px2, py2 = _to_px_clamped(max(x1, x2), w), _to_px_clamped(max(y1, y2), h)
+    px1, px2 = _expand_to_min_side(px1, px2, w)
+    py1, py2 = _expand_to_min_side(py1, py2, h)
+    crop = image.crop((px1, py1, max(px1 + 1, px2), max(py1 + 1, py2)))
+    pixels = crop.width * crop.height
+    if pixels < ZOOM_MIN_PIXELS:
+        scale = (ZOOM_MIN_PIXELS / pixels) ** 0.5
+    elif pixels > ZOOM_MAX_PIXELS:
+        scale = (ZOOM_MAX_PIXELS / pixels) ** 0.5
+    else:
+        scale = 1.0
+    if scale != 1.0:
+        crop = crop.resize((max(1, round(crop.width * scale)), max(1, round(crop.height * scale))), Image.Resampling.LANCZOS)
+    return _pil_to_content(crop)
+
+# ========== MCP Drawing Tools (adopted from origin/main) ==========
+# The 5 tools below (draw_boxes / draw_points / draw_lines / draw_texts /
+# draw_polygons) are origin/main's redesigned drawing toolset, taken verbatim.
+# Only their image-output path differs: they call _save_output_image, which we
+# route through _save_and_emit (see helpers above) so every drawn image is
+# downscaled to <= DRAW_MAX_PIXELS and JPEG-encoded. main's original
+# _save_output_image emitted a full-resolution PNG, which overflowed the MCP
+# stdio transport and the model context (this is what had zeroed the draw runs).
+
+
+def _save_output_image(image: Image.Image):
+    """Drawing-tool output path -> bounded JPEG via _save_and_emit. Returns
+    ['Saved drawn image to: <path>' sentinel, bounded JPEG image]; the eval
+    backend turns the sentinel into a fresh img_idx so a later tool call can
+    address the drawn image (mirrors training appending crops to image_data)."""
+    return _save_and_emit(image)
 
 
 @app.tool(name="draw_points", description="Draw one or more point markers on an image. Coordinates use 0-1000 scale where (0,0)=top-left, (1000,1000)=bottom-right. For a single point, pass [x, y]. For multiple points, pass [[x1, y1], [x2, y2], ...]. Example: draw_points(img_idx=0, points=[[500, 500], [600, 600]]) draws 2 points.")

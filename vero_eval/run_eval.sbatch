@@ -64,6 +64,15 @@ esac
 export CHECKPOINT_PATH PORT API_KEY
 export MODEL_NAME="${MODEL_NAME:-qwen_vllm}" MODEL_VERSION="${MODEL_VERSION:-qwen_vllm}"
 
+# Vero RL checkpoints must be SERVED with their forced-think TRAINING chat template
+# (it ends each assistant turn with '<think>\n' + renders the tool-call format). vLLM
+# otherwise uses tokenizer_config.json's base template and Vero skips <think>/tools and
+# answers directly. Default CHAT_TEMPLATE to the checkpoint's chat_template.jinja.
+if [[ "$MODEL" == vero || "$MODEL" == vero-thinking ]] && [[ -z "${CHAT_TEMPLATE:-}" ]] && [[ -f "$CHECKPOINT_PATH/chat_template.jinja" ]]; then
+  export CHAT_TEMPLATE="$CHECKPOINT_PATH/chat_template.jinja"
+  echo "MODEL=$MODEL -> serving with forced-think chat template: $CHAT_TEMPLATE"
+fi
+
 # ── 2) TOOLS on/off ──
 if [[ "$TOOLS" == "off" ]]; then export MCP_SERVER_PATH=""; else export MCP_SERVER_PATH="${MCP_SERVER_PATH:-lmms_eval/mcp/vero2_mcp.py}"; fi
 

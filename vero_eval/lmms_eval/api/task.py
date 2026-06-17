@@ -1155,7 +1155,14 @@ class ConfigurableTask(Task):
             if "create_link" in dataset_kwargs:
                 dataset_kwargs.pop("create_link")
 
-        if dataset_kwargs is not None and "load_from_disk" in dataset_kwargs and dataset_kwargs["load_from_disk"]:
+        if dataset_kwargs is not None and "builder_fn" in dataset_kwargs:
+            # Explicit dataset builder: a `!function` in the task yaml returning a
+            # datasets.DatasetDict. For HF repos whose snapshot has no loadable data
+            # files (e.g. likaixin/ScreenSpot-Pro is raw annotations/ + images/),
+            # datasets.load_dataset fails under HF_HUB_OFFLINE=1 — the builder
+            # constructs the DatasetDict from the local snapshot instead.
+            self.dataset = dataset_kwargs["builder_fn"]()
+        elif dataset_kwargs is not None and "load_from_disk" in dataset_kwargs and dataset_kwargs["load_from_disk"]:
             # using local task in offline environment, need to process the online dataset into local format via
             # `ds = load_datasets("lmms-lab/MMMU")`
             self.dataset = datasets.load_from_disk(dataset_path=self.DATASET_PATH)
