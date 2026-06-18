@@ -54,6 +54,37 @@ _IMAGE_REGISTRY_ENV = "LMMS_EVAL_IMAGE_REGISTRY"
 # system_prompt_files paths declared in task yamls (e.g. prompts/tools/*.txt).
 _VERO_EVAL_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+
+def _composite_zoom_to_original(image_provenance, img_idx, bbox):
+    """Remap a zoom-into-img_idx call so it crops the ROOT original at NATIVE resolution.
+
+    Each img_idx has provenance (orig_idx, region=[X1,Y1,X2,Y2]) = the native-pixel rectangle of
+    original `orig_idx` that this image represents. The model's 0-1000 bbox (on the image it sees)
+    is composited into the original's native pixels (region_origin + bbox/1000*region_span), then
+    re-expressed as a 0-1000 bbox of the ORIGINAL so the (unchanged) MCP tool, called with
+    img_idx=orig_idx, crops the original PNG at full resolution instead of re-cropping a resized
+    crop. Mirrors the training tool's in-tool compositing. Returns
+    (orig_idx, native_subregion, bbox_in_original_0_1000) or None if no provenance.
+    For an original (region = full image) this is a no-op: bbox' == bbox, orig_idx == img_idx."""
+    prov = image_provenance.get(img_idx)
+    root = image_provenance.get(prov[0]) if prov is not None else None
+    if prov is None or root is None:
+        return None
+    orig_idx, region = prov
+    x1, y1, x2, y2 = region
+    rw, rh = x2 - x1, y2 - y1
+    nsub = [
+        x1 + bbox[0] / 1000.0 * rw, y1 + bbox[1] / 1000.0 * rh,
+        x1 + bbox[2] / 1000.0 * rw, y1 + bbox[3] / 1000.0 * rh,
+    ]
+    w_orig, h_orig = root[1][2], root[1][3]  # root region is [0,0,W,H] (full original, native)
+    bbox_prime = [
+        nsub[0] / w_orig * 1000.0, nsub[1] / h_orig * 1000.0,
+        nsub[2] / w_orig * 1000.0, nsub[3] / h_orig * 1000.0,
+    ]
+    return orig_idx, nsub, bbox_prime
+
+
 load_dotenv(verbose=True)
 
 
@@ -359,8 +390,9 @@ class AsyncOpenAIChat(lmms):
                 bbox_str = str(bbox)
             wording = f"Zoomed in on the image to the region {bbox_str} with label {label}."
             if mode == "multi_index":
-                wording += (f" The cropped view is now available as img_idx {assigned_idx}; "
-                            f"you can zoom into it (or img_idx 0, the original) for a closer look.")
+                # Inform-only: announce the crop is addressable, without nudging the model to
+                # always zoom further (avoids biasing it toward an extra "closer look").
+                wording += f" The cropped view is now available as img_idx {assigned_idx}."
             return wording
         return f"Registered image as img_idx {assigned_idx}."
 
@@ -417,6 +449,12 @@ class AsyncOpenAIChat(lmms):
         # via the registry passed in LMMS_EVAL_IMAGE_REGISTRY. Tool-produced images
         # get appended with a new img_idx below (mirrors agent_data.image_data growth).
         image_registry: Dict[int, str] = {}
+        # Provenance for original-resolution crop compositing: {img_idx: (orig_idx, [x1,y1,x2,y2])}
+        # = the native-pixel rectangle of original `orig_idx` that this image represents. Seeded
+        # for each initial image as (itself, full native bounds); crops get composited regions.
+        # A zoom into a crop is remapped to crop the ROOT original at native resolution (see
+        # _composite_zoom_to_original) so chained / multi-index zooms keep full detail.
+        image_provenance: Dict[int, tuple] = {}
         next_img_idx = 0
         if self.mcp_client is not None:
             for image_idx, image in enumerate(images):
@@ -426,6 +464,7 @@ class AsyncOpenAIChat(lmms):
                 image.save(image_path, format="PNG")
                 request_image_paths.append(image_path)
                 image_registry[next_img_idx] = image_path
+                image_provenance[next_img_idx] = (next_img_idx, [0.0, 0.0, float(image.width), float(image.height)])
                 next_img_idx += 1
                 messages[-1]["content"].append(
                     {
@@ -534,13 +573,28 @@ class AsyncOpenAIChat(lmms):
                         break
                     try:
                         tool_args = json.loads(call.function.arguments) if call.function.arguments else {}
+                        call_args = tool_args  # what the tool actually runs (may be remapped below)
+                        zoom_provenance = None   # (orig_idx, native_subregion) of the crop this call yields
                         if "img_idx" in tool_args:
                             _idx = int(tool_args["img_idx"])
                             if _idx not in image_registry:
                                 raise ValueError(f"img_idx {_idx} is not available. Available indices: {sorted(image_registry)}.")
+                            # Original-resolution crop: remap a zoom into ANY image to crop the ROOT
+                            # original at native resolution (composite the 0-1000 bbox through
+                            # provenance). No-op for originals (img_idx whose region is the full image).
+                            # tool_args is kept as-is for the model-visible tool_response wording; only
+                            # the executed call_args is remapped.
+                            if call.function.name == "image_zoom_in_tool" and isinstance(tool_args.get("bbox_2d"), (list, tuple)) and len(tool_args["bbox_2d"]) >= 4:
+                                composited = _composite_zoom_to_original(image_provenance, _idx, [float(v) for v in tool_args["bbox_2d"][:4]])
+                                if composited is not None:
+                                    orig_idx, nsub, bbox_prime = composited
+                                    zoom_provenance = (orig_idx, nsub)
+                                    call_args = dict(tool_args)
+                                    call_args["img_idx"] = orig_idx
+                                    call_args["bbox_2d"] = bbox_prime
                         # Snapshot the registry into the tool subprocess so it can map img_idx -> path.
                         tool_env = {_IMAGE_REGISTRY_ENV: json.dumps({str(k): v for k, v in image_registry.items()})}
-                        result = await self.mcp_client.run_tool(call.function.name, tool_args, env=tool_env)
+                        result = await self.mcp_client.run_tool(call.function.name, call_args, env=tool_env)
                         raw_parts = []
                         for content in result.content:
                             raw_parts.extend(self.mcp_client.convert_result_to_openai_format(content))
@@ -570,6 +624,10 @@ class AsyncOpenAIChat(lmms):
                                 request_image_paths.append(saved_path)
                                 assigned_idx = next_img_idx
                                 image_registry[assigned_idx] = saved_path
+                                if zoom_provenance is not None:
+                                    # Carry provenance so a later zoom into this crop composites
+                                    # back to the ROOT original at native resolution again.
+                                    image_provenance[assigned_idx] = zoom_provenance
                                 next_img_idx += 1
                                 text = text.replace(match.group(0), self._tool_image_registered_text(image_indexing_mode, call.function.name, tool_args, assigned_idx))
                             part = {"type": "text", "text": text}
