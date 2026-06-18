@@ -1,14 +1,13 @@
 #!/bin/bash
 #SBATCH --job-name=crop_hard_fe
-#SBATCH --partition=pli
-#SBATCH --account=vlmrl
+#SBATCH --partition=pli-c
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=968G
 #SBATCH --time=24:00:00
-#SBATCH --array=1-3%1
+#SBATCH --array=1-5%1
 #SBATCH --output=slurm/output/%x_%j.log
 #SBATCH --error=slurm/error/%x_%j.log
 

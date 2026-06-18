@@ -39,7 +39,7 @@ data:
   normalize_bbox_to_1000: true
   return_raw_chat: true
   return_multi_modal_inputs: false
-  tool_config_path: ${oc.env:VERL_ROOT}/vero2_scripts/config/tool_config/image_zoom_in_tool_multiidx.yaml
+  tool_config_path: ${oc.env:VERL_ROOT}/vero2_scripts/config/tool_config/image_zoom_in_tool.yaml
   per_batch_domain_weights:
     chart: 1
     counting: 1
@@ -223,7 +223,7 @@ actor_rollout_ref:
       default_agent_loop: tool_agent
     multi_turn:
       enable: true
-      tool_config_path: ${oc.env:VERL_ROOT}/vero2_scripts/config/tool_config/image_zoom_in_tool_multiidx.yaml
+      tool_config_path: ${oc.env:VERL_ROOT}/vero2_scripts/config/tool_config/image_zoom_in_tool.yaml
       max_assistant_turns: 11
       max_user_turns: 10
       max_parallel_calls: 1

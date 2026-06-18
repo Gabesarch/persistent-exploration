@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=968G
 #SBATCH --time=24:00:00
-#SBATCH --array=1-3%1
+#SBATCH --array=1-2%1
 #SBATCH --output=slurm/output/%x_%j.log
 #SBATCH --error=slurm/error/%x_%j.log
 #SBATCH --dependency=afterany:9252967_3

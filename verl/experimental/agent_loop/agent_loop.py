@@ -1021,6 +1021,9 @@ class AgentLoopWorker:
         # Keep a stable set of keys so downstream batch concat stays consistent across agent loops.
         extra_fields = {}
         default_extra_keys = {
+            "forced_structure_error",
+            "forced_structure_error_reason",
+            "forced_structure_error_assistant_turn",
             "turn_scores",
             "tool_rewards",
             "min_global_steps",

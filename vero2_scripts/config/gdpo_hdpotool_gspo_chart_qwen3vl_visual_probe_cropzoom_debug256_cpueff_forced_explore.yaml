@@ -182,7 +182,7 @@ actor_rollout_ref:
     ppo_micro_batch_size_per_gpu: 1
     ulysses_sequence_parallel_size: 1
     use_dynamic_bsz: true
-    ppo_max_token_len_per_gpu: 61440
+    ppo_max_token_len_per_gpu: 49296
     loss_agg_mode: seq-mean-token-mean
     policy_loss:
       loss_mode: gspo
@@ -239,7 +239,7 @@ actor_rollout_ref:
     engine_kwargs:
       vllm:
         mm_processor_cache_gb: 0
-    gpu_memory_utilization: 0.7
+    gpu_memory_utilization: 0.6
     enable_prefix_caching: false
     max_model_len: 40960
     max_num_batched_tokens: 8192
@@ -259,16 +259,16 @@ actor_rollout_ref:
       n: 1
     log_prob_use_dynamic_bsz: true
     log_prob_micro_batch_size_per_gpu: 1
-    log_prob_max_token_len_per_gpu: 61440
+    log_prob_max_token_len_per_gpu: 49296
     checkpoint_engine:
-      update_weights_bucket_megabytes: 6144
+      update_weights_bucket_megabytes: 2048
 
   ref:
     strategy: fsdp2
     ulysses_sequence_parallel_size: 2
     log_prob_micro_batch_size_per_gpu: 1
     log_prob_use_dynamic_bsz: true
-    log_prob_max_token_len_per_gpu: 61440
+    log_prob_max_token_len_per_gpu: 49296
     entropy_from_logits_with_chunking: true
     use_torch_compile: false
     fsdp_config:
@@ -304,8 +304,8 @@ reward:
 critic:
   ulysses_sequence_parallel_size: 1
   use_dynamic_bsz: true
-  ppo_max_token_len_per_gpu: 61440
-  forward_max_token_len_per_gpu: 61440
+  ppo_max_token_len_per_gpu: 49296
+  forward_max_token_len_per_gpu: 49296
   forward_micro_batch_size_per_gpu: 16
 
 trainer:

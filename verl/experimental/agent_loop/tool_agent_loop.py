@@ -45,6 +45,11 @@ from verl.utils.debug.comprehensive_logging import (
 from verl.utils.profiler import simple_timer
 from verl.utils.response_display import apply_response_display_prefix, get_response_display_prefix
 from verl.utils.rollout_trace import rollout_trace_op
+from verl.utils.forced_action_tags import (
+    FORCE_ACTION_AFTER_THINK_IDS_OPTIONS_KEY,
+    FORCE_ACTION_REQUIRED_TAG_KEY,
+    FORCE_ACTION_TAG_IDS_KEY,
+)
 from verl.workers.rollout.replica import TokenOutput
 
 logger = logging.getLogger(__file__)
@@ -55,6 +60,9 @@ TERMINAL_TOOL_EXTRA_FIELD_DEFAULTS: dict[str, Any] = {
     "terminal_tool_name": None,
     "terminal_tool_error": None,
     "terminal_reason": None,
+    "forced_structure_error": False,
+    "forced_structure_error_reason": None,
+    "forced_structure_error_assistant_turn": None,
 }
 
 
@@ -286,19 +294,33 @@ class ToolAgentLoop(AgentLoopBase):
             or (len(agent_data.response_mask) + self.final_answer_token_margin >= self.response_length)
         )
 
+    def _with_forced_action_extra_args(self, sampling_params: dict[str, Any], required_tag: str) -> dict[str, Any]:
+        tag_ids = self.tokenizer.encode(f"\n{required_tag}", add_special_tokens=False)
+        if not tag_ids:
+            raise ValueError(f"required action tag encoded to no tokens: {required_tag}")
+
+        extra_args = dict(sampling_params.get("extra_args") or {})
+        extra_args.update(
+            {
+                FORCE_ACTION_REQUIRED_TAG_KEY: required_tag,
+                FORCE_ACTION_TAG_IDS_KEY: tag_ids,
+                FORCE_ACTION_AFTER_THINK_IDS_OPTIONS_KEY: [
+                    self.tokenizer.encode("</think>", add_special_tokens=False),
+                ],
+            }
+        )
+        return {**sampling_params, "extra_args": extra_args}
+
     async def _handle_generating_state(
         self, agent_data: AgentData, sampling_params: dict[str, Any], ignore_termination: bool = False
     ) -> AgentState:
         """Handle the generating state: generate model response and check for tool calls."""
         add_messages: list[dict[str, Any]] = []
+        forced_required_tag: Optional[str] = None
 
         if self.force_tool_calls_until_final_turn:
-            # Ban <answer> until the final allowable turn (forcing tool calls), then ban <tool_call>
-            # to force a final answer. New dict to avoid leaking bad_words across turns / callers.
-            sampling_params = {
-                **sampling_params,
-                "bad_words": ["<tool_call>"] if self._must_answer_now(agent_data) else ["<answer>"],
-            }
+            forced_required_tag = "<answer>" if self._must_answer_now(agent_data) else "<tool_call>"
+            sampling_params = self._with_forced_action_extra_args(sampling_params, forced_required_tag)
 
         with simple_timer("generate_sequences", agent_data.metrics):
             output: TokenOutput = await self.server_manager.generate(
@@ -348,6 +370,22 @@ class ToolAgentLoop(AgentLoopBase):
             agent_data.debug_events.append(event)
             self._debug_append_event(event)
 
+        # Extract tool calls before termination checks so forced final turns can be validated.
+        tools = [tool.tool_schema for tool in self.tools.values()]
+        _, agent_data.tool_calls = await self.tool_parser.extract_tool_calls(agent_data.response_ids, tools)
+
+        if forced_required_tag == "<tool_call>" and not agent_data.tool_calls:
+            self._mark_forced_structure_error(agent_data, "missing_tool_call")
+            return AgentState.TERMINATED
+        if forced_required_tag == "<answer>":
+            assistant_message = await self.loop.run_in_executor(
+                None, lambda: self.tokenizer.decode(agent_data.response_ids, skip_special_tokens=True)
+            )
+            if agent_data.tool_calls or "<answer>" not in assistant_message:
+                reason = "unexpected_tool_call_on_final_turn" if agent_data.tool_calls else "missing_final_answer"
+                self._mark_forced_structure_error(agent_data, reason)
+                return AgentState.TERMINATED
+
         # Check termination conditions
         if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
             return AgentState.TERMINATED
@@ -355,10 +393,6 @@ class ToolAgentLoop(AgentLoopBase):
             return AgentState.TERMINATED
         if self.max_user_turns and agent_data.user_turns >= self.max_user_turns:
             return AgentState.TERMINATED
-
-        # Extract tool calls
-        tools = [tool.tool_schema for tool in self.tools.values()]
-        _, agent_data.tool_calls = await self.tool_parser.extract_tool_calls(agent_data.response_ids, tools)
 
         # Handle interaction if needed
         if self.interaction_config_file:
@@ -375,6 +409,24 @@ class ToolAgentLoop(AgentLoopBase):
             return AgentState.INTERACTING
         else:
             return AgentState.TERMINATED
+
+    def _mark_forced_structure_error(self, agent_data: AgentData, reason: str) -> None:
+        agent_data.extra_fields.update(
+            {
+                "forced_structure_error": True,
+                "forced_structure_error_reason": reason,
+                "forced_structure_error_assistant_turn": agent_data.assistant_turns,
+            }
+        )
+        if self._debug_enabled_for_agent(agent_data):
+            event = {
+                "event": "forced_structure_error",
+                "request_id": agent_data.request_id,
+                "assistant_turn": agent_data.assistant_turns,
+                "reason": reason,
+            }
+            agent_data.debug_events.append(event)
+            self._debug_append_event(event)
 
     async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
         """Handle the processing tools state: execute tool calls and prepare tool responses."""

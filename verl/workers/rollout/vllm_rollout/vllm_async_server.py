@@ -40,6 +40,7 @@ from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import DistProfiler, build_vllm_profiler_args
 from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
+from verl.utils.forced_action_tags import ensure_forced_action_logits_processor
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.utils import get_max_position_embeddings, qwen2_5_vl_dedup_image_tokens, run_uvicorn
@@ -208,6 +209,7 @@ class vLLMHttpServer:
             engine_kwargs["cuda_graph_sizes"] = self.config.cudagraph_capture_sizes
 
         self._preprocess_engine_kwargs(engine_kwargs)
+        self._maybe_enable_forced_action_logits_processor(engine_kwargs)
 
         # Override default generation config from hugging face model config,
         # user can still override them by passing kwargs in each request.
@@ -370,6 +372,13 @@ class vLLMHttpServer:
             await self.run_server(server_args)
         else:
             await self.run_headless(server_args)
+
+    def _maybe_enable_forced_action_logits_processor(self, engine_kwargs: dict[str, Any]) -> None:
+        multi_turn_config = getattr(self.config, "multi_turn", None)
+        force_tool_calls = bool(getattr(multi_turn_config, "force_tool_calls_until_final_turn", False))
+        if not force_tool_calls:
+            return
+        ensure_forced_action_logits_processor(engine_kwargs)
 
     async def run_server(self, args: argparse.Namespace):
         engine_args = AsyncEngineArgs.from_cli_args(args)

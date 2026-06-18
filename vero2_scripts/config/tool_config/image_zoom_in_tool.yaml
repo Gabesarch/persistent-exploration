@@ -11,6 +11,12 @@ tools:
       cropped_max_pixels: 1048576
       use_original_resolution_source: true
       original_source_unavailable_policy: fallback
+      # Multi-index variant: after each zoom, register the crop as a NEW addressable
+      # img_idx and tell the model it can zoom into it. Mirrors the vero_eval task
+      # visual_probe_hard_reasoning_zoom_multiidx (image_indexing: multi_index). The
+      # default ("training_faithful") reproduces the step-403 training behavior, where
+      # the response never announced a new index (581/581 calls used img_idx 0).
+      image_indexing: multi_index
     tool_schema:
       type: function
       function:

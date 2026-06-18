@@ -29,6 +29,7 @@ from verl.experimental.agent_loop.agent_loop import (
     DictConfigWrap,
     _InternalAgentLoopOutput,
 )
+from verl.protocol import DataProto
 from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
 from verl.utils.dataset.rl_dataset import RLHFDataset
 from verl.workers.rollout.replica import TokenOutput
@@ -250,6 +251,61 @@ async def test_agent_loop_extra_fields_schema_stable_for_training_concat_on_cpu(
     # And the list-typed fields are actually lists (not missing / scalar).
     assert merged.non_tensor_batch["turn_scores"][0] == []
     assert merged.non_tensor_batch["tool_rewards"][0] == []
+
+
+def test_agent_loop_postprocess_keeps_forced_structure_schema_stable_across_worker_concat_on_cpu():
+    dummy_worker = type(
+        "_DummyWorker",
+        (),
+        {"reward_loop_worker_handles": None, "distillation_enabled": False, "stream_teacher_with_rollout": False},
+    )()
+
+    base_kwargs = {
+        "output_prompt_ids": [101, 102],
+        "output_response_ids": [11, 12],
+        "output_response_mask": [1, 1],
+        "metrics": AgentLoopMetrics(),
+        "num_turns": 2,
+        "prompt_len": 4,
+        "response_len": 4,
+    }
+    without_error = _to_internal(
+        **base_kwargs,
+        extra_fields={"turn_scores": [], "tool_rewards": []},
+    )
+    with_error = _to_internal(
+        **base_kwargs,
+        extra_fields={
+            "turn_scores": [],
+            "tool_rewards": [],
+            "forced_structure_error": True,
+            "forced_structure_error_reason": "missing_tool_call",
+            "forced_structure_error_assistant_turn": 1,
+        },
+    )
+
+    chunk_without_error = AgentLoopWorker._postprocess(
+        dummy_worker,
+        inputs=[without_error],
+        input_non_tensor_batch={
+            "index": np.array([0], dtype=object),
+            "agent_name": np.array(["tool_agent"], dtype=object),
+        },
+    )
+    chunk_with_error = AgentLoopWorker._postprocess(
+        dummy_worker,
+        inputs=[with_error],
+        input_non_tensor_batch={
+            "index": np.array([1], dtype=object),
+            "agent_name": np.array(["tool_agent"], dtype=object),
+        },
+    )
+
+    merged = DataProto.concat([chunk_without_error, chunk_with_error])
+
+    assert merged.non_tensor_batch["forced_structure_error"].tolist() == [None, True]
+    assert merged.non_tensor_batch["forced_structure_error_reason"].tolist() == [None, "missing_tool_call"]
+    assert merged.non_tensor_batch["forced_structure_error_assistant_turn"].tolist() == [None, 1]
 
 
 @pytest.mark.asyncio
