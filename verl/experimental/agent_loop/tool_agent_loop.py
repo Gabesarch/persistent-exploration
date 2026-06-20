@@ -138,6 +138,10 @@ class ToolAgentLoop(AgentLoopBase):
         self.tool_response_truncate_side = self.rollout_config.multi_turn.tool_response_truncate_side
         self.force_tool_calls_until_final_turn = self.rollout_config.multi_turn.force_tool_calls_until_final_turn
         self.final_answer_token_margin = self.rollout_config.multi_turn.final_answer_token_margin
+        self.tool_response_turn_suffix_enabled = self.rollout_config.multi_turn.tool_response_turn_suffix_enabled
+        self.tool_response_explore_turns = self.rollout_config.multi_turn.tool_response_explore_turns
+        self.tool_response_explore_suffix = self.rollout_config.multi_turn.tool_response_explore_suffix
+        self.tool_response_final_suffix = self.rollout_config.multi_turn.tool_response_final_suffix
         tool_config_path = self.rollout_config.multi_turn.tool_config_path
         tool_list = initialize_tools_from_config(tool_config_path) if tool_config_path else []
         self.tools = {tool.name: tool for tool in tool_list}
@@ -310,6 +314,46 @@ class ToolAgentLoop(AgentLoopBase):
             }
         )
         return {**sampling_params, "extra_args": extra_args}
+
+    def _tool_response_turn_suffix(self, assistant_turn: int) -> str:
+        if not self.tool_response_turn_suffix_enabled:
+            return ""
+        if assistant_turn < self.tool_response_explore_turns:
+            return self.tool_response_explore_suffix or ""
+        if assistant_turn == self.tool_response_explore_turns:
+            return self.tool_response_final_suffix or ""
+        return ""
+
+    @staticmethod
+    def _append_text_suffix(text: str, suffix: str) -> str:
+        if not suffix:
+            return text
+        if not text:
+            return suffix
+        return f"{text}\n\n{suffix}"
+
+    def _append_suffix_to_tool_message(self, message: dict[str, Any], suffix: str) -> dict[str, Any]:
+        if not suffix:
+            return message
+
+        content = message.get("content")
+        if isinstance(content, str):
+            return {**message, "content": self._append_text_suffix(content, suffix)}
+
+        if isinstance(content, list):
+            new_content: list[Any] = []
+            appended = False
+            for item in content:
+                if not appended and isinstance(item, dict) and item.get("type") == "text" and "text" in item:
+                    new_content.append({**item, "text": self._append_text_suffix(str(item.get("text") or ""), suffix)})
+                    appended = True
+                else:
+                    new_content.append(item)
+            if not appended:
+                new_content.append({"type": "text", "text": suffix})
+            return {**message, "content": new_content}
+
+        return {**message, "content": suffix}
 
     async def _handle_generating_state(
         self, agent_data: AgentData, sampling_params: dict[str, Any], ignore_termination: bool = False
@@ -489,6 +533,7 @@ class ToolAgentLoop(AgentLoopBase):
         # Process tool responses and update multi_modal_data
         # Removed: agent_data.new_images_this_turn = []
         for tool_call, (tool_response, tool_reward, tool_info) in zip(active_tool_calls, responses, strict=False):
+            response_suffix = self._tool_response_turn_suffix(agent_data.assistant_turns)
             if self._debug_enabled_for_agent(agent_data):
                 event = {
                     "event": "tool_response",
@@ -496,7 +541,7 @@ class ToolAgentLoop(AgentLoopBase):
                     "assistant_turn": agent_data.assistant_turns,
                     "tool_name": tool_call.name,
                     "tool_arguments": tool_call.arguments,
-                    "tool_response_text": tool_response.text,
+                    "tool_response_text": self._append_text_suffix(tool_response.text or "", response_suffix),
                     "tool_reward": tool_reward,
                     "tool_info": tool_info,
                 }
@@ -523,6 +568,7 @@ class ToolAgentLoop(AgentLoopBase):
                 # Text-only content
                 message = {"role": "tool", "content": tool_response.text or ""}
 
+            message = self._append_suffix_to_tool_message(message, response_suffix)
             add_messages.append(message)
 
             crop_refs = list(tool_response.crop_image_refs or [])

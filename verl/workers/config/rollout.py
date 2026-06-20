@@ -89,6 +89,17 @@ class MultiTurnConfig(BaseConfig):
     num_repeat_rollouts: Optional[int] = None
     force_tool_calls_until_final_turn: bool = False
     final_answer_token_margin: int = 2048
+    tool_response_turn_suffix_enabled: bool = False
+    tool_response_explore_turns: int = 10
+    tool_response_explore_suffix: str = (
+        "Even if you are confident in your answer, please explore more by outputting a zoom tool call in the next "
+        "turn. You are encouraged to use depth first search (zooming deeper into previously explored regions) and "
+        "breadth first search (zooming into image regions not yet examined), and are discouraged from similarly "
+        "repeating previous zoom explorations."
+    )
+    tool_response_final_suffix: str = (
+        "The maximum amount of tool calling has been reached. Please output a final answer in the next turn."
+    )
 
 
 @dataclass

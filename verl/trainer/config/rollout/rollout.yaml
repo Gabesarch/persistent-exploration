@@ -220,6 +220,12 @@ multi_turn:
   # drops below this, switch to forcing an answer to avoid an answerless overflow.
   final_answer_token_margin: 2048
 
+  # Append turn-dependent guidance to tool responses without forcing logits/actions.
+  tool_response_turn_suffix_enabled: False
+  tool_response_explore_turns: 10
+  tool_response_explore_suffix: "Even if you are confident in your answer, please explore more by outputting a zoom tool call in the next turn. You are encouraged to use depth first search (zooming deeper into previously explored regions) and breadth first search (zooming into image regions not yet examined), and are discouraged from similarly repeating previous zoom explorations."
+  tool_response_final_suffix: "The maximum amount of tool calling has been reached. Please output a final answer in the next turn."
+
 # support logging rollout prob for debugging purpose
 # "Truncated importance sampling" requires rollout log probs, set to True when turning on Truncated importance sampling
 calculate_log_probs: False
