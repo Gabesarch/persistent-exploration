@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=968G
 #SBATCH --time=24:00:00
-#SBATCH --array=1-5%1
+#SBATCH --array=1-1%1
 #SBATCH --output=slurm/output/%x_%j.log
 #SBATCH --error=slurm/error/%x_%j.log
 
@@ -47,7 +47,7 @@ RUN_UNIQUE_ID="${RUN_UNIQUE_ID:-${SLURM_JOB_ID:-pid_$$}}"
 NUM_GPUS="${NUM_GPUS:-${SLURM_GPUS_ON_NODE:-8}}"
 
 ALGORITHM_TAG="${ALGORITHM_TAG:-GDPO_HDPOtool_GSPO_fp16_math_verify}"
-TRAINER_EXPERIMENT_SUFFIX="${TRAINER_EXPERIMENT_SUFFIX:-qwen3vl_visual_probe_cropzoom_gdpo_hdpotool_hardonly_forced_explore_fixedsampling}"
+TRAINER_EXPERIMENT_SUFFIX="${TRAINER_EXPERIMENT_SUFFIX:-qwen3vl_visual_probe_cropzoom_gdpo_hdpotool_hardonly_forced_explore_fixedsampling_multiidxfix}"
 CHECKPOINT_EXPERIMENT_NAME="${CHECKPOINT_EXPERIMENT_NAME:-${ALGORITHM_TAG}_${TRAINER_EXPERIMENT_SUFFIX}_${CHECKPOINT_DATE_TIME}}"
 TRAINER_EXPERIMENT_NAME="${TRAINER_EXPERIMENT_NAME:-${CHECKPOINT_EXPERIMENT_NAME}_${RUN_UNIQUE_ID}}"
 TRAINER_PROJECT_NAME="${TRAINER_PROJECT_NAME:-vero2_verl}"

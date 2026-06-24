@@ -27,7 +27,7 @@ data:
   val_batch_size: 256
   max_prompt_length: 16384
   max_response_length: 24576
-  max_pixels: 4194304
+  max_pixels: 10000000
   filter_overlong_prompts: false
   truncation: error
   image_key: images
@@ -230,6 +230,8 @@ actor_rollout_ref:
       # Forced exploration: ban <answer> on turns 1-10 (force tool calls), force <answer> on turn 11.
       force_tool_calls_until_final_turn: true
       final_answer_token_margin: 2048
+      # On the forced final turn, start the answer with a boxed expression: <answer>\n\boxed{
+      force_final_answer_prefix: "\n\\boxed{"
     tensor_model_parallel_size: 1
     ignore_eos: false
     disable_log_stats: false
@@ -241,7 +243,7 @@ actor_rollout_ref:
     enable_prefix_caching: false
     max_model_len: 40960
     max_num_batched_tokens: 8192
-    max_num_seqs: 1024
+    max_num_seqs: 728
     enable_chunked_prefill: true
     enforce_eager: false
     free_cache_engine: true
@@ -310,7 +312,7 @@ trainer:
   critic_warmup: 0
   logger: ["console", "wandb"]
   save_freq: 40
-  test_freq: 40
+  test_freq: 10
   nnodes: 1
   n_gpus_per_node: 8
   project_name: vero2_verl

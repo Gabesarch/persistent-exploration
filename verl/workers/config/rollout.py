@@ -89,6 +89,9 @@ class MultiTurnConfig(BaseConfig):
     num_repeat_rollouts: Optional[int] = None
     force_tool_calls_until_final_turn: bool = False
     final_answer_token_margin: int = 2048
+    # Text forced immediately after the `<answer>` tag on the forced final turn (e.g. "\n\\boxed{"
+    # to start a boxed answer). Empty string forces only the `<answer>` tag, as before.
+    force_final_answer_prefix: str = ""
     tool_response_turn_suffix_enabled: bool = False
     tool_response_explore_turns: int = 10
     tool_response_explore_suffix: str = (

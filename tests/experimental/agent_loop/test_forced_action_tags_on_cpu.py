@@ -33,6 +33,7 @@ class _FakeTokenizer:
             "\n<tool_call>": [2, 10],
             "<answer>": [20, 21, 22],
             "\n<answer>": [2, 20, 21, 22],
+            "\n<answer>\n\\boxed{": [2, 20, 21, 22, 2, 60, 61],
         }
         self.id_to_text = {
             1: "</think>",
@@ -46,6 +47,8 @@ class _FakeTokenizer:
             31: "reason",
             40: '{"name":"image_zoom_in_tool","arguments":{}}',
             50: "final",
+            60: "\\boxed",
+            61: "{",
         }
 
     def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
@@ -182,6 +185,7 @@ def _make_loop(tokenizer: _FakeTokenizer, server_manager: _FakeServerManager, to
     loop = object.__new__(ToolAgentLoop)
     loop.force_tool_calls_until_final_turn = True
     loop.final_answer_token_margin = 2048
+    loop.force_final_answer_prefix = ""
     loop.max_assistant_turns = 11
     loop.max_user_turns = 10
     loop.response_length = 24576
@@ -267,6 +271,28 @@ def test_forced_final_turn_requires_answer_tag():
     assert server_manager.last_sampling_params["extra_args"][FORCE_ACTION_TAG_IDS_KEY] == [2, 20, 21, 22]
     assert agent_data.extra_fields["forced_structure_error"] is True
     assert agent_data.extra_fields["forced_structure_error_reason"] == "missing_final_answer"
+
+
+def test_forced_final_turn_forces_boxed_answer_prefix():
+    tokenizer = _FakeTokenizer()
+    server_manager = _FakeServerManager([30, 31, 1, 2, 20, 21, 22, 2, 60, 61, 50])
+    tool_parser = _FakeToolParser([])
+    agent_data = _make_agent_data()
+    agent_data.assistant_turns = 10
+
+    async def run_test():
+        loop = _make_loop(tokenizer, server_manager, tool_parser)
+        loop.force_final_answer_prefix = "\n\\boxed{"
+        return await loop._handle_generating_state(agent_data, {"temperature": 1.0})
+
+    state = asyncio.run(run_test())
+
+    extra_args = server_manager.last_sampling_params["extra_args"]
+    assert extra_args[FORCE_ACTION_REQUIRED_TAG_KEY] == "<answer>"
+    # `<answer>` tag (2, 20, 21, 22) followed by the forced boxed prefix (2, 60, 61).
+    assert extra_args[FORCE_ACTION_TAG_IDS_KEY] == [2, 20, 21, 22, 2, 60, 61]
+    assert state == AgentState.TERMINATED
+    assert "forced_structure_error" not in agent_data.extra_fields
 
 
 def test_vllm_server_helper_appends_forced_action_processor_when_force_mode_enabled():

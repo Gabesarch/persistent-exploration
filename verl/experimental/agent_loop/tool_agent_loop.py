@@ -138,6 +138,7 @@ class ToolAgentLoop(AgentLoopBase):
         self.tool_response_truncate_side = self.rollout_config.multi_turn.tool_response_truncate_side
         self.force_tool_calls_until_final_turn = self.rollout_config.multi_turn.force_tool_calls_until_final_turn
         self.final_answer_token_margin = self.rollout_config.multi_turn.final_answer_token_margin
+        self.force_final_answer_prefix = self.rollout_config.multi_turn.force_final_answer_prefix
         self.tool_response_turn_suffix_enabled = self.rollout_config.multi_turn.tool_response_turn_suffix_enabled
         self.tool_response_explore_turns = self.rollout_config.multi_turn.tool_response_explore_turns
         self.tool_response_explore_suffix = self.rollout_config.multi_turn.tool_response_explore_suffix
@@ -299,7 +300,13 @@ class ToolAgentLoop(AgentLoopBase):
         )
 
     def _with_forced_action_extra_args(self, sampling_params: dict[str, Any], required_tag: str) -> dict[str, Any]:
-        tag_ids = self.tokenizer.encode(f"\n{required_tag}", add_special_tokens=False)
+        # The semantic tag passed to vLLM (and used for downstream validation) stays `required_tag`,
+        # but the actually-forced token sequence may extend past it. On the forced final turn we can
+        # additionally force a fixed answer prefix (e.g. "\n\\boxed{") right after the `<answer>` tag.
+        forced_text = f"\n{required_tag}"
+        if required_tag == "<answer>" and self.force_final_answer_prefix:
+            forced_text += self.force_final_answer_prefix
+        tag_ids = self.tokenizer.encode(forced_text, add_special_tokens=False)
         if not tag_ids:
             raise ValueError(f"required action tag encoded to no tokens: {required_tag}")
 

@@ -34,8 +34,8 @@ EVENT_ORDER = {
 SUCCESS_SCORE_THRESHOLD = 1.0
 
 # --- Crop reconstruction constants -------------------------------------------------
-# These mirror the cropzoom tool config used in training, see
-# vero2_scripts/config/tool_config/image_zoom_in_tool.yaml and
+# These mirror the cropzoom multi-index tool config used in training, see
+# vero2_scripts/config/tool_config/image_zoom_in_tool_multiidx.yaml and
 # verl/tools/image_zoom_in_tool.py (ImageZoomInTool). The cropzoom setup runs with
 # coordinate_system=normalized_1000 and use_original_resolution_source=true, so every
 # zoom (including zooms into a previously produced crop, img_idx>0) is composited back
@@ -240,16 +240,12 @@ def reconstruct_crops(events: list[dict[str, Any]], source_paths: list[str]) -> 
     if Image is None or not source_paths:
         return recon_by_event
     reconstructor = CropReconstructor(source_paths)
-    for event in events:
-        if event.get("event") != "tool_response":
-            continue
+    for event in collect_zoom_events(events):
         info = event.get("tool_info") or {}
         # Failed crops are not appended to image_data, so they don't consume an index.
         if info.get("success") is False:
             continue
         bbox = bbox_from_event(event)
-        if bbox is None:
-            continue
         record = reconstructor.process(img_idx_from_event(event), bbox)
         if record is None:
             continue
@@ -691,7 +687,7 @@ def crop_from_record(record: dict[str, Any] | None) -> dict[str, str] | None:
         return None
     native_region = [round(c, 1) for c in record.get("native_region", [])]
     caption = (
-        f"reconstructed crop (training-faithful) from img_idx={record.get('input_img_idx')} "
+        f"reconstructed crop (multi-index) from img_idx={record.get('input_img_idx')} "
         f"-> root original img_idx={record.get('orig_idx')}, bbox_2d={record.get('bbox_2d')}, "
         f"native_region={native_region}, crop_size={record.get('crop_size')}, "
         f"label={record.get('label')}, new img_idx={record.get('new_img_idx')}"
