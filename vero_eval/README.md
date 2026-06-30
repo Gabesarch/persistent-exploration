@@ -9,6 +9,47 @@ conventions (same `set_paths.sh`, task-yaml naming, judge) but serves the policy
 
 ---
 
+## Quickstart — zoom eval (VisualProbe & others)
+
+**One-time setup:** `cp set_paths.sh.example set_paths.sh` and edit it (conda env with
+vLLM ≥0.17 + `mcp` + `lmms_eval`, HF-cache paths, `CHECKPOINT_PATH`). Submit every
+`sbatch` **from the repo root**. Judge tasks (VisualProbe, MathVista, …) want **2 GPUs**
+(the 2nd auto-serves the reportable Qwen3-32B judge).
+
+**VisualProbe-Hard, full setting — one command** (10 MP; training-faithful for Vero /
+native sampling for the base; dedicated 32B judge):
+```bash
+# Vero RL checkpoint  -> runs visual_probe_hard_reasoning_zoom
+sbatch --export=ALL,MODEL=vero,CHECKPOINT_PATH=/scratch/.../actor/huggingface \
+       vero_eval/scripts/eval_visual_probe_full.sbatch
+# Base Qwen3-VL-8B-Instruct  -> runs visual_probe_hard_qwen3_zoom
+sbatch --export=ALL,MODEL=qwen3vl vero_eval/scripts/eval_visual_probe_full.sbatch
+```
+`PROBE=hard` (default) `| easy | medium | all`. Results land in `vero_eval/results/vprobe_full_*/`.
+1-GPU smoke (8B self-judge, not reportable): add `--gres=gpu:1 --export=...,LIMIT=10,START_VLLM_JUDGE_SERVER=0`.
+
+**Any other benchmark, with zoom** — pick the task by base model (`_reasoning_zoom` for
+Vero, `_qwen3_zoom` for the base; the same pair exists for *every* benchmark) and use the
+generic entrypoint:
+```bash
+sbatch --export=ALL,MODEL=vero,CHECKPOINT_PATH=...,TOOLS=on,MM_MAX_PIXELS=10000000,\
+TASKS=vstar_bench_reasoning_zoom,blink_reasoning_zoom,mathvista_testmini_reasoning_zoom \
+       vero_eval/run_eval.sbatch
+```
+`TASKS` also accepts a domain name (e.g. `grounding_counting_search`, or `visual_probe`).
+
+**A whole training run's checkpoints on VisualProbe** (one array task per checkpoint):
+```bash
+MM_MAX_PIXELS=10000000 bash vero_eval/examples/submit_eval_checkpoints.sh \
+  --train-dir /scratch/.../checkpoints/verl/<RUN> --domain visual_probe --model-suffix reasoning_zoom
+```
+
+That's the whole loop. Deeper reference below: the `eval_visual_probe_full` runner +
+`MM_MAX_PIXELS` knob → **§5**; the per-model zoom suffixes → **§6**; the judge → **§7**;
+tools-on/off, turns, and how the zoom tool crops at native resolution → **§3–§4**.
+
+---
+
 ## 1. Layout
 ```
 vero_eval/
