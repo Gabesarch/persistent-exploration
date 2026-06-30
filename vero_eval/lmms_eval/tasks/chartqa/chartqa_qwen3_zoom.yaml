@@ -1,0 +1,49 @@
+# Base Qwen3-VL-Instruct multi-turn ZOOM variant of chartqa.
+#
+# Reuses the generic zoom toolset (_toolset_zoom_yaml): instruct model, NO forced
+# <think>, NO Layer-A. Baseline counterpart to the Vero chartqa_reasoning_zoom.
+#
+# Modular composition: this task inlines the chartqa_qwen3_zs dataset wiring
+# directly (NOT via include) + the reusable zoom toolset template. We must NOT
+# include chartqa_qwen3_zs.yaml because its `metadata` is a LIST (`- version: 0.0`),
+# which is not deep-mergeable and would clobber the toolset template's dict-style
+# metadata (allowed_tools / system_prompt_files), dropping tool use. Mirrors the
+# self-contained chartqa_reasoning_zoom.yaml. The toolset template contributes
+# metadata.allowed_tools (image_zoom_in_tool) and metadata.system_prompt_files
+# (system_base + system_zoom), deep-merged with this task's metadata.version.
+# Run with MODEL=qwen3vl TOOLS=on.
+include:
+  - ../_tool_templates/_toolset_zoom_yaml
+dataset_path: lmms-lab/ChartQA
+dataset_kwargs:
+  token: True
+task: "chartqa_qwen3_zoom"
+test_split: test
+output_type: generate_until
+doc_to_visual: !function utils.chartqa_doc_to_visual
+doc_to_text: !function utils.chartqa_doc_to_text
+doc_to_target: "answer"
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 40
+  presence_penalty: 2.0
+  do_sample: True
+process_results: !function utils.chartqa_process_results
+metric_list:
+  - metric: relaxed_overall
+    aggregation: mean
+    higher_is_better: true
+  - metric: relaxed_human_split
+    aggregation: mean
+    higher_is_better: true
+  - metric: relaxed_augmented_split
+    aggregation: mean
+    higher_is_better: true
+metadata:
+  version: 0.0
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: ""
+    post_prompt: "\nYour final answer should be a single word or phrase."

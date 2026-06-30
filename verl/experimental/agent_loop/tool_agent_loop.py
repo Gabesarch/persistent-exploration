@@ -923,6 +923,8 @@ class ToolAgentLoop(AgentLoopBase):
 
         # Process tool responses and update multi_modal_data
         # Removed: agent_data.new_images_this_turn = []
+        pending_crop_refs: list[dict[str, Any]] = []
+        pending_tool_rewards: list[float] = []
         for tool_call, (tool_response, tool_reward, tool_info) in zip(active_tool_calls, responses, strict=False):
             response_suffix = self._tool_response_turn_suffix(agent_data.assistant_turns)
             if self._debug_enabled_for_agent(agent_data):
@@ -976,10 +978,10 @@ class ToolAgentLoop(AgentLoopBase):
                                 crop_ref["image_index"] = (
                                     len(agent_data.image_data or []) + len(new_images_this_turn)
                                 )
-                                crop_ref["order"] = len(agent_data.crop_image_refs)
+                                crop_ref["order"] = len(agent_data.crop_image_refs) + len(pending_crop_refs)
                                 crop_ref["assistant_turn"] = agent_data.assistant_turns
                                 crop_ref["tool_name"] = tool_call.name
-                                agent_data.crop_image_refs.append(crop_ref)
+                                pending_crop_refs.append(crop_ref)
                             new_images_this_turn.append(img)  # Using local variable
                 else:
                     # Ensure the image is not None
@@ -987,10 +989,10 @@ class ToolAgentLoop(AgentLoopBase):
                         if crop_refs:
                             crop_ref = dict(crop_refs[0])
                             crop_ref["image_index"] = len(agent_data.image_data or []) + len(new_images_this_turn)
-                            crop_ref["order"] = len(agent_data.crop_image_refs)
+                            crop_ref["order"] = len(agent_data.crop_image_refs) + len(pending_crop_refs)
                             crop_ref["assistant_turn"] = agent_data.assistant_turns
                             crop_ref["tool_name"] = tool_call.name
-                            agent_data.crop_image_refs.append(crop_ref)
+                            pending_crop_refs.append(crop_ref)
                         new_images_this_turn.append(tool_response.image)  # Using local variable
 
             # Handle video data
@@ -1002,9 +1004,7 @@ class ToolAgentLoop(AgentLoopBase):
                 )
 
             if tool_reward is not None:
-                agent_data.tool_rewards.append(tool_reward)
-
-        agent_data.messages.extend(add_messages)
+                pending_tool_rewards.append(tool_reward)
 
         if self.tool_parser_name == "gpt-oss":
             logger.info("manually format tool responses for gpt-oss")
@@ -1025,8 +1025,26 @@ class ToolAgentLoop(AgentLoopBase):
             )
 
         if len(agent_data.response_mask) + len(response_ids) >= self.response_length:
+            if self._debug_enabled_for_agent(agent_data):
+                event = {
+                    "event": "tool_response_dropped_over_limit",
+                    "request_id": agent_data.request_id,
+                    "assistant_turn": agent_data.assistant_turns,
+                    "dropped_tool_messages": len(add_messages),
+                    "dropped_images": len(new_images_this_turn),
+                    "dropped_crop_refs": len(pending_crop_refs),
+                    "current_response_tokens": len(agent_data.response_mask),
+                    "tool_response_tokens": len(response_ids),
+                    "max_response_tokens": self.response_length,
+                }
+                agent_data.debug_events.append(event)
+                self._debug_append_event(event)
             return AgentState.TERMINATED
         # Update prompt_ids and response_mask
+
+        agent_data.messages.extend(add_messages)
+        agent_data.crop_image_refs.extend(pending_crop_refs)
+        agent_data.tool_rewards.extend(pending_tool_rewards)
 
         if new_images_this_turn:
             if agent_data.image_data is None:

@@ -1,0 +1,29 @@
+# Base Qwen3-VL-Instruct multi-turn ZOOM variant of countqa.
+#
+# Reuses the generic zoom toolset (../_tool_templates/_toolset_zoom_yaml): contributes
+# metadata.allowed_tools (image_zoom_in_tool) + system_prompt_files (system_base +
+# system_zoom) for instruct-style multi-turn tool calling. No forced <think>, no Layer-A.
+# Baseline counterpart to the Vero countqa_reasoning_zoom checkpoint eval.
+#
+# Dataset wiring (dataset_path / process_docs / doc_to_* / process_results / metric_list /
+# test_split / output_type) is inherited verbatim from countqa.yaml via include, exactly as
+# countqa_qwen3_zs does. Qwen3 instruct sampling is kept from countqa_qwen3_zs. Run with
+# TOOLS=on.
+include:
+  - countqa.yaml
+  - ../_tool_templates/_toolset_zoom_yaml
+task: "countqa_qwen3_zoom"
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 40
+  presence_penalty: 2.0
+  do_sample: True
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: ""
+    # Softened from countqa_qwen3_zs's "Please answer with only a number." so it does not
+    # discourage tool use before answering (mirrors how visual_probe_hard_qwen3_zoom softened
+    # the _zs suppressor).
+    post_prompt: " Your final answer should be a number."

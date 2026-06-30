@@ -1,0 +1,13 @@
+group: mmmu_pro_zoomdrawing_vero
+task:
+- mmmu_pro_vision_zoomdrawing_vero
+- mmmu_pro_standard_zoomdrawing_vero
+metadata:
+  image_indexing: training_faithful
+include:
+- ../../_tool_templates/_vero/_toolset_zoomdraw_vero_yaml
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 0.7
+  top_p: 1.0
+  top_k: -1

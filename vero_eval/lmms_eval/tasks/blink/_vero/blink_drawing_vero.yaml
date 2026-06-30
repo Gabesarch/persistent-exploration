@@ -1,0 +1,29 @@
+group: blink_drawing_vero
+task:
+- blink_art_style_drawing_vero
+- blink_counting_drawing_vero
+- blink_forensic_detection_drawing_vero
+- blink_functional_correspondence_drawing_vero
+- blink_iq_test_drawing_vero
+- blink_jigsaw_drawing_vero
+- blink_multi_view_reasoning_drawing_vero
+- blink_object_localization_drawing_vero
+- blink_relative_depth_drawing_vero
+- blink_relative_reflectance_drawing_vero
+- blink_semantic_correspondence_drawing_vero
+- blink_spatial_relation_drawing_vero
+- blink_visual_correspondence_drawing_vero
+- blink_visual_similarity_drawing_vero
+process_results: !function ../utils.blink_process_results
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 0.7
+  top_p: 1.0
+  top_k: -1
+  do_sample: true
+aggregate_metric_list:
+- metric: blink_acc
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: "\n"
+    post_prompt: ""

@@ -1,0 +1,36 @@
+# Vero (RL thinking checkpoint) + ZOOM on ERQA — TRAINING-FAITHFUL Vero zoom variant.
+#
+# Mirrors visual_probe_hard_reasoning_zoom (Vero zoom toolset + training sampling):
+#   - system prompt = training Layer A (system_vero_reasoning.txt, passed as the system
+#     message) + the served chat_template's appended "# Tools" block + the EXACT training
+#     tool schema (via _toolset_zoom_vero_yaml's tool_schema_overrides).
+#   - training sampling (temperature 0.7, top_p 1.0, top_k -1, do_sample True).
+#   - image_indexing: training_faithful (tool_response announces the zoomed region only).
+#
+# BYTE-FAITHFUL only for visual_probe. For ERQA this is a CONSISTENT GENERALIZATION eval
+# (same Vero toolset + sampling + indexing), NOT byte-identical to training.
+#
+# DATASET WIRING (dataset_path / process_results / scorer / question format) is inherited
+# unchanged from _default_template_yaml + the source erqa_reasoning.yaml. Run with
+# MODEL=vero TOOLS=on.
+include:
+  - _default_template_yaml
+  - ../_tool_templates/_toolset_zoom_vero_yaml
+dataset_name: null
+test_split: test
+task: "erqa_reasoning_zoom"
+generation_kwargs:
+  # Matches the RL training validation sampling (temperature 0.7, top_p 1.0, top_k -1).
+  # top_p/top_k MUST be set explicitly: if omitted, vLLM falls back to the checkpoint's
+  # generation_config defaults (top_k=20, top_p=0.8), which diverges from training.
+  max_new_tokens: 16384
+  temperature: 0.7
+  top_p: 1.0
+  top_k: -1
+  do_sample: True
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: ""
+    post_prompt: ""
+metadata:
+  image_indexing: training_faithful

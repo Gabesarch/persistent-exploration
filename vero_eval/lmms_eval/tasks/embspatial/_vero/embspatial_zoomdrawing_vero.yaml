@@ -1,0 +1,19 @@
+dataset_name:
+test_split: test
+task: "embspatial_zoomdrawing_vero"
+metadata:
+  image_indexing: training_faithful
+include:
+- ../_default_template_yaml
+- ../../_tool_templates/_vero/_toolset_zoomdraw_vero_yaml
+process_results: !function ../utils.embspatial_process_results
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 0.7
+  top_p: 1.0
+  top_k: -1
+  do_sample: true
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: "\n"
+    post_prompt: ""

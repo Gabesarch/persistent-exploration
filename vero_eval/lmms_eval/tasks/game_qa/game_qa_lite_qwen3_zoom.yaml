@@ -1,0 +1,31 @@
+# Base Qwen3-VL-Instruct multi-turn ZOOM variant of game_qa_lite.
+#
+# Reuses the generic zoom toolset (../_tool_templates/_toolset_zoom_yaml):
+# instruct (non-think) model with multi-turn tool calling (image_zoom_in_tool),
+# NO forced <think>, NO Layer-A. The toolset template contributes
+# metadata.allowed_tools (image_zoom_in_tool) and metadata.system_prompt_files
+# (system_base + system_zoom). This is the base-model BASELINE vs the Vero
+# checkpoint variant (game_qa_lite_reasoning_zoom). Run with TOOLS=on.
+#
+# Dataset wiring (dataset_path / process_results / scorer) + qwen3 sampling are
+# kept identical to game_qa_lite_qwen3_zs; the only prompt change is softening the
+# final-answer suppressor so it does not discourage tool use.
+dataset_path: gsarch/Game-QA-Lite
+dataset_name: "default"
+task: "game_qa_lite_qwen3_zoom"
+test_split: train
+include:
+  - _default_template_yaml
+  - ../_tool_templates/_toolset_zoom_yaml
+process_results: !function utils.game_qa_process_results
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 40
+  presence_penalty: 2.0
+  do_sample: True
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: ""
+    post_prompt: "Your final answer should be the number (e.g., '1') or letter (e.g., 'A') from the options."

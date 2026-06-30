@@ -9,6 +9,47 @@ conventions (same `set_paths.sh`, task-yaml naming, judge) but serves the policy
 
 ---
 
+## Quickstart — zoom eval (VisualProbe & others)
+
+**One-time setup:** `cp set_paths.sh.example set_paths.sh` and edit it (conda env with
+vLLM ≥0.17 + `mcp` + `lmms_eval`, HF-cache paths, `CHECKPOINT_PATH`). Submit every
+`sbatch` **from the repo root**. Judge tasks (VisualProbe, MathVista, …) want **2 GPUs**
+(the 2nd auto-serves the reportable Qwen3-32B judge).
+
+**VisualProbe-Hard, full setting — one command** (10 MP; training-faithful for Vero /
+native sampling for the base; dedicated 32B judge):
+```bash
+# Vero RL checkpoint  -> runs visual_probe_hard_reasoning_zoom
+sbatch --export=ALL,MODEL=vero,CHECKPOINT_PATH=/scratch/.../actor/huggingface \
+       vero_eval/scripts/eval_visual_probe_full.sbatch
+# Base Qwen3-VL-8B-Instruct  -> runs visual_probe_hard_qwen3_zoom
+sbatch --export=ALL,MODEL=qwen3vl vero_eval/scripts/eval_visual_probe_full.sbatch
+```
+`PROBE=hard` (default) `| easy | medium | all`. Results land in `vero_eval/results/vprobe_full_*/`.
+1-GPU smoke (8B self-judge, not reportable): add `--gres=gpu:1 --export=...,LIMIT=10,START_VLLM_JUDGE_SERVER=0`.
+
+**Any other benchmark, with zoom** — pick the task by base model (`_reasoning_zoom` for
+Vero, `_qwen3_zoom` for the base; the same pair exists for *every* benchmark) and use the
+generic entrypoint:
+```bash
+sbatch --export=ALL,MODEL=vero,CHECKPOINT_PATH=...,TOOLS=on,MM_MAX_PIXELS=10000000,\
+TASKS=vstar_bench_reasoning_zoom,blink_reasoning_zoom,mathvista_testmini_reasoning_zoom \
+       vero_eval/run_eval.sbatch
+```
+`TASKS` also accepts a domain name (e.g. `grounding_counting_search`, or `visual_probe`).
+
+**A whole training run's checkpoints on VisualProbe** (one array task per checkpoint):
+```bash
+MM_MAX_PIXELS=10000000 bash vero_eval/examples/submit_eval_checkpoints.sh \
+  --train-dir /scratch/.../checkpoints/verl/<RUN> --domain visual_probe --model-suffix reasoning_zoom
+```
+
+That's the whole loop. Deeper reference below: the `eval_visual_probe_full` runner +
+`MM_MAX_PIXELS` knob → **§5**; the per-model zoom suffixes → **§6**; the judge → **§7**;
+tools-on/off, turns, and how the zoom tool crops at native resolution → **§3–§4**.
+
+---
+
 ## 1. Layout
 ```
 vero_eval/
@@ -232,6 +273,18 @@ domain's tasks → stop the server. Results land in
 `$ROOT_PATH/vero_eval/logs/<run-id>/raw/<global_step_N>/`. Flags: `--domain all` submits
 one array per canonical domain; `--max-checkpoints N`, `--every X`, `--dry-run`.
 
+**Focusing the sweep on VisualProbe** (full setting): a `visual_probe` domain
+(`visual_probe_{easy,medium,hard}`, **not** in `all`) is provided so the sweep isn't diluted
+by the other `grounding_counting_search` tasks. Carry the 10 MP setting via `MM_MAX_PIXELS`
+(propagated by `--export=ALL`); the array auto-applies Vero's forced-`<think>` template for
+any `reasoning*` suffix:
+```bash
+MM_MAX_PIXELS=10000000 bash vero_eval/examples/submit_eval_checkpoints.sh \
+  --train-dir /scratch/.../checkpoints/verl/<RUN> \
+  --domain visual_probe --model-suffix reasoning_zoom --every 200 --array-chunk 2
+# (one checkpoint or the base model instead of a sweep -> use eval_visual_probe_full.sbatch below.)
+```
+
 ### TYPE 3 — one checkpoint across multiple domains
 ```bash
 cd vero_eval
@@ -240,6 +293,41 @@ bash examples/eval_across_domains.sh --domains all --model-suffix reasoning --li
 Serves `CHECKPOINT_PATH` **once**, then loops the domains (default `server` judge so judge
 tasks reuse the policy endpoint). Results go to `results/<model>_<ts>/<domain>/`.
 `--domains chart_ocr,stem` to pick a subset.
+
+### Visual Probe at the full setting (`scripts/eval_visual_probe_full.sbatch`)
+
+The canonical, reportable VisualProbe zoom configuration in one command:
+**`max_pixels = 10,000,000`** served at launch, the **per-model** zoom task + sampling, and
+the dedicated **Qwen3-32B** judge (needs `gpu:2`). Submit from the repo root:
+
+```bash
+# Vero RL checkpoint — TRAINING-FAITHFUL (forced-<think> chat template, temp 0.7/top_p 1/top_k -1,
+# image_indexing: training_faithful); runs visual_probe_hard_reasoning_zoom:
+sbatch --export=ALL,MODEL=vero,CHECKPOINT_PATH=/scratch/.../actor/huggingface \
+       vero_eval/scripts/eval_visual_probe_full.sbatch
+
+# Base Qwen3-VL-8B-Instruct — qwen3 sampling (temp 1.0/top_p 1/top_k 40/presence_penalty 2.0);
+# runs visual_probe_hard_qwen3_zoom:
+sbatch --export=ALL,MODEL=qwen3vl vero_eval/scripts/eval_visual_probe_full.sbatch
+
+# all three difficulties; or a single-GPU smoke (8B self-judge, NOT reportable):
+sbatch --export=ALL,MODEL=vero,CHECKPOINT_PATH=...,PROBE=all vero_eval/scripts/eval_visual_probe_full.sbatch
+sbatch --gres=gpu:1 --export=ALL,MODEL=qwen3vl,LIMIT=10,START_VLLM_JUDGE_SERVER=0 \
+       vero_eval/scripts/eval_visual_probe_full.sbatch
+```
+
+It picks the task by `MODEL` (`vero` → `visual_probe_<probe>_reasoning_zoom`, `qwen3vl` →
+`visual_probe_<probe>_qwen3_zoom`), exports `MM_MAX_PIXELS=10000000`, and for Vero sets the
+forced-`<think>` chat template automatically. `PROBE` = `hard` (default) | `easy` | `medium` | `all`.
+
+> **`MM_MAX_PIXELS` is a serve-time knob** read only by `scripts/serve_qwen_vllm.sh` (vLLM
+> `--mm-processor-kwargs max_pixels`); it caps the **initial** image resolution the model sees
+> — the zoom tool re-crops the *original* PNG at native resolution regardless. It does not
+> flow through `eval_domain.sh`, so set it in the environment that reaches the serve call (the
+> full-setting script and `sbatch --export=ALL,MM_MAX_PIXELS=...` both do); default when unset
+> is 10,000,000 (the full setting — on the ~8-13MP accuracy plateau). The reuse-if-up server
+> check does not inspect a running server's resolution,
+> so use a clean `PORT` (or let this script restart the server) when changing it.
 
 ---
 
@@ -263,11 +351,21 @@ extract from the checkpoint's `chat_template.jinja` if you need exact parity for
 |---|---|
 | **Vero** (our RL agent) | `_reasoning` |
 | **Vero thinking** | `_reasoning_samplingq3` |
+| **Vero + zoom** (training-faithful) | `_reasoning_zoom` |
 | **Qwen3-VL-8B Instruct** (baseline) | `_qwen3_zs` |
+| **Qwen3-VL-8B Instruct + zoom** | `_qwen3_zoom` |
 | **Qwen3-VL-8B Thinking** (baseline) | `_qwen3_thinking_zs` |
 | Qwen2.5-VL-7B Instruct | `_qwen25_zs` |
 | MiMo-VL | `_mimo_zs` |
 | GPT-5-nano (API; not these local runners) | `_gpt5nano_zs` |
+
+**Zoom variants** (multi-turn `image_zoom_in_tool`, available for every benchmark): pick by
+base model exactly like the non-tool suffixes. `_reasoning_zoom` (Vero) replays the RL
+training input — forced `<think>`, temp 0.7 / top_p 1.0 / top_k -1, `image_indexing:
+training_faithful`, and the exact training tool schema; `_qwen3_zoom` (base Qwen3-VL) uses
+Qwen3-VL's sampling (temp 1.0 / top_p 1.0 / top_k 40 / presence_penalty 2.0). Per-model
+sampling lives in each task yaml; both require tools on (`MCP_SERVER_PATH=lmms_eval/mcp/vero2_mcp.py`,
+the default). For VisualProbe at the production resolution use the full-setting runner in §5.
 
 ## 6b. Domains → tasks (`examples/_domain_map.sh`)
 
@@ -278,6 +376,7 @@ extract from the checkpoint's `chat_template.jinja` if you need exact parity for
 | `spatial_action` | cv_bench, embspatial, erqa, game_qa_lite, blink |
 | `knowledge_rec` | realworldqa, simplevqa_en, fvqa, mmvetv2_group_img |
 | `grounding_counting_search` | countbenchqa, countqa, mme_realworld_lite, vstar_bench, aerialvg_bbox, visual_probe_{easy,medium,hard}, screenspot_point_in_box, screenspotpro_point_in_box |
+| `visual_probe` | visual_probe_{easy,medium,hard} — visual-search-only group (NOT in `all`; for a VisualProbe-focused checkpoint sweep, see §5 TYPE 2) |
 | `instruction_following` | mia_bench, mm_mt_bench, mmifeval |
 | `ball_drop` | balldrop |
 

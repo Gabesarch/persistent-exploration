@@ -1,0 +1,27 @@
+# Base Qwen3-VL-Instruct multi-turn ZOOM variant of vstar_bench.
+#
+# Reuses the generic _toolset_zoom_yaml: instruct (non-think) base model with
+# multi-turn tool use, NO forced <think>, NO Layer-A. This is the BASELINE vs the
+# Vero checkpoint's vstar_bench_reasoning_zoom.
+#
+# Modular composition: dataset template (vstar_bench.yaml -> _default_template_yaml,
+# contributing dataset_path / doc_to_* / process_results / metric_list / test_split /
+# output_type / metadata.version) + reusable zoom toolset template. The toolset
+# contributes metadata.allowed_tools (image_zoom_in_tool) and metadata.system_prompt_files
+# (system_base + system_zoom), deep-merged with the dataset metadata.version. Run with
+# TOOLS=on.
+include:
+  - vstar_bench.yaml
+  - ../_tool_templates/_toolset_zoom_yaml
+task: "vstar_bench_qwen3_zoom"
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 40
+  presence_penalty: 2.0
+  do_sample: True
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: ""
+    post_prompt: ""

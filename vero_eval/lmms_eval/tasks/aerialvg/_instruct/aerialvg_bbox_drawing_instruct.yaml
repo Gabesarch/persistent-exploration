@@ -1,0 +1,21 @@
+include:
+- ../aerialvg_bbox.yaml
+- ../../_tool_templates/_instruct/_toolset_draw_instruct_yaml
+task: "aerialvg_bbox_drawing_instruct"
+process_docs: !function ../utils.aerialvg_process_docs_rel1000
+doc_to_text: !function ../utils.aerialvg_doc_to_text_rel1000
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 40
+  presence_penalty: 2.0
+  do_sample: true
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: ""
+    post_prompt: ' Return only one JSON array with a single object: [{"bbox_2d": [x_min,
+      y_min, x_max, y_max], "label": "<class name>"}]. Use coordinates scaled to 1000
+      (range 0-1000) relative to the original image img_idx=0, not any zoomed
+      crop (origin at top-left; x_min,y_min upper-left, x_max,y_max lower-right).
+      Put the final JSON array only inside <answer>...</answer>. Provide exactly one box with no extra text.'

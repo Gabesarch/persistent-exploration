@@ -1,0 +1,53 @@
+# Training-faithful Vero ZOOM variant of mathvista_testmini.
+#
+# Mirrors visual_probe_hard_reasoning_zoom (Vero RL thinking checkpoint + image_zoom_in_tool):
+# it adds the EXACT training Vero zoom toolset (via _toolset_zoom_vero_yaml: Layer-A system
+# prompt passed as the system message + the served chat_template's "# Tools" block + the
+# pinned training tool schema) plus training-faithful sampling (temperature 0.7, top_p 1.0,
+# top_k -1) and image_indexing: training_faithful.
+#
+# BYTE-FAITHFUL only for visual_probe (that dataset's turn-1 input is verified byte-identical
+# to the checkpoint's validation data). For mathvista this is a CONSISTENT GENERALIZATION
+# eval, NOT byte-identical to training: it reuses the same toolset + sampling so the model is
+# probed the same way, but the dataset, question format, and scorer are mathvista's own.
+#
+# DATASET WIRING (dataset_path / process_docs-less inline doc_to_* / process_results /
+# metric_list / shot_type) is IDENTICAL to mathvista_testmini_reasoning.yaml. shot_type
+# "direct" produces an EMPTY hint, so it does not fight Layer-A's <answer>/\boxed{} protocol.
+# Run with MODEL=vero TOOLS=on.
+include:
+  - ../_tool_templates/_toolset_zoom_vero_yaml
+dataset_path: AI4Math/MathVista
+dataset_kwargs:
+  token: True
+task: "mathvista_testmini_reasoning_zoom"
+test_split: testmini
+output_type: generate_until
+doc_to_visual: !function utils.mathvista_doc_to_visual
+doc_to_text: !function utils.mathvista_doc_to_text
+doc_to_target: "answer"
+generation_kwargs:
+  # Matches the RL training validation sampling exactly (temperature 0.7, top_p 1.0, top_k -1).
+  # top_p/top_k MUST be set explicitly: if omitted, vLLM falls back to the checkpoint's
+  # generation_config defaults (top_k=20, top_p=0.8), which diverges from training.
+  max_new_tokens: 16384
+  temperature: 0.7
+  top_p: 1.0
+  top_k: -1
+  do_sample: True
+process_results: !function utils.mathvista_process_results
+metric_list:
+  - metric: submission
+    aggregation: !function utils.mathvista_aggregate_results
+    higher_is_better: true
+
+lmms_eval_specific_kwargs:
+  default:
+    shot_type: "direct" # can be "reason-first", "solution", "step-by-step"
+    shot: 0
+    use_caption: False
+    use_ocr: False
+  phi3v:
+    shot_type: "solution"
+metadata:
+  image_indexing: training_faithful

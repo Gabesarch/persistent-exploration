@@ -1,0 +1,11 @@
+include:
+- ../mia_bench.yaml
+- ../../_tool_templates/_instruct/_toolset_zoomdraw_instruct_yaml
+task: "mia_bench_zoomdrawing_instruct"
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 40
+  presence_penalty: 1.5
+  do_sample: true

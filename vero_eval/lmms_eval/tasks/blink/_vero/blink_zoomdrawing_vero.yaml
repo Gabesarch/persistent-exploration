@@ -1,0 +1,31 @@
+group: blink_zoomdrawing_vero
+task:
+- blink_art_style_zoomdrawing_vero
+- blink_counting_zoomdrawing_vero
+- blink_forensic_detection_zoomdrawing_vero
+- blink_functional_correspondence_zoomdrawing_vero
+- blink_iq_test_zoomdrawing_vero
+- blink_jigsaw_zoomdrawing_vero
+- blink_multi_view_reasoning_zoomdrawing_vero
+- blink_object_localization_zoomdrawing_vero
+- blink_relative_depth_zoomdrawing_vero
+- blink_relative_reflectance_zoomdrawing_vero
+- blink_semantic_correspondence_zoomdrawing_vero
+- blink_spatial_relation_zoomdrawing_vero
+- blink_visual_correspondence_zoomdrawing_vero
+- blink_visual_similarity_zoomdrawing_vero
+process_results: !function ../utils.blink_process_results
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 0.7
+  top_p: 1.0
+  top_k: -1
+  do_sample: true
+aggregate_metric_list:
+- metric: blink_acc
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: "\n"
+    post_prompt: ""
+metadata:
+  image_indexing: training_faithful

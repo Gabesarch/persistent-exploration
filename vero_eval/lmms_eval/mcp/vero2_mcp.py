@@ -10,6 +10,7 @@ import base64
 import io
 import json
 import logging
+import math
 import os
 import tempfile
 from typing import List, Union
@@ -22,7 +23,7 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 import numpy as np
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent, TextContent
-from PIL import Image, ImageDraw
+from PIL import Image, ImageColor, ImageDraw, ImageFont
 
 # The rich drawing tools below render via the heavy Visualizer (cv2 + matplotlib).
 # Import it LAZILY through a same-named factory so this MCP server starts in a
@@ -118,7 +119,7 @@ def _save_and_emit(image: Image.Image):
     fd, path = tempfile.mkstemp(suffix=".jpg", prefix="vero2_tool_out_")
     os.close(fd)
     bounded.save(path, format="JPEG", quality=DRAW_JPEG_QUALITY)
-    return [TextContent(type="text", text=f"Saved drawn image to: {path}"), _encode_jpeg_content(bounded)]
+    return [_encode_jpeg_content(bounded), TextContent(type="text", text=f"Saved drawn image to: {path}")]
 
 
 def _image_to_content(image: np.ndarray):
@@ -129,6 +130,127 @@ def _image_to_content(image: np.ndarray):
 def _to_pixel(value: int, size: int) -> float:
     """Convert 0-1000 coordinate to pixel coordinate."""
     return (value / COORD_SCALE) * size
+
+
+def _parse_number(value, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a finite number, got {value!r}.")
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number, got {value!r}.")
+    return value
+
+
+def _parse_positive_number(value, name: str, default: float) -> float:
+    if value is None:
+        return default
+    value = _parse_number(value, name)
+    if value <= 0:
+        raise ValueError(f"{name} must be positive, got {value}.")
+    return value
+
+
+def _parse_alpha(value, default: float) -> float:
+    if value is None:
+        return default
+    return max(0.0, min(1.0, _parse_number(value, "alpha")))
+
+
+def _parse_color(value, default: str):
+    if not isinstance(value, str) or not value:
+        value = default
+    try:
+        return ImageColor.getrgb(value)
+    except ValueError as exc:
+        raise ValueError(f"Unsupported color {value!r}.") from exc
+
+
+def _to_pixel_clamped(value, size: int, name: str) -> float:
+    coord = max(0.0, min(float(COORD_SCALE), _parse_number(value, name)))
+    return coord / COORD_SCALE * float(size)
+
+
+def _is_numeric_vector(value, length: int) -> bool:
+    if not isinstance(value, (list, tuple)) or len(value) != length:
+        return False
+    try:
+        for idx, item in enumerate(value):
+            _parse_number(item, f"value[{idx}]")
+    except ValueError:
+        return False
+    return True
+
+
+def _normalize_vectors(value, name: str, length: int):
+    if value is None:
+        raise ValueError(f"{name} parameter is required.")
+    if not isinstance(value, (list, tuple)) or len(value) == 0:
+        raise ValueError(f"{name} must be a non-empty list.")
+    if _is_numeric_vector(value, length):
+        return [list(value)]
+    if all(_is_numeric_vector(item, length) for item in value):
+        return [list(item) for item in value]
+    raise ValueError(f"{name} must be either one length-{length} numeric list or a list of those lists.")
+
+
+def _normalize_texts(value):
+    if value is None:
+        raise ValueError("texts parameter is required.")
+    if isinstance(value, dict):
+        value = [value]
+    if not isinstance(value, (list, tuple)) or len(value) == 0:
+        raise ValueError("texts must be a non-empty object or list of objects.")
+    for idx, item in enumerate(value):
+        if not isinstance(item, dict) or not all(key in item for key in ("x", "y", "text")):
+            raise ValueError(f"texts[{idx}] must be an object with x, y, and text.")
+    return list(value)
+
+
+def _normalize_polygons(value):
+    if value is None:
+        raise ValueError("polygons parameter is required.")
+    if not isinstance(value, (list, tuple)) or len(value) == 0:
+        raise ValueError("polygons must be a non-empty list.")
+    if all(_is_numeric_vector(point, 2) for point in value):
+        polygons = [list(value)]
+    elif all(isinstance(poly, (list, tuple)) and all(_is_numeric_vector(point, 2) for point in poly) for poly in value):
+        polygons = [list(poly) for poly in value]
+    else:
+        raise ValueError("polygons must be one polygon [[x,y], ...] or a list of polygons.")
+    for idx, polygon in enumerate(polygons):
+        if len(polygon) < 3:
+            raise ValueError(f"polygons[{idx}] must contain at least 3 points.")
+    return polygons
+
+
+def _point_to_pixels(point, width: int, height: int, prefix: str):
+    if not isinstance(point, (list, tuple)) or len(point) != 2:
+        raise ValueError(f"{prefix} must be [x, y].")
+    return (
+        _to_pixel_clamped(point[0], width, f"{prefix}[0]"),
+        _to_pixel_clamped(point[1], height, f"{prefix}[1]"),
+    )
+
+
+def _box_to_pixels(box, width: int, height: int, prefix: str):
+    if not isinstance(box, (list, tuple)) or len(box) != 4:
+        raise ValueError(f"{prefix} must be [x1, y1, x2, y2].")
+    return (
+        _to_pixel_clamped(box[0], width, f"{prefix}[0]"),
+        _to_pixel_clamped(box[1], height, f"{prefix}[1]"),
+        _to_pixel_clamped(box[2], width, f"{prefix}[2]"),
+        _to_pixel_clamped(box[3], height, f"{prefix}[3]"),
+    )
+
+
+def _load_font(font_size: int):
+    for font_path in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    ):
+        if os.path.exists(font_path):
+            return ImageFont.truetype(font_path, font_size)
+    return ImageFont.load_default()
 
 
 def _pil_to_content(image: Image.Image):
@@ -238,22 +360,16 @@ def draw_points(
     :param radius: Radius of the circle markers (0-1000, relative to image width).
     :return: Image with point markers.
     """
-    image_path = _resolve_image_path(img_idx)
-    img = np.array(Image.open(image_path).convert("RGB"))
-    h, w = img.shape[:2]
-    vis = Visualizer(img)
-
-    # Normalize to list of points
-    if points and isinstance(points[0], int):
-        points = [points]  # Single point: [x, y] -> [[x, y]]
-
-    pr = _to_pixel(radius, w)
-    for i, point in enumerate(points):
-        x, y = point
-        px, py = _to_pixel(x, w), _to_pixel(y, h)
-        vis.draw_circle((px, py), color=color, radius=pr)
-
-    return _save_output_image(Image.fromarray(vis.get_output().get_image()))
+    image = Image.open(_resolve_image_path(img_idx)).convert("RGB")
+    w, h = image.size
+    parsed_points = _normalize_vectors(points, "points", 2)
+    rgb = _parse_color(color, "lime")
+    pr = max(1, int(round(_parse_positive_number(radius, "radius", 15.0) / COORD_SCALE * w)))
+    draw = ImageDraw.Draw(image)
+    for i, point in enumerate(parsed_points):
+        px, py = _point_to_pixels(point, w, h, f"points[{i}]")
+        draw.ellipse([px - pr, py - pr, px + pr, py + pr], fill=rgb, outline=rgb)
+    return _save_output_image(image)
 
 
 @app.tool(name="draw_lines", description="Draw one or more lines on an image. Coordinates use 0-1000 scale. For a single line, pass [x1, y1, x2, y2]. For multiple lines, pass [[x1, y1, x2, y2], [x1, y1, x2, y2], ...]. Example: draw_lines(img_idx=0, lines=[[200, 300, 800, 700]]) draws one diagonal line.")
@@ -272,22 +388,16 @@ def draw_lines(
     :param linewidth: Width of the lines in pixels.
     :return: Image with lines drawn.
     """
-    image_path = _resolve_image_path(img_idx)
-    img = np.array(Image.open(image_path).convert("RGB"))
-    h, w = img.shape[:2]
-    vis = Visualizer(img)
-
-    # Normalize to list of lines
-    if lines and isinstance(lines[0], int):
-        lines = [lines]  # Single line: [x1, y1, x2, y2] -> [[x1, y1, x2, y2]]
-
-    for line in lines:
-        x1, y1, x2, y2 = line
-        px1, py1 = _to_pixel(x1, w), _to_pixel(y1, h)
-        px2, py2 = _to_pixel(x2, w), _to_pixel(y2, h)
-        vis.draw_line([px1, px2], [py1, py2], color=color, linewidth=linewidth)
-
-    return _save_output_image(Image.fromarray(vis.get_output().get_image()))
+    image = Image.open(_resolve_image_path(img_idx)).convert("RGB")
+    w, h = image.size
+    parsed_lines = _normalize_vectors(lines, "lines", 4)
+    rgb = _parse_color(color, "red")
+    line_width = max(1, int(round(_parse_positive_number(linewidth, "linewidth", 3.0))))
+    draw = ImageDraw.Draw(image)
+    for i, line in enumerate(parsed_lines):
+        px1, py1, px2, py2 = _box_to_pixels(line, w, h, f"lines[{i}]")
+        draw.line([px1, py1, px2, py2], fill=rgb, width=line_width)
+    return _save_output_image(image)
 
 
 @app.tool(name="draw_boxes", description="Draw one or more bounding boxes on an image. Coordinates use 0-1000 scale where (0,0)=top-left, (1000,1000)=bottom-right. For a single box, pass [x1, y1, x2, y2]. For multiple boxes, pass [[x1, y1, x2, y2], ...]. Example: draw_boxes(img_idx=0, boxes=[[100, 100, 200, 200], [300, 300, 400, 400]]) draws 2 boxes.")
@@ -308,33 +418,22 @@ def draw_boxes(
     :param linewidth: Width of box outlines in pixels.
     :return: Image with boxes drawn.
     """
-    image_path = _resolve_image_path(img_idx)
-    img = np.array(Image.open(image_path).convert("RGB"))
-    h, w = img.shape[:2]
-
-    # Normalize to list of boxes
-    if boxes and isinstance(boxes[0], int):
-        boxes = [boxes]  # Single box: [x1, y1, x2, y2] -> [[x1, y1, x2, y2]]
-
-    try:
-        vis = Visualizer(img)
-        for i, box in enumerate(boxes):
-            x1, y1, x2, y2 = box
-            px1, py1 = _to_pixel(x1, w), _to_pixel(y1, h)
-            px2, py2 = _to_pixel(x2, w), _to_pixel(y2, h)
-            vis.draw_box([px1, py1, px2, py2], edge_color=color, alpha=alpha, linewidth=linewidth)
-
-        return _save_output_image(Image.fromarray(vis.get_output().get_image()))
-    except RuntimeError:
-        # Offline fallback: plain PIL rectangle (no cv2/matplotlib).
-        pil_img = Image.fromarray(img)
-        draw = ImageDraw.Draw(pil_img)
-        for i, box in enumerate(boxes):
-            x1, y1, x2, y2 = box
-            px1, py1 = _to_pixel(x1, w), _to_pixel(y1, h)
-            px2, py2 = _to_pixel(x2, w), _to_pixel(y2, h)
-            draw.rectangle([px1, py1, px2, py2], outline=color, width=max(1, int(linewidth)))
-        return _save_output_image(pil_img)
+    image = Image.open(_resolve_image_path(img_idx)).convert("RGB")
+    w, h = image.size
+    parsed_boxes = _normalize_vectors(boxes, "boxes", 4)
+    rgb = _parse_color(color, "lime")
+    alpha_value = _parse_alpha(alpha, 0.8)
+    rgba = (*rgb, int(round(alpha_value * 255)))
+    line_width = max(1, int(round(_parse_positive_number(linewidth, "linewidth", 3.0))))
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    for i, box in enumerate(parsed_boxes):
+        px1, py1, px2, py2 = _box_to_pixels(box, w, h, f"boxes[{i}]")
+        left, right = sorted((px1, px2))
+        top, bottom = sorted((py1, py2))
+        if right > left and bottom > top:
+            draw.rectangle([left, top, right, bottom], outline=rgba, width=line_width)
+    return _save_output_image(Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB"))
 
 
 @app.tool(name="draw_texts", description="Add one or more text annotations to an image. Coordinates use 0-1000 scale. For a single text, pass {\"x\": x, \"y\": y, \"text\": \"label\"}. For multiple, pass a list. Example: draw_texts(img_idx=0, texts=[{\"x\": 500, \"y\": 100, \"text\": \"Title\"}]) adds text at top center.")
@@ -353,23 +452,18 @@ def draw_texts(
     :param font_size: Size of the font in pixels.
     :return: Image with text drawn.
     """
-    image_path = _resolve_image_path(img_idx)
-    img = np.array(Image.open(image_path).convert("RGB"))
-    h, w = img.shape[:2]
-    vis = Visualizer(img)
-
-    # Normalize to list of text objects
-    if isinstance(texts, dict):
-        texts = [texts]
-
-    for text_obj in texts:
-        x = text_obj["x"]
-        y = text_obj["y"]
-        text = text_obj["text"]
-        px, py = _to_pixel(x, w), _to_pixel(y, h)
-        vis.draw_text(text, (px, py), color=color, font_size=font_size)
-
-    return _save_output_image(Image.fromarray(vis.get_output().get_image()))
+    image = Image.open(_resolve_image_path(img_idx)).convert("RGB")
+    w, h = image.size
+    parsed_texts = _normalize_texts(texts)
+    rgb = _parse_color(color, "red")
+    size = max(1, int(round(_parse_positive_number(font_size, "font_size", 18.0))))
+    font = _load_font(size)
+    draw = ImageDraw.Draw(image)
+    for i, text_obj in enumerate(parsed_texts):
+        px = _to_pixel_clamped(text_obj["x"], w, f"texts[{i}].x")
+        py = _to_pixel_clamped(text_obj["y"], h, f"texts[{i}].y")
+        draw.text((px, py), str(text_obj["text"]), fill=rgb, font=font)
+    return _save_output_image(image)
 
 
 @app.tool(name="draw_polygons", description="Draw one or more polygons on an image. Coordinates use 0-1000 scale. For a single polygon, pass [[x1,y1], [x2,y2], [x3,y3], ...]. For multiple polygons, pass [[[x1,y1], ...], [[x1,y1], ...], ...]. Example: draw_polygons(img_idx=0, polygons=[[[200,200], [800,200], [500,800]]]) draws a triangle.")
@@ -388,21 +482,18 @@ def draw_polygons(
     :param alpha: Opacity of the fill.
     :return: Image with polygons drawn.
     """
-    image_path = _resolve_image_path(img_idx)
-    img = np.array(Image.open(image_path).convert("RGB"))
-    h, w = img.shape[:2]
-    vis = Visualizer(img)
-
-    # Normalize to list of polygons
-    # Check if it's a single polygon (list of [x, y] pairs) or multiple polygons
-    if polygons and isinstance(polygons[0], list) and len(polygons[0]) == 2 and isinstance(polygons[0][0], int):
-        polygons = [polygons]  # Single polygon: [[x1,y1], [x2,y2], ...] -> [[[x1,y1], [x2,y2], ...]]
-
-    for polygon in polygons:
-        pixel_points = [[_to_pixel(p[0], w), _to_pixel(p[1], h)] for p in polygon]
-        vis.draw_polygon(np.array(pixel_points), color=color, alpha=alpha)
-
-    return _save_output_image(Image.fromarray(vis.get_output().get_image()))
+    image = Image.open(_resolve_image_path(img_idx)).convert("RGB")
+    w, h = image.size
+    parsed_polygons = _normalize_polygons(polygons)
+    rgb = _parse_color(color, "red")
+    alpha_value = _parse_alpha(alpha, 0.5)
+    rgba = (*rgb, int(round(alpha_value * 255)))
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    for poly_idx, polygon in enumerate(parsed_polygons):
+        points = [_point_to_pixels(point, w, h, f"polygons[{poly_idx}][{point_idx}]") for point_idx, point in enumerate(polygon)]
+        draw.polygon(points, fill=rgba, outline=(*rgb, 255))
+    return _save_output_image(Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB"))
 
 
 if __name__ == "__main__":

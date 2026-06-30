@@ -1,0 +1,8 @@
+group: mmmu_pro_zoomdrawing_instruct
+task:
+- mmmu_pro_vision_zoomdrawing_instruct
+- mmmu_pro_standard_zoomdrawing_instruct
+include:
+- ../../_tool_templates/_instruct/_toolset_zoomdraw_instruct_yaml
+generation_kwargs:
+  max_new_tokens: 16384

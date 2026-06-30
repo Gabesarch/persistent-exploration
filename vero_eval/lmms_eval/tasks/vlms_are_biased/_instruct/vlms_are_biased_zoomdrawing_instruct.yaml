@@ -1,0 +1,17 @@
+include:
+- ../vlms_are_biased.yaml
+- ../../_tool_templates/_instruct/_toolset_zoomdraw_instruct_yaml
+task: "vlms_are_biased_zoomdrawing_instruct"
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 40
+  presence_penalty: 2.0
+  do_sample: true
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: ""
+    post_prompt: " Put your final answer in <answer>...</answer> tags."
+metadata:
+  version: 0.0
