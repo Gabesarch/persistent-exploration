@@ -103,6 +103,17 @@ class MultiTurnConfig(BaseConfig):
     tool_response_final_suffix: str = (
         "The maximum amount of tool calling has been reached. Please output a final answer in the next turn."
     )
+    conditional_answer_retry_enabled: bool = False
+    conditional_answer_retry_force_next_tool_call: bool = True
+    conditional_answer_retry_suffix: str = (
+        "You have not gathered enough information yet. In your next turn, keep exploring rather than answering "
+        "prematurely: use more tool calls to broaden the search, test alternative hypotheses, look for "
+        "disconfirming evidence, and dig deeper into the most likely explanations. Finalize only when the evidence "
+        "clearly supports a conclusion."
+    )
+    conditional_answer_retry_assistant_prefill: str = ""
+    conditional_answer_retry_correct_accuracy_threshold: float = 0.0
+    conditional_answer_retry_max_retries: Optional[int] = None
 
 
 @dataclass

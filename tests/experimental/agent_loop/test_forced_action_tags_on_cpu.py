@@ -1,6 +1,8 @@
 import asyncio
+from types import SimpleNamespace
 from typing import Any, Optional
 
+from omegaconf import OmegaConf
 import pytest
 import torch
 from vllm import SamplingParams
@@ -34,6 +36,7 @@ class _FakeTokenizer:
             "<answer>": [20, 21, 22],
             "\n<answer>": [2, 20, 21, 22],
             "\n<answer>\n\\boxed{": [2, 20, 21, 22, 2, 60, 61],
+            "retry prefill": [70, 71],
         }
         self.id_to_text = {
             1: "</think>",
@@ -49,6 +52,8 @@ class _FakeTokenizer:
             50: "final",
             60: "\\boxed",
             61: "{",
+            70: "retry ",
+            71: "prefill",
         }
 
     def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
@@ -159,9 +164,32 @@ class _FakeServerManager:
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
     ) -> TokenOutput:
-        del request_id, prompt_ids, image_data, video_data
+        del request_id, image_data, video_data
+        self.last_prompt_ids = list(prompt_ids)
         self.last_sampling_params = sampling_params
         return TokenOutput(token_ids=self.token_ids, extra_fields={})
+
+
+class _SequencedFakeServerManager:
+    def __init__(self, token_ids_by_call: list[list[int]]):
+        self.token_ids_by_call = list(token_ids_by_call)
+        self.sampling_params_by_call: list[dict[str, Any]] = []
+        self.prompt_ids_by_call: list[list[int]] = []
+
+    async def generate(
+        self,
+        request_id: str,
+        *,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        image_data: Optional[list[Any]] = None,
+        video_data: Optional[list[Any]] = None,
+    ) -> TokenOutput:
+        del request_id, image_data, video_data
+        self.prompt_ids_by_call.append(list(prompt_ids))
+        self.sampling_params_by_call.append(sampling_params)
+        token_ids = self.token_ids_by_call.pop(0)
+        return TokenOutput(token_ids=token_ids, extra_fields={}, log_probs=[0.0] * len(token_ids))
 
 
 class _FakeToolParser:
@@ -171,6 +199,15 @@ class _FakeToolParser:
     async def extract_tool_calls(self, responses_ids, tools=None):
         del responses_ids, tools
         return "", self.tool_calls
+
+
+class _SequencedFakeToolParser:
+    def __init__(self, tool_calls_by_call: list[list[FunctionCall]]):
+        self.tool_calls_by_call = list(tool_calls_by_call)
+
+    async def extract_tool_calls(self, responses_ids, tools=None):
+        del responses_ids, tools
+        return "", self.tool_calls_by_call.pop(0)
 
 
 class _InlineExecutorLoop:
@@ -199,6 +236,95 @@ def _make_loop(tokenizer: _FakeTokenizer, server_manager: _FakeServerManager, to
     return loop
 
 
+def _make_conditional_retry_loop(
+    tokenizer: _FakeTokenizer,
+    server_manager: _SequencedFakeServerManager,
+    tool_parser: _SequencedFakeToolParser,
+    reward_fn,
+):
+    loop = object.__new__(ToolAgentLoop)
+    loop.force_tool_calls_until_final_turn = False
+    loop.final_answer_token_margin = 4
+    loop.force_final_answer_prefix = ""
+    loop.max_assistant_turns = 11
+    loop.max_user_turns = 10
+    loop.response_length = 64
+    loop.server_manager = server_manager
+    loop.tokenizer = tokenizer
+    loop.loop = _InlineExecutorLoop()
+    loop.tools = {}
+    loop.tool_schemas = []
+    loop.tool_parser = tool_parser
+    loop.interaction_config_file = None
+    loop.response_display_prefix = ""
+    loop.conditional_answer_retry_enabled = True
+    loop.conditional_answer_retry_force_next_tool_call = True
+    loop.conditional_answer_retry_suffix = "retry suffix"
+    loop.conditional_answer_retry_assistant_prefill = ""
+    loop.conditional_answer_retry_correct_accuracy_threshold = 0.0
+    loop.conditional_answer_retry_max_retries = None
+    loop.conditional_answer_retry_reward_fn = reward_fn
+    loop._debug_enabled_for_agent = lambda agent_data: False
+
+    async def apply_chat_template(
+        messages,
+        tools=None,
+        images=None,
+        videos=None,
+        remove_system_prompt=False,
+    ):
+        del tools, images, videos, remove_system_prompt
+        return [100, 101] if "retry suffix" in str(messages) else [100]
+
+    loop.apply_chat_template = apply_chat_template
+    return loop
+
+
+def test_tool_agent_loop_init_tolerates_missing_optional_multi_turn_keys(monkeypatch):
+    multi_turn = OmegaConf.create(
+        {
+            "max_user_turns": 10,
+            "max_assistant_turns": 11,
+            "max_parallel_calls": 1,
+            "max_tool_response_length": 256,
+            "tool_response_truncate_side": "middle",
+            "tool_config_path": None,
+            "format": "hermes",
+            "interaction_config_path": None,
+        }
+    )
+    OmegaConf.set_struct(multi_turn, True)
+    loop = object.__new__(ToolAgentLoop)
+    loop.rollout_config = SimpleNamespace(
+        multi_turn=multi_turn,
+        get=lambda key, default=None: default,
+        prompt_length=16,
+        response_length=64,
+    )
+    loop.config = {}
+    loop.tokenizer = _FakeTokenizer()
+    monkeypatch.setattr(
+        "verl.experimental.agent_loop.tool_agent_loop.initialize_tools_from_config",
+        lambda path: [],
+    )
+    monkeypatch.setattr(
+        "verl.experimental.agent_loop.tool_agent_loop.ToolParser.get_tool_parser",
+        lambda fmt, tokenizer: _FakeToolParser([]),
+    )
+    monkeypatch.setattr(
+        "verl.experimental.agent_loop.tool_agent_loop.AgentLoopBase.__init__",
+        lambda self, *args, **kwargs: None,
+    )
+
+    ToolAgentLoop.__init__(loop)
+
+    assert loop.force_final_answer_prefix == ""
+    assert loop.force_tool_calls_until_final_turn is False
+    assert loop.conditional_answer_retry_enabled is False
+    assert loop.conditional_answer_retry_force_next_tool_call is True
+    assert loop.conditional_answer_retry_assistant_prefill == ""
+
+
 def _make_agent_data() -> AgentData:
     agent_data = AgentData(
         messages=[],
@@ -209,6 +335,15 @@ def _make_agent_data() -> AgentData:
         tools_kwargs={},
     )
     agent_data.prompt_ids = [100]
+    agent_data.messages = [{"role": "user", "content": "question"}]
+    agent_data.last_user_tool_prompt_start = 0
+    agent_data.last_user_tool_prompt_end = 1
+    agent_data.last_user_tool_response_mask_start = 0
+    agent_data.last_user_tool_response_mask_end = 0
+    agent_data.last_user_tool_response_logprobs_start = 0
+    agent_data.last_user_tool_response_logprobs_end = 0
+    agent_data.last_user_tool_message_index = 0
+    agent_data.last_user_tool_block_start_index = 0
     return agent_data
 
 
@@ -293,6 +428,185 @@ def test_forced_final_turn_forces_boxed_answer_prefix():
     assert extra_args[FORCE_ACTION_TAG_IDS_KEY] == [2, 20, 21, 22, 2, 60, 61]
     assert state == AgentState.TERMINATED
     assert "forced_structure_error" not in agent_data.extra_fields
+
+
+def test_conditional_answer_retry_keeps_correct_first_answer_without_forcing():
+    tokenizer = _FakeTokenizer()
+    server_manager = _SequencedFakeServerManager([[30, 31, 1, 2, 20, 21, 22, 50]])
+    tool_parser = _SequencedFakeToolParser([[]])
+    agent_data = _make_agent_data()
+
+    async def run_test():
+        loop = _make_conditional_retry_loop(
+            tokenizer,
+            server_manager,
+            tool_parser,
+            lambda **kwargs: {"accuracy": 1.0, "score": 1.0},
+        )
+        return await loop._handle_generating_state(
+            agent_data,
+            {"temperature": 1.0},
+            rollout_kwargs={"data_source": "unit", "reward_model": {"ground_truth": "ok"}, "extra_info": {}},
+        )
+
+    state = asyncio.run(run_test())
+
+    assert state == AgentState.TERMINATED
+    assert FORCE_ACTION_REQUIRED_TAG_KEY not in server_manager.sampling_params_by_call[0].get("extra_args", {})
+    assert agent_data.extra_fields["conditional_answer_retry_last_grade"]["accuracy"] == 1.0
+    assert agent_data.extra_fields.get("conditional_answer_retry_count") is None
+
+
+def test_conditional_answer_retry_grades_with_response_display_prefix():
+    tokenizer = _FakeTokenizer()
+    server_manager = _SequencedFakeServerManager([[31, 1, 20, 21, 22, 50]])
+    tool_parser = _SequencedFakeToolParser([[]])
+    agent_data = _make_agent_data()
+    graded_solution = {}
+
+    def reward_fn(**kwargs):
+        graded_solution["solution_str"] = kwargs["solution_str"]
+        return {"accuracy": 1.0 if kwargs["solution_str"].startswith("<think>reason</think><answer>") else 0.0}
+
+    async def run_test():
+        loop = _make_conditional_retry_loop(tokenizer, server_manager, tool_parser, reward_fn)
+        loop.response_display_prefix = "<think>"
+        return await loop._handle_generating_state(
+            agent_data,
+            {"temperature": 1.0},
+            rollout_kwargs={"data_source": "unit", "reward_model": {"ground_truth": "ok"}, "extra_info": {}},
+        )
+
+    state = asyncio.run(run_test())
+
+    assert state == AgentState.TERMINATED
+    assert graded_solution["solution_str"] == "<think>reason</think><answer>final"
+    assert agent_data.extra_fields["conditional_answer_retry_last_grade"]["accuracy"] == 1.0
+    assert agent_data.extra_fields.get("conditional_answer_retry_count") is None
+
+
+def test_conditional_answer_retry_rolls_back_appends_suffix_and_forces_next_tool_call():
+    tokenizer = _FakeTokenizer()
+    server_manager = _SequencedFakeServerManager(
+        [
+            [30, 31, 1, 2, 20, 21, 22, 50],
+            [30, 31, 1, 2, 10, 40, 11],
+        ]
+    )
+    tool_parser = _SequencedFakeToolParser(
+        [
+            [],
+            [FunctionCall(name="image_zoom_in_tool", arguments="{}")],
+        ]
+    )
+    agent_data = _make_agent_data()
+
+    async def run_test():
+        loop = _make_conditional_retry_loop(
+            tokenizer,
+            server_manager,
+            tool_parser,
+            lambda **kwargs: {"accuracy": 0.0, "score": 0.0},
+        )
+        first_state = await loop._handle_generating_state(
+            agent_data,
+            {"temperature": 1.0},
+            rollout_kwargs={"data_source": "unit", "reward_model": {"ground_truth": "ok"}, "extra_info": {}},
+        )
+        second_state = await loop._handle_generating_state(
+            agent_data,
+            {"temperature": 1.0},
+            rollout_kwargs={"data_source": "unit", "reward_model": {"ground_truth": "ok"}, "extra_info": {}},
+        )
+        return first_state, second_state
+
+    first_state, second_state = asyncio.run(run_test())
+
+    assert first_state == AgentState.GENERATING
+    assert second_state == AgentState.PROCESSING_TOOLS
+    assert agent_data.messages == [{"role": "user", "content": "question\n\nretry suffix"}]
+    assert agent_data.extra_fields["conditional_answer_retry_count"] == 1
+    assert agent_data.assistant_turns == 1
+    assert agent_data.prompt_ids[:2] == [100, 101]
+    assert len(agent_data.response_mask) == len(server_manager.sampling_params_by_call[1]["extra_args"][FORCE_ACTION_TAG_IDS_KEY]) + 5
+    extra_args = server_manager.sampling_params_by_call[1]["extra_args"]
+    assert extra_args[FORCE_ACTION_REQUIRED_TAG_KEY] == "<tool_call>"
+    assert extra_args[FORCE_ACTION_TAG_IDS_KEY] == [2, 10]
+
+
+def test_conditional_answer_retry_assistant_prefill_is_masked_and_in_prompt():
+    tokenizer = _FakeTokenizer()
+    server_manager = _SequencedFakeServerManager(
+        [
+            [30, 31, 1, 2, 20, 21, 22, 50],
+            [30, 31, 1, 2, 10, 40, 11],
+        ]
+    )
+    tool_parser = _SequencedFakeToolParser(
+        [
+            [],
+            [FunctionCall(name="image_zoom_in_tool", arguments="{}")],
+        ]
+    )
+    agent_data = _make_agent_data()
+
+    async def run_test():
+        loop = _make_conditional_retry_loop(
+            tokenizer,
+            server_manager,
+            tool_parser,
+            lambda **kwargs: {"accuracy": 0.0, "score": 0.0},
+        )
+        loop.conditional_answer_retry_assistant_prefill = "retry prefill"
+        first_state = await loop._handle_generating_state(
+            agent_data,
+            {"temperature": 1.0},
+            rollout_kwargs={"data_source": "unit", "reward_model": {"ground_truth": "ok"}, "extra_info": {}},
+        )
+        second_state = await loop._handle_generating_state(
+            agent_data,
+            {"temperature": 1.0},
+            rollout_kwargs={"data_source": "unit", "reward_model": {"ground_truth": "ok"}, "extra_info": {}},
+        )
+        return first_state, second_state
+
+    first_state, second_state = asyncio.run(run_test())
+
+    assert first_state == AgentState.GENERATING
+    assert second_state == AgentState.PROCESSING_TOOLS
+    assert server_manager.prompt_ids_by_call[1][-2:] == [70, 71]
+    assert agent_data.response_mask == [0, 0] + [1] * 7
+    assert agent_data.response_logprobs == [0.0, 0.0] + [0.0] * 7
+    assert agent_data.prompt_ids[-9:] == [70, 71, 30, 31, 1, 2, 10, 40, 11]
+
+
+def test_conditional_answer_retry_skips_when_caps_prevent_more_exploration():
+    tokenizer = _FakeTokenizer()
+    server_manager = _SequencedFakeServerManager([[30, 31, 1, 2, 20, 21, 22, 50]])
+    tool_parser = _SequencedFakeToolParser([[]])
+    agent_data = _make_agent_data()
+
+    async def run_test():
+        loop = _make_conditional_retry_loop(
+            tokenizer,
+            server_manager,
+            tool_parser,
+            lambda **kwargs: {"accuracy": 0.0, "score": 0.0},
+        )
+        loop.max_assistant_turns = 1
+        return await loop._handle_generating_state(
+            agent_data,
+            {"temperature": 1.0},
+            rollout_kwargs={"data_source": "unit", "reward_model": {"ground_truth": "ok"}, "extra_info": {}},
+        )
+
+    state = asyncio.run(run_test())
+
+    assert state == AgentState.TERMINATED
+    assert agent_data.messages == [{"role": "user", "content": "question"}]
+    assert agent_data.assistant_turns == 1
+    assert agent_data.extra_fields["conditional_answer_retry_skipped_reason"] == "max_assistant_turns"
+    assert agent_data.extra_fields.get("conditional_answer_retry_count") is None
 
 
 def test_vllm_server_helper_appends_forced_action_processor_when_force_mode_enabled():

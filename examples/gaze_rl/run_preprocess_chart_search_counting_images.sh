@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 VERL_ROOT="${VERL_ROOT:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 
-DEFAULT_DATA_DIR="/scratch/gpfs/ZHUANGL/gs1693/reason_vlm_datasets/chart_search_counting_rl"
+DEFAULT_DATA_DIR="/scratch/gpfs/ZHUANGL/gs1693/vigorl_gaze_datasets/chart_search_counting_rl"
 TRAIN_JSONL="${TRAIN_JSONL:-$DEFAULT_DATA_DIR/chart_search_counting_train.verl.jsonl}"
 VAL_JSONL="${VAL_JSONL:-$DEFAULT_DATA_DIR/chart_search_counting_val.verl.jsonl}"
 MAX_PIXELS="${MAX_PIXELS:-10240000}"

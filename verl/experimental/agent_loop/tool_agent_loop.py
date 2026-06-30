@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -33,6 +34,7 @@ from verl.interactions.base import BaseInteraction
 from verl.interactions.utils.interaction_registry import initialize_interactions_from_config
 from verl.tools.schemas import ToolResponse
 from verl.tools.utils.tool_registry import initialize_tools_from_config
+from verl.trainer.ppo.reward import get_custom_reward_fn
 from verl.utils.crop_cache import CROP_IMAGE_REFS_KEY, resolve_crop_cache_root
 from verl.utils.debug.comprehensive_logging import (
     append_jsonl,
@@ -63,6 +65,9 @@ TERMINAL_TOOL_EXTRA_FIELD_DEFAULTS: dict[str, Any] = {
     "forced_structure_error": False,
     "forced_structure_error_reason": None,
     "forced_structure_error_assistant_turn": None,
+    "conditional_answer_retry_count": 0,
+    "conditional_answer_retry_last_grade": None,
+    "conditional_answer_retry_skipped_reason": None,
 }
 
 
@@ -123,6 +128,17 @@ class AgentData:
         self.extra_fields: dict[str, Any] = {}
         self.debug_events: list[dict[str, Any]] = []
         self.crop_image_refs: list[dict[str, Any]] = []
+        self.force_next_tool_call = False
+        self.last_user_tool_prompt_start: int | None = None
+        self.last_user_tool_prompt_end: int | None = None
+        self.last_user_tool_response_mask_start: int | None = None
+        self.last_user_tool_response_mask_end: int | None = None
+        self.last_user_tool_response_logprobs_start: int | None = None
+        self.last_user_tool_response_logprobs_end: int | None = None
+        self.last_user_tool_message_index: int | None = None
+        self.last_user_tool_block_start_index: int | None = None
+        self.last_user_tool_block_images: list[Any] | None = None
+        self.last_user_tool_block_videos: list[Any] | None = None
 
 
 @register("tool_agent")
@@ -131,19 +147,48 @@ class ToolAgentLoop(AgentLoopBase):
         super().__init__(*args, **kwargs)
 
         # Initialize tools from config file
-        self.max_user_turns = self.rollout_config.multi_turn.max_user_turns
-        self.max_assistant_turns = self.rollout_config.multi_turn.max_assistant_turns
-        self.max_parallel_calls = self.rollout_config.multi_turn.max_parallel_calls
-        self.max_tool_response_length = self.rollout_config.multi_turn.max_tool_response_length
-        self.tool_response_truncate_side = self.rollout_config.multi_turn.tool_response_truncate_side
-        self.force_tool_calls_until_final_turn = self.rollout_config.multi_turn.force_tool_calls_until_final_turn
-        self.final_answer_token_margin = self.rollout_config.multi_turn.final_answer_token_margin
-        self.force_final_answer_prefix = self.rollout_config.multi_turn.force_final_answer_prefix
-        self.tool_response_turn_suffix_enabled = self.rollout_config.multi_turn.tool_response_turn_suffix_enabled
-        self.tool_response_explore_turns = self.rollout_config.multi_turn.tool_response_explore_turns
-        self.tool_response_explore_suffix = self.rollout_config.multi_turn.tool_response_explore_suffix
-        self.tool_response_final_suffix = self.rollout_config.multi_turn.tool_response_final_suffix
-        tool_config_path = self.rollout_config.multi_turn.tool_config_path
+        multi_turn_config = self.rollout_config.multi_turn
+        self.max_user_turns = multi_turn_config.max_user_turns
+        self.max_assistant_turns = multi_turn_config.max_assistant_turns
+        self.max_parallel_calls = multi_turn_config.max_parallel_calls
+        self.max_tool_response_length = multi_turn_config.max_tool_response_length
+        self.tool_response_truncate_side = multi_turn_config.tool_response_truncate_side
+        self.force_tool_calls_until_final_turn = getattr(multi_turn_config, "force_tool_calls_until_final_turn", False)
+        self.final_answer_token_margin = getattr(multi_turn_config, "final_answer_token_margin", 2048)
+        self.force_final_answer_prefix = getattr(multi_turn_config, "force_final_answer_prefix", "")
+        self.tool_response_turn_suffix_enabled = getattr(multi_turn_config, "tool_response_turn_suffix_enabled", False)
+        self.tool_response_explore_turns = getattr(multi_turn_config, "tool_response_explore_turns", 10)
+        self.tool_response_explore_suffix = getattr(multi_turn_config, "tool_response_explore_suffix", "")
+        self.tool_response_final_suffix = getattr(multi_turn_config, "tool_response_final_suffix", "")
+        self.conditional_answer_retry_enabled = getattr(
+            multi_turn_config, "conditional_answer_retry_enabled", False
+        )
+        self.conditional_answer_retry_force_next_tool_call = getattr(
+            multi_turn_config, "conditional_answer_retry_force_next_tool_call", True
+        )
+        self.conditional_answer_retry_suffix = getattr(
+            multi_turn_config,
+            "conditional_answer_retry_suffix",
+            (
+                "You have not gathered enough information yet. In your next turn, keep exploring rather than "
+                "answering prematurely: use more tool calls to broaden the search, test alternative hypotheses, "
+                "look for disconfirming evidence, and dig deeper into the most likely explanations. Finalize only "
+                "when the evidence clearly supports a conclusion."
+            ),
+        )
+        self.conditional_answer_retry_assistant_prefill = getattr(
+            multi_turn_config, "conditional_answer_retry_assistant_prefill", ""
+        )
+        self.conditional_answer_retry_correct_accuracy_threshold = getattr(
+            multi_turn_config, "conditional_answer_retry_correct_accuracy_threshold", 0.0
+        )
+        self.conditional_answer_retry_max_retries = getattr(
+            multi_turn_config, "conditional_answer_retry_max_retries", None
+        )
+        self.conditional_answer_retry_reward_fn = (
+            get_custom_reward_fn(self.config) if self.conditional_answer_retry_enabled else None
+        )
+        tool_config_path = multi_turn_config.tool_config_path
         tool_list = initialize_tools_from_config(tool_config_path) if tool_config_path else []
         self.tools = {tool.name: tool for tool in tool_list}
         self.tool_schemas = [tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tool_list]
@@ -233,7 +278,7 @@ class ToolAgentLoop(AgentLoopBase):
             if state == AgentState.PENDING:
                 state = await self._handle_pending_state(agent_data, sampling_params)
             elif state == AgentState.GENERATING:
-                state = await self._handle_generating_state(agent_data, sampling_params)
+                state = await self._handle_generating_state(agent_data, sampling_params, rollout_kwargs=kwargs)
             elif state == AgentState.PROCESSING_TOOLS:
                 state = await self._handle_processing_tools_state(agent_data)
             elif state == AgentState.INTERACTING:
@@ -285,6 +330,18 @@ class ToolAgentLoop(AgentLoopBase):
             videos=agent_data.video_data,
         )
         agent_data.prompt_ids = prompt_ids
+        self._record_last_user_tool_prompt_block(
+            agent_data=agent_data,
+            prompt_start=0,
+            prompt_end=len(prompt_ids),
+            response_mask_start=0,
+            response_mask_end=0,
+            response_logprobs_start=0,
+            response_logprobs_end=0,
+            block_start_index=0,
+            block_images=agent_data.image_data,
+            block_videos=agent_data.video_data,
+        )
         return AgentState.GENERATING
 
     def _must_answer_now(self, agent_data: AgentData) -> bool:
@@ -363,15 +420,26 @@ class ToolAgentLoop(AgentLoopBase):
         return {**message, "content": suffix}
 
     async def _handle_generating_state(
-        self, agent_data: AgentData, sampling_params: dict[str, Any], ignore_termination: bool = False
+        self,
+        agent_data: AgentData,
+        sampling_params: dict[str, Any],
+        ignore_termination: bool = False,
+        rollout_kwargs: Optional[dict[str, Any]] = None,
     ) -> AgentState:
         """Handle the generating state: generate model response and check for tool calls."""
         add_messages: list[dict[str, Any]] = []
         forced_required_tag: Optional[str] = None
+        assistant_prefill_ids: list[int] = []
+        generation_snapshot = self._snapshot_generation_state(agent_data)
 
         if self.force_tool_calls_until_final_turn:
             forced_required_tag = "<answer>" if self._must_answer_now(agent_data) else "<tool_call>"
             sampling_params = self._with_forced_action_extra_args(sampling_params, forced_required_tag)
+        elif getattr(self, "conditional_answer_retry_enabled", False) and agent_data.force_next_tool_call:
+            forced_required_tag = "<tool_call>"
+            sampling_params = self._with_forced_action_extra_args(sampling_params, forced_required_tag)
+            assistant_prefill_ids = self._append_conditional_retry_assistant_prefill(agent_data)
+            agent_data.force_next_tool_call = False
 
         with simple_timer("generate_sequences", agent_data.metrics):
             output: TokenOutput = await self.server_manager.generate(
@@ -401,6 +469,8 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.prompt_ids += agent_data.response_ids
         agent_data.response_mask += [1] * len(agent_data.response_ids)
         if output.log_probs:
+            if assistant_prefill_ids:
+                agent_data.response_logprobs += [0.0] * len(assistant_prefill_ids)
             agent_data.response_logprobs += output.log_probs
 
         if output.routed_experts is not None:
@@ -408,7 +478,10 @@ class ToolAgentLoop(AgentLoopBase):
 
         if self._debug_enabled_for_agent(agent_data):
             assistant_message = await self.loop.run_in_executor(
-                None, lambda: self.tokenizer.decode(agent_data.response_ids, skip_special_tokens=True)
+                None,
+                lambda: self.tokenizer.decode(
+                    assistant_prefill_ids + agent_data.response_ids, skip_special_tokens=True
+                ),
             )
             assistant_message = apply_response_display_prefix(assistant_message, self.response_display_prefix)
             event = {
@@ -437,6 +510,26 @@ class ToolAgentLoop(AgentLoopBase):
                 self._mark_forced_structure_error(agent_data, reason)
                 return AgentState.TERMINATED
 
+        if (
+            getattr(self, "conditional_answer_retry_enabled", False)
+            and not agent_data.tool_calls
+            and rollout_kwargs is not None
+        ):
+            assistant_message = await self.loop.run_in_executor(
+                None, lambda: self.tokenizer.decode(agent_data.response_ids, skip_special_tokens=True)
+            )
+            assistant_message = apply_response_display_prefix(assistant_message, self.response_display_prefix)
+            if "<answer>" in assistant_message:
+                retry_state = await self._maybe_retry_incorrect_answer(
+                    agent_data=agent_data,
+                    generation_snapshot=generation_snapshot,
+                    assistant_message=assistant_message,
+                    rollout_kwargs=rollout_kwargs,
+                    ignore_termination=ignore_termination,
+                )
+                if retry_state is not None:
+                    return retry_state
+
         # Check termination conditions
         if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
             return AgentState.TERMINATED
@@ -460,6 +553,297 @@ class ToolAgentLoop(AgentLoopBase):
             return AgentState.INTERACTING
         else:
             return AgentState.TERMINATED
+
+    def _append_conditional_retry_assistant_prefill(self, agent_data: AgentData) -> list[int]:
+        prefill = self.conditional_answer_retry_assistant_prefill or ""
+        if not prefill:
+            return []
+        prefill_ids = self.tokenizer.encode(prefill, add_special_tokens=False)
+        if not prefill_ids:
+            return []
+        if len(agent_data.response_mask) + len(prefill_ids) >= self.response_length:
+            return []
+        agent_data.prompt_ids += prefill_ids
+        agent_data.response_mask += [0] * len(prefill_ids)
+        return prefill_ids
+
+    def _snapshot_generation_state(self, agent_data: AgentData) -> dict[str, Any]:
+        return {
+            "prompt_ids_len": len(agent_data.prompt_ids),
+            "response_mask_len": len(agent_data.response_mask),
+            "response_logprobs_len": len(agent_data.response_logprobs),
+            "assistant_turns": agent_data.assistant_turns,
+            "extra_fields": dict(agent_data.extra_fields),
+            "debug_events_len": len(agent_data.debug_events),
+        }
+
+    def _rollback_generation_state(self, agent_data: AgentData, snapshot: dict[str, Any]) -> None:
+        agent_data.prompt_ids = agent_data.prompt_ids[: snapshot["prompt_ids_len"]]
+        agent_data.response_ids = []
+        agent_data.response_mask = agent_data.response_mask[: snapshot["response_mask_len"]]
+        agent_data.response_logprobs = agent_data.response_logprobs[: snapshot["response_logprobs_len"]]
+        agent_data.assistant_turns = snapshot["assistant_turns"]
+        agent_data.tool_calls = []
+        agent_data.extra_fields = snapshot["extra_fields"]
+        agent_data.debug_events = agent_data.debug_events[: snapshot["debug_events_len"]]
+
+    async def _maybe_retry_incorrect_answer(
+        self,
+        agent_data: AgentData,
+        generation_snapshot: dict[str, Any],
+        assistant_message: str,
+        rollout_kwargs: dict[str, Any],
+        ignore_termination: bool,
+    ) -> AgentState | None:
+        grade = await self._grade_current_response(agent_data, rollout_kwargs)
+        agent_data.extra_fields["conditional_answer_retry_last_grade"] = grade
+        accuracy = self._grade_accuracy(grade)
+        if accuracy > float(self.conditional_answer_retry_correct_accuracy_threshold):
+            return None
+
+        retry_count = int(agent_data.extra_fields.get("conditional_answer_retry_count") or 0)
+        skipped_reason = self._incorrect_answer_retry_skipped_reason(
+            agent_data=agent_data,
+            snapshot=generation_snapshot,
+            retry_count=retry_count,
+        )
+        if skipped_reason is not None:
+            agent_data.extra_fields["conditional_answer_retry_skipped_reason"] = skipped_reason
+            self._log_incorrect_answer_retry_skipped(agent_data, grade, retry_count, skipped_reason)
+            return None
+
+        self._rollback_generation_state(agent_data, generation_snapshot)
+        retry_count += 1
+        suffix = self.conditional_answer_retry_suffix or ""
+        await self._append_conditional_retry_suffix_to_previous_message(agent_data, suffix)
+        if self.conditional_answer_retry_force_next_tool_call:
+            agent_data.force_next_tool_call = True
+        agent_data.extra_fields["conditional_answer_retry_count"] = retry_count
+        agent_data.extra_fields["conditional_answer_retry_last_grade"] = grade
+        agent_data.extra_fields["conditional_answer_retry_skipped_reason"] = None
+        self._log_incorrect_answer_retry(
+            agent_data=agent_data,
+            grade=grade,
+            retry_count=retry_count,
+            suffix=suffix,
+            removed_assistant_turn=generation_snapshot["assistant_turns"] + 1,
+            removed_assistant_text=assistant_message,
+        )
+
+        if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
+            return AgentState.TERMINATED
+        return AgentState.GENERATING
+
+    async def _grade_current_response(self, agent_data: AgentData, rollout_kwargs: dict[str, Any]) -> dict[str, Any]:
+        if self.conditional_answer_retry_reward_fn is None:
+            return {"accuracy": 0.0, "error": "conditional answer retry requires a custom reward function"}
+
+        response_ids = agent_data.prompt_ids[-len(agent_data.response_mask) :] if agent_data.response_mask else []
+        solution_str = await self.loop.run_in_executor(
+            None, lambda: self.tokenizer.decode(response_ids, skip_special_tokens=True)
+        )
+        solution_str = apply_response_display_prefix(solution_str, self.response_display_prefix)
+        reward_model = rollout_kwargs.get("reward_model") or {}
+        ground_truth = reward_model.get("ground_truth") if isinstance(reward_model, dict) else None
+        result = self.conditional_answer_retry_reward_fn(
+            data_source=rollout_kwargs.get("data_source", "unknown"),
+            solution_str=solution_str,
+            ground_truth=ground_truth,
+            extra_info=rollout_kwargs.get("extra_info"),
+        )
+        if inspect.isawaitable(result):
+            result = await result
+        if isinstance(result, dict):
+            return result
+        return {"score": float(result), "accuracy": float(result)}
+
+    @staticmethod
+    def _grade_accuracy(grade: Any) -> float:
+        if isinstance(grade, dict):
+            try:
+                return float(grade.get("accuracy", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+        try:
+            return float(grade)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _incorrect_answer_retry_skipped_reason(
+        self,
+        agent_data: AgentData,
+        snapshot: dict[str, Any],
+        retry_count: int,
+    ) -> str | None:
+        max_retries = self.conditional_answer_retry_max_retries
+        if max_retries is not None and retry_count >= int(max_retries):
+            return "max_retries"
+        if self.max_assistant_turns and snapshot["assistant_turns"] + 2 > self.max_assistant_turns:
+            return "max_assistant_turns"
+        if self.max_user_turns and agent_data.user_turns >= self.max_user_turns:
+            return "max_user_turns"
+        if snapshot["response_mask_len"] + self.final_answer_token_margin >= self.response_length:
+            return "response_length"
+        if self._latest_user_or_tool_message_index(agent_data) is None:
+            return "missing_previous_user_or_tool_message"
+        return None
+
+    def _latest_user_or_tool_message_index(self, agent_data: AgentData) -> int | None:
+        for index in range(len(agent_data.messages) - 1, -1, -1):
+            if agent_data.messages[index].get("role") in {"user", "tool"}:
+                return index
+        return None
+
+    def _record_last_user_tool_prompt_block(
+        self,
+        agent_data: AgentData,
+        prompt_start: int,
+        prompt_end: int,
+        response_mask_start: int,
+        response_mask_end: int,
+        response_logprobs_start: int,
+        response_logprobs_end: int,
+        block_start_index: int,
+        block_images: Any,
+        block_videos: Any,
+    ) -> None:
+        message_index = self._latest_user_or_tool_message_index(agent_data)
+        if message_index is None:
+            return
+        agent_data.last_user_tool_prompt_start = prompt_start
+        agent_data.last_user_tool_prompt_end = prompt_end
+        agent_data.last_user_tool_response_mask_start = response_mask_start
+        agent_data.last_user_tool_response_mask_end = response_mask_end
+        agent_data.last_user_tool_response_logprobs_start = response_logprobs_start
+        agent_data.last_user_tool_response_logprobs_end = response_logprobs_end
+        agent_data.last_user_tool_message_index = message_index
+        agent_data.last_user_tool_block_start_index = block_start_index
+        agent_data.last_user_tool_block_images = block_images
+        agent_data.last_user_tool_block_videos = block_videos
+
+    async def _append_conditional_retry_suffix_to_previous_message(self, agent_data: AgentData, suffix: str) -> None:
+        message_index = self._latest_user_or_tool_message_index(agent_data)
+        if message_index is None:
+            raise RuntimeError("conditional answer retry could not find a previous user/tool message")
+
+        agent_data.messages[message_index] = self._append_suffix_to_tool_message(agent_data.messages[message_index], suffix)
+        prompt_start = agent_data.last_user_tool_prompt_start
+        prompt_end = agent_data.last_user_tool_prompt_end
+        mask_start = agent_data.last_user_tool_response_mask_start
+        mask_end = agent_data.last_user_tool_response_mask_end
+        logprobs_start = agent_data.last_user_tool_response_logprobs_start
+        logprobs_end = agent_data.last_user_tool_response_logprobs_end
+        block_start = agent_data.last_user_tool_block_start_index
+
+        if (
+            prompt_start is None
+            or prompt_end is None
+            or mask_start is None
+            or mask_end is None
+            or logprobs_start is None
+            or logprobs_end is None
+            or block_start is None
+            or message_index < block_start
+        ):
+            prompt_ids = await self.apply_chat_template(
+                agent_data.messages,
+                tools=self.tool_schemas,
+                images=agent_data.image_data,
+                videos=agent_data.video_data,
+            )
+            agent_data.prompt_ids = prompt_ids
+            agent_data.response_mask = []
+            agent_data.response_logprobs = []
+            self._record_last_user_tool_prompt_block(
+                agent_data=agent_data,
+                prompt_start=0,
+                prompt_end=len(prompt_ids),
+                response_mask_start=0,
+                response_mask_end=0,
+                response_logprobs_start=0,
+                response_logprobs_end=0,
+                block_start_index=0,
+                block_images=agent_data.image_data,
+                block_videos=agent_data.video_data,
+            )
+            return
+
+        if prompt_start == 0:
+            replacement_ids = await self.apply_chat_template(
+                agent_data.messages,
+                tools=self.tool_schemas,
+                images=agent_data.image_data,
+                videos=agent_data.video_data,
+            )
+        else:
+            block_messages = agent_data.messages[block_start : message_index + 1]
+            replacement_ids = await self.apply_chat_template(
+                block_messages,
+                images=agent_data.last_user_tool_block_images,
+                videos=agent_data.last_user_tool_block_videos,
+                remove_system_prompt=True,
+            )
+        old_len = prompt_end - prompt_start
+        delta = len(replacement_ids) - old_len
+        agent_data.prompt_ids = agent_data.prompt_ids[:prompt_start] + replacement_ids + agent_data.prompt_ids[prompt_end:]
+        if mask_end > mask_start:
+            agent_data.response_mask = (
+                agent_data.response_mask[:mask_start]
+                + [0] * len(replacement_ids)
+                + agent_data.response_mask[mask_end:]
+            )
+        if agent_data.response_logprobs and logprobs_end > logprobs_start:
+            agent_data.response_logprobs = (
+                agent_data.response_logprobs[:logprobs_start]
+                + [0.0] * len(replacement_ids)
+                + agent_data.response_logprobs[logprobs_end:]
+            )
+        agent_data.last_user_tool_prompt_end = prompt_end + delta
+        agent_data.last_user_tool_response_mask_end = mask_start + len(replacement_ids)
+        agent_data.last_user_tool_response_logprobs_end = logprobs_start + len(replacement_ids)
+
+    def _log_incorrect_answer_retry(
+        self,
+        agent_data: AgentData,
+        grade: dict[str, Any],
+        retry_count: int,
+        suffix: str,
+        removed_assistant_turn: int,
+        removed_assistant_text: str,
+    ) -> None:
+        if not self._debug_enabled_for_agent(agent_data):
+            return
+        event = {
+            "event": "incorrect_answer_retry",
+            "request_id": agent_data.request_id,
+            "retry_count": retry_count,
+            "removed_assistant_turn": removed_assistant_turn,
+            "removed_assistant_text": removed_assistant_text,
+            "grade": grade,
+            "suffix": suffix,
+            "force_next_tool_call": bool(self.conditional_answer_retry_force_next_tool_call),
+        }
+        agent_data.debug_events.append(event)
+        self._debug_append_event(event)
+
+    def _log_incorrect_answer_retry_skipped(
+        self,
+        agent_data: AgentData,
+        grade: dict[str, Any],
+        retry_count: int,
+        reason: str,
+    ) -> None:
+        if not self._debug_enabled_for_agent(agent_data):
+            return
+        event = {
+            "event": "incorrect_answer_retry_skipped",
+            "request_id": agent_data.request_id,
+            "retry_count": retry_count,
+            "reason": reason,
+            "grade": grade,
+        }
+        agent_data.debug_events.append(event)
+        self._debug_append_event(event)
 
     def _mark_forced_structure_error(self, agent_data: AgentData, reason: str) -> None:
         agent_data.extra_fields.update(
@@ -652,11 +1036,26 @@ class ToolAgentLoop(AgentLoopBase):
             for img in new_images_this_turn:
                 agent_data.image_data.append(img)
 
+        prompt_start = len(agent_data.prompt_ids)
+        mask_start = len(agent_data.response_mask)
+        logprobs_start = len(agent_data.response_logprobs)
         agent_data.prompt_ids += response_ids
         agent_data.response_mask += [0] * len(response_ids)
         if agent_data.response_logprobs:
             agent_data.response_logprobs += [0.0] * len(response_ids)
         agent_data.user_turns += 1
+        self._record_last_user_tool_prompt_block(
+            agent_data=agent_data,
+            prompt_start=prompt_start,
+            prompt_end=len(agent_data.prompt_ids),
+            response_mask_start=mask_start,
+            response_mask_end=len(agent_data.response_mask),
+            response_logprobs_start=logprobs_start,
+            response_logprobs_end=len(agent_data.response_logprobs),
+            block_start_index=len(agent_data.messages) - len(add_messages),
+            block_images=images,
+            block_videos=videos,
+        )
         return AgentState.GENERATING
 
     async def _handle_interacting_state(self, agent_data: AgentData) -> AgentState:

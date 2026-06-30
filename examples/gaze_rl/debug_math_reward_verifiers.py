@@ -34,7 +34,7 @@ DEFAULT_JSONL = (
     "validation_data/160.jsonl"
 )
 DEFAULT_SOURCE_JSONL = (
-    "/scratch/gpfs/ZHUANGL/gs1693/reason_vlm_datasets/chart_search_counting_rl/"
+    "/scratch/gpfs/ZHUANGL/gs1693/vigorl_gaze_datasets/chart_search_counting_rl/"
     "preprocessed_max_pixels_10240000/chart_search_counting_val.verl.preprocessed.jsonl"
 )
 

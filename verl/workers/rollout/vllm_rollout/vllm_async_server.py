@@ -376,7 +376,11 @@ class vLLMHttpServer:
     def _maybe_enable_forced_action_logits_processor(self, engine_kwargs: dict[str, Any]) -> None:
         multi_turn_config = getattr(self.config, "multi_turn", None)
         force_tool_calls = bool(getattr(multi_turn_config, "force_tool_calls_until_final_turn", False))
-        if not force_tool_calls:
+        conditional_answer_retry_force = bool(
+            getattr(multi_turn_config, "conditional_answer_retry_enabled", False)
+            and getattr(multi_turn_config, "conditional_answer_retry_force_next_tool_call", True)
+        )
+        if not (force_tool_calls or conditional_answer_retry_force):
             return
         ensure_forced_action_logits_processor(engine_kwargs)
 
