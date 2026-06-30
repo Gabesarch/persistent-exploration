@@ -67,8 +67,14 @@ echo "[INFO] index=$TASK_ID checkpoint=$CKPT_NAME path=$CHECKPOINT_PATH domain=$
 TASKS="$(expand_domain "$DOMAIN" "$MODEL_SUFFIX")" || { echo "[ERROR] empty task set"; exit 1; }
 echo "[INFO] tasks: $TASKS"
 
-# 4) Serve this checkpoint.
-NUM_GPUS="$NUM_GPUS" CHECKPOINT_PATH="$CHECKPOINT_PATH" PORT="$PORT" bash scripts/serve_qwen_vllm.sh
+# 4) Serve this checkpoint. RL/Vero checkpoints (reasoning* suffix) must be served with
+#    their forced-<think> training chat template, else they skip <think>/tool calls and
+#    answer directly (mirrors run_eval.sbatch). Base models (qwen3_zoom/_zs) are unaffected.
+if [[ -z "${CHAT_TEMPLATE:-}" && "$MODEL_SUFFIX" == reasoning* && -f "$CHECKPOINT_PATH/chat_template.jinja" ]]; then
+  export CHAT_TEMPLATE="$CHECKPOINT_PATH/chat_template.jinja"
+  echo "[INFO] suffix=$MODEL_SUFFIX -> serving with forced-think chat template: $CHAT_TEMPLATE"
+fi
+NUM_GPUS="$NUM_GPUS" CHECKPOINT_PATH="$CHECKPOINT_PATH" PORT="$PORT" CHAT_TEMPLATE="${CHAT_TEMPLATE:-}" bash scripts/serve_qwen_vllm.sh
 curl --max-time 5 -s -o /dev/null -H "Authorization: Bearer ${API_KEY}" "http://localhost:${PORT}/v1/models" \
   || { echo "[ERROR] vLLM not up for $CKPT_NAME"; exit 1; }
 

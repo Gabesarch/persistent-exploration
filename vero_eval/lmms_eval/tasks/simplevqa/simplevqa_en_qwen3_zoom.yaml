@@ -1,0 +1,28 @@
+# Base Qwen3-VL-Instruct multi-turn ZOOM variant of simplevqa_en.
+#
+# Reuses _toolset_zoom_yaml (generic zoom toolset: allowed_tools=[image_zoom_in_tool]
+# + system_base/system_zoom prompts) for instruct multi-turn tool use. This evaluates
+# the INSTRUCT (non-think) base model: no forced <think>, no Layer-A. Baseline vs the
+# Vero simplevqa_en_reasoning_zoom checkpoint.
+#
+# Modular composition: dataset wiring (via _default_template_yaml) + reusable zoom
+# toolset template. The toolset contributes metadata.allowed_tools and
+# metadata.system_prompt_files (deep-merged across includes). Run with TOOLS=on.
+include:
+  - _default_template_yaml
+  - ../_tool_templates/_toolset_zoom_yaml
+dataset_path: gsarch/SimpleVQA-EN
+dataset_name: "default"
+task: "simplevqa_en_qwen3_zoom"
+test_split: test
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 40
+  presence_penalty: 2.0
+  do_sample: True
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: "You are given an image. Examine the picture to answer the question. Your final answer should be a short, specific phrase. "
+    post_prompt: ""

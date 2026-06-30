@@ -1,0 +1,38 @@
+# Training-faithful Vero (RL thinking checkpoint) + ZOOM variant of embspatial.
+#
+# Mirrors visual_probe_hard_reasoning_zoom: it adds the Vero zoom toolset
+# (_toolset_zoom_vero_yaml -> Layer-A system prompt + training tool schema +
+# image_zoom_in_tool) and the training validation sampling (temperature 0.7,
+# top_p 1.0, top_k -1) on top of the embspatial dataset wiring.
+#
+# NOTE: BYTE-FAITHFUL replication of the RL training input is only claimed for
+# visual_probe (the dataset the checkpoint was trained on). For embspatial this
+# is a CONSISTENT GENERALIZATION eval -- same toolset / sampling / answer
+# protocol as training, but NOT byte-identical to any training example.
+#
+# Dataset wiring (dataset_path, doc_to_*, process_results, metric_list, splits)
+# is inherited unchanged from _default_template_yaml. Run with MODEL=vero TOOLS=on.
+include:
+  - _default_template_yaml
+  - ../_tool_templates/_toolset_zoom_vero_yaml
+dataset_name: null
+test_split: test
+task: "embspatial_reasoning_zoom"
+generation_kwargs:
+  # Matches the RL training validation sampling exactly (temperature 0.7, top_p 1.0, top_k -1).
+  # top_p/top_k MUST be set explicitly: if omitted, vLLM falls back to the checkpoint's
+  # generation_config defaults (top_k=20, top_p=0.8), which diverges from training.
+  max_new_tokens: 16384
+  temperature: 0.7
+  top_p: 1.0
+  top_k: -1
+  do_sample: True
+lmms_eval_specific_kwargs:
+  default:
+    # embspatial_doc_to_text builds "{question}\nOptions:\n{A.. D}\n" itself and
+    # .strip()s the result; Layer-A drives the answer format (A/B/C/D lands in the
+    # \boxed{} inside <answer>), so no pre/post answer-format instruction is added.
+    pre_prompt: ""
+    post_prompt: ""
+metadata:
+  image_indexing: training_faithful

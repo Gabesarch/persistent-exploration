@@ -1,0 +1,65 @@
+# Training-faithful Vero ZOOM variant of aerialvg_bbox.
+#
+# Mirrors visual_probe_hard_reasoning_zoom (Vero RL thinking checkpoint + image_zoom_in
+# tool + training sampling): it pairs the source aerialvg dataset wiring with the Vero
+# zoom toolset (_toolset_zoom_vero_yaml -> Layer-A system prompt + EXACT training tool
+# schema), training-faithful sampling (temperature 0.7 / top_p 1.0 / top_k -1), and
+# image_indexing: training_faithful.
+#
+# NOTE: BYTE-FAITHFUL replication only holds for visual_probe (the dataset Vero trained
+# on). For aerialvg this is a CONSISTENT GENERALIZATION eval, NOT byte-identical to
+# training: the question format and the structured-bbox post_prompt come from the source
+# task, not from the training distribution.
+#
+# Structured-output task: the scorer (utils.aerialvg_process_results) parses a JSON
+# [{"bbox_2d": [x_min, y_min, x_max, y_max], "label": "<class name>"}] array out of the
+# model's <answer>. The post_prompt below is kept VERBATIM from the source so it lands
+# inside <answer> and the scorer can extract bbox_2d. Run with MODEL=vero TOOLS=on.
+include:
+  - ../_tool_templates/_toolset_zoom_vero_yaml
+dataset_path: IPEC-COMMUNITY/AerialVG
+task: "aerialvg_bbox_reasoning_zoom"
+# rel1000 scoring: Vero emits bbox coords on the 0-1000 scale (its training/zoom-tool
+# convention), so the scorer must treat the predicted bbox as relative_1000 and rescale it to
+# pixels before IoU against the absolute-pixel GT. The abs_pixel variant (aerialvg_process_docs)
+# mis-scores Vero's 0-1000 output as pixels -> IoU collapses to ~0. (Mirrors the screenspot
+# rel1000 fix.)
+process_docs: !function utils.aerialvg_process_docs_rel1000
+test_split: test
+output_type: generate_until
+doc_to_visual: !function utils.aerialvg_doc_to_visual
+doc_to_text: !function utils.aerialvg_doc_to_text_rel1000
+doc_to_target: !function utils.aerialvg_doc_to_target
+
+generation_kwargs:
+  # Matches the RL training validation sampling exactly (temperature 0.7, top_p 1.0, top_k -1).
+  # top_p/top_k MUST be set explicitly: if omitted, vLLM falls back to the checkpoint's
+  # generation_config defaults (top_k=20, top_p=0.8), which diverges from training.
+  max_new_tokens: 16384
+  temperature: 0.7
+  top_p: 1.0
+  top_k: -1
+  do_sample: True
+
+
+# The return value of process_results will be used by metrics
+process_results: !function utils.aerialvg_process_results
+# Note that the metric name can be either a registered metric function or a key returned by process_results
+metric_list:
+  - metric: aerialvg_iou
+    aggregation: !function utils.aerialvg_mean
+    higher_is_better: true
+  - metric: aerialvg_acc@0.5
+    aggregation: !function utils.aerialvg_mean
+    higher_is_better: true
+  - metric: aerialvg_acc@0.75
+    aggregation: !function utils.aerialvg_mean
+    higher_is_better: true
+
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: ""
+    post_prompt: ' Output the bounding box(es) in a JSON array format using 0-1000 image coordinates: [{"bbox_2d": [x_min, y_min, x_max, y_max], "label": "<class name>"}]. For a single object, return one array element; for multiple objects, return one element per object in the array.'
+metadata:
+  version: 0.0
+  image_indexing: training_faithful

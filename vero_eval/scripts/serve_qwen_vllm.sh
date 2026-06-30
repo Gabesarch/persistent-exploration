@@ -51,6 +51,11 @@ fi
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-}"
 CHAT_TEMPLATE_ARGS=()
 [[ -n "$CHAT_TEMPLATE" ]] && CHAT_TEMPLATE_ARGS=(--chat-template "$CHAT_TEMPLATE") && echo "Using chat template: $CHAT_TEMPLATE"
+# max_pixels is now a serve-time knob (was hardcoded 12960000). Default is 10000000 — the
+# canonical full-setting resolution (on the ~8-13MP accuracy plateau, so equivalent to the
+# old 12.96MP within noise and slightly cheaper). Override per run via MM_MAX_PIXELS.
+MM_MAX_PIXELS="${MM_MAX_PIXELS:-10000000}"
+MM_MIN_PIXELS="${MM_MIN_PIXELS:-4096}"
 
 echo "Starting vLLM server (log: $LOGFILE)..."
 CHAT_TEMPLATE_ARG=""
@@ -62,9 +67,9 @@ nohup vllm serve "$CHECKPOINT_PATH" \
   --attention-config.flash_attn_version 2 \
   --tensor-parallel-size "$NUM_GPUS" \
   --uvicorn-log-level info \
-  --max-model-len 32768 \
+  --max-model-len "${MAX_MODEL_LEN:-32768}" \
   --no-enable-prefix-caching \
-  --mm-processor-kwargs '{"max_pixels":12960000,"min_pixels":4096}' \
+  --mm-processor-kwargs "{\"max_pixels\":${MM_MAX_PIXELS},\"min_pixels\":${MM_MIN_PIXELS}}" \
   --api-key "$API_KEY" \
   --enable-auto-tool-choice \
   --tool-call-parser hermes \
