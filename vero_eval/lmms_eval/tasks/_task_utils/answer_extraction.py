@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 
@@ -129,3 +130,61 @@ def extract_final_answer(
         text = _strip_tex_text_wrapper(text)
 
     return text.strip()
+
+
+# Explicit conclusion phrases — prefer the *last* match (model may revise).
+_MC_EXPLICIT_PATTERNS = (
+    r"(?:THE\s+)?(?:CORRECT\s+)?(?:ANSWER|CHOICE|OPTION)\s+IS\s*:?\s*\n?\s*([A-D])\b",
+    r"THEREFORE,?\s*(?:THE\s+)?(?:CORRECT\s+)?(?:ANSWER|CHOICE)\s+IS\s*:?\s*([A-D])\b",
+)
+
+
+def extract_multiple_choice_letter(text: str) -> str | None:
+    """Extract a single multiple-choice letter (A–D) from a model response.
+
+    Handles short direct answers (``A. rubber``, ``C``) and long post-tool
+    analyses that start with prose such as "Based on the visual analysis...".
+    The legacy ``^([A-D])`` prefix rule is intentionally omitted — it falsely
+    matched the leading B in "Based".
+    """
+    if not isinstance(text, str):
+        text = "" if text is None else str(text)
+    original = text.strip()
+    if not original:
+        return None
+
+    upper = original.upper()
+
+    for pattern in _MC_EXPLICIT_PATTERNS:
+        matches = list(re.finditer(pattern, upper))
+        if matches:
+            return matches[-1].group(1)
+
+    # Last "A. option" line (common final-answer format).
+    option_lines = list(re.finditer(r"(?:^|\n)\s*([A-D])\.\s+\S", original, re.IGNORECASE))
+    if option_lines:
+        return option_lines[-1].group(1).upper()
+
+    # Short direct answers (typical no-tool outputs).
+    if len(original) <= 32:
+        short = re.match(r"^([A-D])\s*[\.\):]?\s*(?:\S.*)?$", original, re.IGNORECASE)
+        if short:
+            return short.group(1).upper()
+        if re.fullmatch(r"[A-D]", original, re.IGNORECASE):
+            return original.upper()
+
+    # (A) — last parenthesized letter.
+    paren = list(re.finditer(r"\(([A-D])\)", upper))
+    if paren:
+        return paren[-1].group(1)
+
+    # Standalone letter bounded by whitespace/punctuation — last occurrence.
+    standalone = list(re.finditer(r"(?:^|[\s\n])([A-D])(?:[\s\n\.]|$)", upper))
+    if standalone:
+        return standalone[-1].group(1)
+
+    letters = re.findall(r"[A-D]", upper)
+    if len(letters) == 1:
+        return letters[0]
+
+    return None
