@@ -1,0 +1,30 @@
+group: blink_drawing_thinking
+task:
+- blink_art_style_drawing_thinking
+- blink_counting_drawing_thinking
+- blink_forensic_detection_drawing_thinking
+- blink_functional_correspondence_drawing_thinking
+- blink_iq_test_drawing_thinking
+- blink_jigsaw_drawing_thinking
+- blink_multi_view_reasoning_drawing_thinking
+- blink_object_localization_drawing_thinking
+- blink_relative_depth_drawing_thinking
+- blink_relative_reflectance_drawing_thinking
+- blink_semantic_correspondence_drawing_thinking
+- blink_spatial_relation_drawing_thinking
+- blink_visual_correspondence_drawing_thinking
+- blink_visual_similarity_drawing_thinking
+process_results: !function ../utils.blink_process_results
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 20
+  presence_penalty: 1.5
+  do_sample: true
+aggregate_metric_list:
+- metric: blink_acc
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: ""
+    post_prompt: "Put the final option letter in <answer>...</answer> tags."

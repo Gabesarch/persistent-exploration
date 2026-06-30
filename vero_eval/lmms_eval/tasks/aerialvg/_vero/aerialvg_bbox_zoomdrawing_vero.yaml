@@ -1,0 +1,18 @@
+metadata:
+  image_indexing: training_faithful
+include:
+- ../aerialvg_bbox.yaml
+- ../../_tool_templates/_vero/_toolset_zoomdraw_vero_yaml
+task: "aerialvg_bbox_zoomdrawing_vero"
+process_docs: !function ../utils.aerialvg_process_docs_rel1000
+doc_to_text: !function ../utils.aerialvg_doc_to_text_rel1000
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 0.7
+  top_p: 1.0
+  top_k: -1
+  do_sample: true
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: "\n"
+    post_prompt: ""

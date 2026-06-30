@@ -1,0 +1,16 @@
+metadata:
+  image_indexing: training_faithful
+include:
+- ../countqa.yaml
+- ../../_tool_templates/_vero/_toolset_zoomdraw_vero_yaml
+task: "countqa_zoomdrawing_vero"
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 0.7
+  top_p: 1.0
+  top_k: -1
+  do_sample: true
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: "\n"
+    post_prompt: ""

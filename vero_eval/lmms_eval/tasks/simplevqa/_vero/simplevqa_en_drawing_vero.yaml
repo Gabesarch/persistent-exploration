@@ -1,0 +1,17 @@
+dataset_path: gsarch/SimpleVQA-EN
+dataset_name: "default"
+task: "simplevqa_en_drawing_vero"
+test_split: test
+include:
+- ../_default_template_yaml
+- ../../_tool_templates/_vero/_toolset_draw_vero_yaml
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 0.7
+  top_p: 1.0
+  top_k: -1
+  do_sample: true
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: "\n"
+    post_prompt: ""
