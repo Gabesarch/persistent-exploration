@@ -1,0 +1,8 @@
+# Base Qwen3-VL-Instruct multi-turn ZOOM variant of charxiv (group).
+#
+# Evaluates the INSTRUCT (non-think) base model with multi-turn tool use, as a
+# baseline vs the Vero checkpoint (charxiv_reasoning_zoom). It reuses the generic
+# zoom toolset (_toolset_zoom_yaml): NO forced <think>, NO Layer-A.
+group: charxiv_qwen3_zoom
+task:
+  - charxiv_val_reasoning_reasoning_qwen3_zoom

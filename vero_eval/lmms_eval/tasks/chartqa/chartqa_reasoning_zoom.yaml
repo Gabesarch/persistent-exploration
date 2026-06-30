@@ -1,0 +1,51 @@
+# Training-faithful Vero ZOOM variant of chartqa.
+#
+# Mirrors visual_probe_hard_reasoning_zoom (Vero toolset + training sampling):
+#   - system prompt = training Layer A (system_vero_reasoning.txt, passed as the system
+#     message) + the served chat_template's appended "# Tools" block + the EXACT training
+#     tool schema (via _toolset_zoom_vero_yaml's tool_schema_overrides).
+#   - training-faithful sampling (temperature 0.7, top_p 1.0, top_k -1) + image_indexing.
+#
+# NOTE: BYTE-FAITHFUL replication only holds for visual_probe (the dataset the checkpoint
+# was trained on). For chartqa this is a CONSISTENT GENERALIZATION eval — same Vero input
+# style + toolset + sampling — but NOT byte-identical to training.
+#
+# Run with MODEL=vero TOOLS=on.
+include:
+  - ../_tool_templates/_toolset_zoom_vero_yaml
+dataset_path: lmms-lab/ChartQA
+dataset_kwargs:
+  token: True
+task: "chartqa_reasoning_zoom"
+test_split: test
+output_type: generate_until
+doc_to_visual: !function utils.chartqa_doc_to_visual
+doc_to_text: !function utils.chartqa_doc_to_text
+doc_to_target: "answer"
+generation_kwargs:
+  # Matches the RL training validation sampling exactly (temperature 0.7, top_p 1.0, top_k -1).
+  # top_p/top_k MUST be set explicitly: if omitted, vLLM falls back to the checkpoint's
+  # generation_config defaults (top_k=20, top_p=0.8), which diverges from training.
+  max_new_tokens: 16384
+  temperature: 0.7
+  top_p: 1.0
+  top_k: -1
+  do_sample: True
+process_results: !function utils.chartqa_process_results
+metric_list:
+  - metric: relaxed_overall
+    aggregation: mean
+    higher_is_better: true
+  - metric: relaxed_human_split
+    aggregation: mean
+    higher_is_better: true
+  - metric: relaxed_augmented_split
+    aggregation: mean
+    higher_is_better: true
+metadata:
+  version: 0.0
+  image_indexing: training_faithful
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: ""
+    post_prompt: ""

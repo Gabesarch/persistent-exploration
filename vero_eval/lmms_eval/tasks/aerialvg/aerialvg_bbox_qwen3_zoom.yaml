@@ -1,0 +1,32 @@
+# Base Qwen3-VL-Instruct multi-turn ZOOM variant of aerialvg_bbox.
+#
+# Mirrors visual_probe_hard_qwen3_zoom (instruct base model + image_zoom_in tool, no
+# forced <think>, no Layer-A): it pairs the source aerialvg dataset wiring + qwen3
+# sampling (from aerialvg_bbox_qwen3_zs.yaml) with the generic zoom toolset
+# (_toolset_zoom_yaml -> allowed_tools=[image_zoom_in_tool] + system_base/system_zoom
+# prompts). This is the INSTRUCT (non-think) baseline vs the Vero _reasoning_zoom.
+#
+# Structured-output task: the scorer (utils.aerialvg_process_results) parses a JSON
+# [{"bbox_2d": [x_min, y_min, x_max, y_max], "label": "<class name>"}] array out of the
+# model's answer. The post_prompt below is kept VERBATIM from the qwen3_zs source so it
+# lands in the answer and the scorer can extract bbox_2d (structured directive, not a
+# phrase-only suppressor). Run with TOOLS=on.
+include:
+  - aerialvg_bbox.yaml
+  - ../_tool_templates/_toolset_zoom_yaml
+task: "aerialvg_bbox_qwen3_zoom"
+# rel1000 scoring: predicted bbox coords are on the 0-1000 scale and rescaled to pixels
+# before IoU against the absolute-pixel GT (matches the qwen3_zs source overrides).
+process_docs: !function utils.aerialvg_process_docs_rel1000
+doc_to_text: !function utils.aerialvg_doc_to_text_rel1000
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 40
+  presence_penalty: 2.0
+  do_sample: True
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: ""
+    post_prompt: ' Return only one JSON array with a single object: [{"bbox_2d": [x_min, y_min, x_max, y_max], "label": "<class name>"}]. Use coordinates scaled to 1000 (range 0-1000) relative to the image (origin at top-left; x_min,y_min upper-left, x_max,y_max lower-right). Provide exactly one box with no extra text.'

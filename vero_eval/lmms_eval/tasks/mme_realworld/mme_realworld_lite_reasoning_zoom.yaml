@@ -1,0 +1,47 @@
+# Training-faithful Vero zoom variant of mme_realworld_lite.
+# Mirrors visual_probe_hard_reasoning_zoom (vero toolset + training sampling).
+# BYTE-FAITHFUL only for visual_probe; for this dataset it is a consistent
+# generalization eval, NOT byte-identical to training.
+#
+# Dataset wiring (dataset_path / kwargs / doc_to_* / process_results / metric_list /
+# test_split / output_type) is copied verbatim from mme_realworld_lite_reasoning.yaml.
+# Adds: the Vero ZOOM toolset (via _toolset_zoom_vero_yaml: Layer-A system prompt +
+# image_zoom_in_tool schema), training-faithful sampling, and image_indexing.
+# Run with MODEL=vero TOOLS=on.
+include:
+  - ../_tool_templates/_toolset_zoom_vero_yaml
+dataset_path: yifanzhang114/MME-RealWorld-lite-lmms-eval
+dataset_kwargs:
+  token: True
+  # From_YouTube: True
+task: "mme_realworld_lite_reasoning_zoom"
+test_split: train
+output_type: generate_until
+doc_to_visual: !function utils.mme_realworld_doc_to_visual
+doc_to_text: !function utils.mme_realworld_doc_to_text_cot
+doc_to_target: "answer"
+generation_kwargs:
+  # Matches the RL training validation sampling exactly (temperature 0.7, top_p 1.0, top_k -1).
+  # top_p/top_k MUST be set explicitly: if omitted, vLLM falls back to the checkpoint's
+  # generation_config defaults (top_k=20, top_p=0.8), which diverges from training.
+  max_new_tokens: 16384
+  temperature: 0.7
+  top_p: 1.0
+  top_k: -1
+  do_sample: True
+
+# The return value of process_results will be used by metrics
+process_results: !function utils.mme_realworld_process_results
+# Note that the metric name can be either a registed metric function (such as the case for GQA) or a key name returned by process_results
+metric_list:
+  - metric: mme_realworld_score
+    aggregation: !function utils.mme_realworld_aggregate_results
+    higher_is_better: true
+metadata:
+  version: 0.0
+  image_indexing: training_faithful
+
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: ""
+    post_prompt: "\nSelect the best answer to the above multiple-choice question based on the image."

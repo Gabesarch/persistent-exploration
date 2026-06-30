@@ -1,0 +1,49 @@
+# Training-faithful Vero ZOOM variant of chartqa_pro.
+#
+# Mirrors visual_probe_hard_reasoning_zoom (the confirmed-correct reference): it pairs the
+# Vero RL thinking checkpoint with the image_zoom_in_tool toolset + training-faithful
+# sampling (temperature 0.7, top_p 1.0, top_k -1) + image_indexing: training_faithful.
+#
+# BYTE-FAITHFULNESS: the byte-identical-to-training guarantee holds ONLY for visual_probe
+# (whose validation_data the toolset was verified against). For chartqa_pro this is a
+# CONSISTENT GENERALIZATION eval — same Vero toolset / system prompt / sampling, NOT
+# byte-identical to training. The DATASET WIRING (dataset_path, doc_to_*, scorer,
+# metric_list) is kept IDENTICAL to chartqa_pro_reasoning.yaml.
+#
+# The _toolset_zoom_vero_yaml include supplies metadata.allowed_tools,
+# system_prompt_files (Layer-A system_vero_reasoning.txt, passed as the system message),
+# system_prompt_preserve_trailing_newline, and tool_schema_overrides. metadata MUST be a
+# dict so its keys deep-merge with the toolset's metadata; a list would silently drop the
+# allowed_tools. Run with MODEL=vero TOOLS=on.
+include:
+  - ../_tool_templates/_toolset_zoom_vero_yaml
+dataset_path: ahmed-masry/ChartQAPro
+dataset_kwargs:
+  token: True
+task: "chartqa_pro_reasoning_zoom"
+test_split: test
+output_type: generate_until
+doc_to_visual: !function utils.chartqa_pro_doc_to_visual
+doc_to_text: !function utils.chartqa_pro_doc_to_text_alt
+doc_to_target: "Answer"
+generation_kwargs:
+  # Matches the RL training validation sampling (temperature 0.7, top_p 1.0, top_k -1).
+  # top_p/top_k MUST be set explicitly: if omitted, vLLM falls back to the checkpoint's
+  # generation_config defaults (top_k=20, top_p=0.8), which diverges from training.
+  max_new_tokens: 16384
+  temperature: 0.7
+  top_p: 1.0
+  top_k: -1
+  do_sample: True
+process_results: !function utils.chartqa_pro_process_results
+metric_list:
+  - metric: relaxed_overall
+    aggregation: mean
+    higher_is_better: true
+metadata:
+  version: 0.0
+  image_indexing: training_faithful
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: ""
+    post_prompt: ""

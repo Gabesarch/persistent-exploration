@@ -1,0 +1,26 @@
+# Training-faithful Vero ZOOM variant of blink (GROUP).
+#
+# Mirrors visual_probe_hard_reasoning_zoom: adds the Vero zoom toolset
+# (_toolset_zoom_vero_yaml -> Layer-A system prompt + EXACT training tool schema)
+# + training-faithful sampling (temperature 0.7, top_p 1.0, top_k -1) + image_indexing.
+#
+# BYTE-FAITHFUL only for visual_probe. For this dataset it is a consistent
+# GENERALIZATION eval (same Vero tool-use input style), NOT byte-identical to training.
+#
+# WHY DEDICATED LEAF FILES (not the shared `blink_groups` tag):
+# the zoom toolset is configured entirely under `metadata:` (allowed_tools,
+# system_prompt_files, system_prompt_preserve_trailing_newline, tool_schema_overrides)
+# plus this variant's image_indexing. In lmms_eval, `metadata` is a GROUP_ONLY key
+# (GROUP_ONLY_KEYS = [group, group_alias, task, aggregate_metric_list, metadata]), so a
+# group config's metadata is retained on the GROUP and is NOT pushed down to subtasks.
+# If this group reused the shared `blink_groups` leaves, every leaf task object would
+# load with metadata={} -> no tools, no Layer-A system prompt, no image_indexing
+# (the eval would silently run as plain text generation). To make the toolset reach
+# each task object, the toolset `include` + image_indexing live on the per-category
+# leaf files (blink_<category>_reasoning_zoom.yaml), tagged blink_reasoning_zoom_groups.
+# This group just collects those leaves and aggregates blink_acc.
+group: blink_reasoning_zoom
+task:
+  - blink_reasoning_zoom_groups
+aggregate_metric_list:
+  - metric: blink_acc

@@ -104,6 +104,23 @@ def screenspot_point_doc_to_text_qwen3_tool(doc, lmms_eval_specific_kwargs=None)
     return f"{prompt}{instruction}"
 
 
+def screenspot_point_doc_to_text_qwen3_mcp_tool(doc, lmms_eval_specific_kwargs=None):
+    """User text for tool-calling runs where ALL tools — the computer_use answer
+    protocol AND the real image tools (zoom/draw) — are passed through the API and
+    rendered natively by the model's chat template. Unlike
+    screenspot_point_doc_to_text_qwen3_tool, no <tools> block is baked into the
+    user text (that would duplicate/conflict with the template's tools section).
+    The pre_prompt/post_prompt come from the task yaml's lmms_eval_specific_kwargs."""
+    kwargs = lmms_eval_specific_kwargs or {}
+    pre = kwargs.get("pre_prompt", "")
+    post = kwargs.get("post_prompt", "")
+    instruction = doc.get("instruction") or doc.get("instruction_cn") or ""
+    instruction = str(instruction).strip()
+    if instruction and not instruction.endswith((".", "?", "!")):
+        instruction += "."
+    return f"{pre}{instruction}{post}"
+
+
 def screenspot_point_doc_to_target(doc, model_specific_target_kwargs=None):
     # Placeholder for few-shot/demo contexts; evaluation ignores doc_to_target.
     return json.dumps([{"point_2d": [0, 0]}])

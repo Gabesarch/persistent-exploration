@@ -1,0 +1,58 @@
+# Training-faithful Vero ZOOM variant of mmifeval; mirrors visual_probe_hard_reasoning_zoom
+# (vero toolset + training sampling). The DATASET WIRING (dataset_path / process_docs /
+# doc_to_visual / doc_to_text / doc_to_target / process_results / metric_list / scorers) is
+# copied verbatim from mmifeval_reasoning.yaml — only the Vero zoom toolset, training-faithful
+# generation sampling, and image_indexing are layered on top.
+#
+# NOTE: BYTE-FAITHFUL replication only holds for visual_probe (the dataset Vero was trained on).
+# For mmifeval this is a CONSISTENT GENERALIZATION eval (same Vero zoom input style), NOT a
+# byte-identical reproduction of training.
+#
+# The Vero zoom toolset (../_tool_templates/_toolset_zoom_vero_yaml) supplies:
+#   - system_prompt_files = Layer-A (system_vero_reasoning.txt) passed as the system message;
+#     the served chat_template appends the "# Tools" block + tool schema.
+#   - tool_schema_overrides pinning the rendered <tools> JSON to the EXACT training schema.
+#   - allowed_tools: image_zoom_in_tool.
+# Run with MODEL=vero TOOLS=on.
+include:
+  - ../_tool_templates/_toolset_zoom_vero_yaml
+dataset_path: lscpku/MMIFEval
+dataset_kwargs:
+  token: true
+task: "mmifeval_reasoning_zoom"
+test_split: test
+output_type: generate_until
+doc_to_visual: !function utils.mmifeval_doc_to_visual
+doc_to_text: !function utils.mmifeval_doc_to_text
+doc_to_target: ""
+generation_kwargs:
+  # Matches the RL training validation sampling exactly (temperature 0.7, top_p 1.0, top_k -1).
+  # top_p/top_k MUST be set explicitly: if omitted, vLLM falls back to the checkpoint's
+  # generation_config defaults (top_k=20, top_p=0.8), which diverges from training.
+  max_new_tokens: 16384
+  temperature: 0.7
+  top_p: 1.0
+  top_k: -1
+  do_sample: True
+process_results: !function utils.mmifeval_process_results
+metric_list:
+  - metric: mmifeval_overall_accuracy
+    aggregation: !function utils.mmifeval_aggregate_overall
+    higher_is_better: true
+  - metric: mmifeval_p_level_accuracy
+    aggregation: !function utils.mmifeval_aggregate_p_level
+    higher_is_better: true
+  - metric: mmifeval_c_level_accuracy
+    aggregation: !function utils.mmifeval_aggregate_c_level
+    higher_is_better: true
+lmms_eval_specific_kwargs:
+  default:
+    # Training's user turn is "<image>\n{question}", which decodes to "user\n\n{question}".
+    # The served chat template emits no newline after the image, so that separator newline
+    # must live in the text. pre_prompt "\n" reproduces training's user-turn separator.
+    # It does NOT add a final-answer instruction (Layer A already governs the answer format).
+    pre_prompt: "\n"
+    post_prompt: ""
+metadata:
+  version: 0.0
+  image_indexing: training_faithful
