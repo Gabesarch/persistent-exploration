@@ -1,0 +1,15 @@
+include: hrbench_4k.yaml
+task: "hrbench_4k_qwen3vl_official"
+# Qwen3-VL official "VL" generation hyperparameters (see official-prompt/).
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 0.7
+  top_p: 0.8
+  top_k: 20
+  presence_penalty: 1.5
+  repetition_penalty: 1.0
+  do_sample: True
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: ""
+    post_prompt: ""

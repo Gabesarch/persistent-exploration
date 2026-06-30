@@ -15,7 +15,7 @@ echo "=== Installing Qwen 3.5 dependencies ==="
 # Core packages (--no-deps to avoid conflicts between vllm<->transformers, verl<->numpy)
 uv pip install --no-deps \
     "verl @ git+https://github.com/Zhang1Sheng/verl.git@main" \
-    "vllm==0.22.0" \
+    "vllm==0.23.0" \
     "transformers==5.3.0" \
     "huggingface-hub==1.8.0" \
     "numpy==2.2.6"
