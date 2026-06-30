@@ -53,10 +53,10 @@ python -m pip install --no-cache-dir \
 
 # The bundled lmms_eval tree is not a standalone pip project. Run it from its
 # parent directory, or add that directory to PYTHONPATH before invoking it.
-export PYTHONPATH="$PWD/tools_scratch/eval:${PYTHONPATH:-}"
-cd tools_scratch/eval
+export PYTHONPATH="$PWD/vero_eval:${PYTHONPATH:-}"
+cd vero_eval
 python -m lmms_eval --help
-cd ../..
+cd ..
 ```
 
 ### Setup
