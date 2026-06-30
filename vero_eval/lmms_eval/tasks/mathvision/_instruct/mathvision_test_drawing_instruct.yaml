@@ -1,0 +1,29 @@
+dataset_path: MathLLMs/MathVision
+dataset_kwargs:
+  token: true
+task: "mathvision_test_drawing_instruct"
+test_split: test
+output_type: generate_until
+doc_to_visual: !function ../utils.mathvision_doc_to_visual
+doc_to_text: !function ../utils.mathvision_doc_to_text
+doc_to_target: "answer"
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 40
+  presence_penalty: 2.0
+  do_sample: true
+process_results: !function ../utils.mathvision_process_results
+metric_list:
+- metric: mathvision_standard_eval
+  aggregation: !function ../utils.mathvision_aggregate_results_eval
+  higher_is_better: true
+
+lmms_eval_specific_kwargs:
+  default:
+    prompt_format: solution
+    mc_prompt: ""
+    short_answer_prompt: ""
+include:
+- ../../_tool_templates/_instruct/_toolset_draw_instruct_yaml

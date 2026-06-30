@@ -1,0 +1,11 @@
+include:
+- ../mia_bench.yaml
+- ../../_tool_templates/_thinking/_toolset_zoomdraw_thinking_yaml
+task: "mia_bench_zoomdrawing_thinking"
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 20
+  presence_penalty: 1.5
+  do_sample: true

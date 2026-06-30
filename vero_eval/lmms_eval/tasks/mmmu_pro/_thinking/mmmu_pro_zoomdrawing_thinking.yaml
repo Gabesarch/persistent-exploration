@@ -1,0 +1,8 @@
+group: mmmu_pro_zoomdrawing_thinking
+task:
+- mmmu_pro_vision_zoomdrawing_thinking
+- mmmu_pro_standard_zoomdrawing_thinking
+include:
+- ../../_tool_templates/_thinking/_toolset_zoomdraw_thinking_yaml
+generation_kwargs:
+  max_new_tokens: 16384

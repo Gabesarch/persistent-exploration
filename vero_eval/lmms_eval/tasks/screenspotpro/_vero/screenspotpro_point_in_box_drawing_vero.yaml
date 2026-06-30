@@ -1,0 +1,17 @@
+group: screenspotpro_point_in_box
+include:
+- ../_default_template_point_yaml
+- ../../_tool_templates/_vero/_toolset_draw_vero_yaml
+task: "screenspotpro_point_in_box_drawing_vero"
+test_split: train
+process_docs: !function ../utils_point.screenspot_point_process_docs_rel1000
+doc_to_text: !function ../utils_point.screenspot_point_doc_to_text_qwen3_tool
+process_results: !function ../utils_point.screenspot_point_process_result_qwen3
+generation_kwargs:
+  until:
+  - "ASSISTANT:"
+  max_new_tokens: 16384
+  temperature: 0.7
+  top_p: 1.0
+  top_k: -1
+  do_sample: true

@@ -1,0 +1,21 @@
+# Training-faithful Vero ZOOM+DRAW eval on VisualProbe-Hard.
+# Zoom side is training-faithful (pinned schema + seam, via _toolset_zoomdraw_vero_yaml); draw side
+# is "Vero on draw" (no draw RL run yet). image_indexing governs the zoom tool-response wording.
+include:
+- ../visual_probe_hard.yaml
+- ../../_tool_templates/_vero/_toolset_zoomdraw_vero_yaml
+task: "visual_probe_hard_zoomdrawing_vero"
+generation_kwargs:
+  # Match Vero validation sampling. top_p/top_k MUST be explicit (else vLLM uses the checkpoint's
+  # generation_config defaults top_k=20/top_p=0.8).
+  max_new_tokens: 16384
+  temperature: 0.7
+  top_p: 1.0
+  top_k: -1
+  do_sample: true
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: "\n"
+    post_prompt: ""
+metadata:
+  image_indexing: training_faithful

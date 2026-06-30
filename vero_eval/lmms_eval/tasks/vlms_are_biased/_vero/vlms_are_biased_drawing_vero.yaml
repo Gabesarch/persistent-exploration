@@ -1,0 +1,16 @@
+include:
+- ../vlms_are_biased.yaml
+- ../../_tool_templates/_vero/_toolset_draw_vero_yaml
+task: "vlms_are_biased_drawing_vero"
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 0.7
+  top_p: 1.0
+  top_k: -1
+  do_sample: true
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: "\n"
+    post_prompt: ""
+metadata:
+  version: 0.0

@@ -1,0 +1,17 @@
+include:
+- ../blink_spatial_relation.yaml
+- ../../_tool_templates/_thinking/_toolset_zoomdraw_thinking_yaml
+task: blink_spatial_relation_zoomdrawing_thinking
+tag: blink_groups_zoomdrawing_thinking
+process_results: !function ../utils.blink_process_results
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 40
+  presence_penalty: 2.0
+  do_sample: true
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: ''
+    post_prompt: Put the final option letter in <answer>...</answer> tags.
