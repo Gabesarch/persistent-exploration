@@ -1,0 +1,9 @@
+group: hstarbench
+task:
+  - hstarbench_mixed_reasoning_zoom
+  - hstarbench_mixed_reasoning
+  - hstarbench_mixed
+  - hstarbench_hos_reasoning
+  - hstarbench_hps_reasoning
+  - hstarbench_hos
+  - hstarbench_hps

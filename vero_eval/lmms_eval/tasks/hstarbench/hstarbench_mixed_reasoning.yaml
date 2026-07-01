@@ -1,0 +1,23 @@
+include:
+  - hstarbench_mixed.yaml
+  - _bbox_zoom_metric_yaml
+task: "hstarbench_mixed_reasoning"
+tag:
+  - hstarbench
+  - humanoid_visual_search
+  - visual_search
+output_type: generate_until
+doc_to_messages: !function utils.hstarbench_bbox_zoom_doc_to_messages
+process_results: !function utils.hstarbench_bbox_zoom_process_results
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 0
+  do_sample: false
+lmms_eval_specific_kwargs:
+  default:
+    use_panorama_strip: true
+    bbox_zoom_only: true
+    score_mode: answer_bbox_dual
+metadata:
+  version: 0.5
+  description: "Hstar mixed strip+zoom; bbox answer with cone + IoU scoring"

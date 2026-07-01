@@ -1,0 +1,7 @@
+include: hstarbench_hos.yaml
+task: "hstarbench_hos_qwen3_zs"
+generation_kwargs:
+  max_new_tokens: 1024
+  temperature: 0
+  do_sample: false
+  max_agentic_steps: 10

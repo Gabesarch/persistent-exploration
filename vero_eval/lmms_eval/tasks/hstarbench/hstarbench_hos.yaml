@@ -1,0 +1,11 @@
+include: _default_template_yaml
+dataset_kwargs:
+  data_files:
+    test: /scratch/gpfs/ZHUANGL/shared/Hstarbench/data/hstarbench_hos_test.jsonl
+task: "hstarbench_hos"
+test_split: test
+tag:
+  - hstarbench
+  - humanoid_visual_search
+metadata:
+  description: "Hstar HOS (object search) agentic rotate/submit"
