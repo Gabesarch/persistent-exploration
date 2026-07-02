@@ -55,7 +55,7 @@ auditor** that is explicitly told *hard ≠ wrong* returns:
 |---|---|
 | `prompts.py` | blind + auditor prompts (anti-laziness / anti-sycophancy / visible-only / ambiguity) — the only dataset-specific piece |
 | `localize_paths.py` | rewrite metadata image paths to a local copy → `*_<split>.local.verl.jsonl`; **fails closed** if any image is missing |
-| `filter_counting.py` | synchronous filter; resumable per-example decisions JSONL + `<out>.config.json` guard + 2-key failover |
+| `filter_counting.py` | synchronous filter; resumable per-example decisions JSONL + `<out>.config.json` guard + self-healing multi-key failover |
 | `batch_runner.py` | same pipeline via the Portkey **batch API** (~50 % cheaper) — ready but blocked on the sandbox key (see [Batch](#batch-status)) |
 | `filter_apply.py` | decisions → `<dataset>_<split>.filtered.verl.jsonl` (+ keep_ids / dropped / undecided); **fail-closed** |
 | `rescore.py` | re-derive keep/verdict under new `--abs-tol`/`--rel-tol` from stored outputs — **no new API calls** |
@@ -113,10 +113,16 @@ No code changes — the pipeline is dataset-agnostic. To filter `mydata`:
   **undecided** (missing, `keep is None`, or `ERROR`/`PARSE_ERROR`) and **errors out** if
   any is undecided, rather than emitting a partial dataset that looks complete.
   `--allow-partial` excludes + lists undecided (`undecided_<split>.txt`); output is named
-  `*.filtered.partial.verl.jsonl`. Only an explicit `keep is False` is ever dropped.
-- **2-key failover.** `AI_SANDBOX_KEY` (primary) → `AI_SANDBOX_KEY2…` (backups) on quota /
-  auth exhaustion; transient rate-limits are backed-off, not failed-over. If all keys are
-  exhausted it fast-fails (stays resumable) instead of spinning.
+  `*.filtered.partial.verl.jsonl`. Which verdicts count as keep is set by `--keep-verdicts`
+  (default `CORRECT,PLAUSIBLE`); pass `--keep-verdicts CORRECT --out-tag correct` for a
+  strict **correct-only** tier — PLAUSIBLE then classifies as drop and the output is named
+  `*_<split>.correct[.partial].verl.jsonl`. Undecided is never kept.
+- **Multi-key failover (self-healing).** `AI_SANDBOX_KEY` (primary) → `AI_SANDBOX_KEY2…`
+  (backups) on quota / auth exhaustion; transient per-minute rate-limits are backed-off, not
+  failed-over. A key that returns a usage/auth error is marked dead and skipped for the rest
+  of the run; if **every** key looks dead the set is cleared and re-probed from the top
+  (usage windows may have cleared). It never permanently gives up on the whole run — a row
+  only becomes `ERROR` after its own retry budget and stays resumable on the next run.
 
 ## Batch status
 Provider-native batch (`batch_runner.py`, ~50 % cheaper) is **not usable on the sandbox
