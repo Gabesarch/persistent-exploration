@@ -1,13 +1,23 @@
 #!/bin/bash
 # Environment-specific paths for gaze RL runs in this verl clone.
+#
+# Per-user setup: create an optional (git-ignored) set_paths.local.sh next to
+# this file and export your own values there (VERL_ROOT, ROOT_PATH,
+# VERO2_CONDA_ENV, ...). Every setting below respects an existing value, so the
+# defaults only apply when nothing else is set.
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+if [ -f "$SCRIPT_DIR/set_paths.local.sh" ]; then
+  source "$SCRIPT_DIR/set_paths.local.sh"
+fi
 
 source "$HOME/miniconda3/etc/profile.d/conda.sh"
-conda activate /scratch/gpfs/ZHUANGL/gs1693/conda/vero2
+conda activate "${VERO2_CONDA_ENV:-/scratch/gpfs/ZHUANGL/gs1693/conda/vero2}"
 module load cudatoolkit/12.9
 module load gcc/11
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-export VERL_ROOT="/home/gs1693/repo/vero2"
+export VERL_ROOT="${VERL_ROOT:-/home/gs1693/repo/vero2}"
 
 export ROOT_PATH="${ROOT_PATH:-/scratch/gpfs/ZHUANGL/gs1693}"
 export SAVE_PATH="${SAVE_PATH:-$ROOT_PATH/vero2}"
@@ -18,7 +28,7 @@ export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$HF_HOME/datasets}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-$ROOT_PATH/vllm_cache}"
 export WANDB_DIR="${WANDB_DIR:-$SAVE_PATH/wandb}"
-export TRITON_HOME="$ROOT_PATH/.cache/triton"
+export TRITON_HOME="${TRITON_HOME:-$ROOT_PATH/.cache/triton}"
 
 
 export TQDM_MININTERVAL="${TQDM_MININTERVAL:-10}"
