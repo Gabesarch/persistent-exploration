@@ -1,0 +1,7 @@
+include: hstarbench_hps.yaml
+dataset_kwargs:
+  data_files:
+    test: /scratch/gpfs/ZHUANGL/shared/Hstarbench/data/hstarbench_hps_rl.jsonl
+task: "hstarbench_hps_rl"
+metadata:
+  description: "Hstar HPS RL train split"
