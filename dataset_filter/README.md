@@ -1,111 +1,157 @@
-# Counting-dataset ground-truth filter
+# Dataset ground-truth (GT) filter
 
-Filter `combined_counting_hq` so we keep **hard-but-correct** counting examples and
-drop examples whose **ground-truth count is wrong / unanswerable**. Judging is done
-by a strong multimodal model (**Gemini `gemini-3.1-pro-preview`**) via the Princeton
-AI-sandbox (Portkey gateway; key auto-loaded from `../../AI-sandbox/.env`).
+A **reusable** toolkit that audits a dataset's ground-truth labels with a strong
+multimodal model and keeps only the examples whose GT is correct-or-plausible,
+dropping ones that are **wrong / ambiguous / unanswerable**. Judging uses
+**Gemini `gemini-3.1-pro-preview`** via the Princeton AI-sandbox (Portkey gateway; keys
+auto-loaded from `../../AI-sandbox/.env`, never committed).
+
+First use case: `combined_counting_hq` (a counting dataset). Nothing below is
+counting-specific except the prompts in `prompts.py` — the pipeline reads the standard
+**verl** record schema and is driven entirely by `--dataset <PREFIX>` + `--split`, so
+the next dataset reuses the same tooling (see **[Filter a new dataset](#filter-a-new-dataset)**).
+
+The reason to filter at all: **GT is not trusted** — we audit it. So the whole pipeline
+is *fail-closed* and every decision is traceable (verdict + both counts + reasoning).
 
 ## The core idea (why not just "ask the model")
 
-This dataset's value is its hard examples, so the filter must not reject an example
+A dataset's value is often its hard examples, so the filter must not reject an example
 merely because it is hard. Two naive approaches each fail:
 
 | approach | failure |
 |---|---|
-| blind count (image only), require `== GT` | over-rejects correct-but-hard images the model slightly miscounts |
+| blind judge (input only), require `== GT` | over-rejects correct-but-hard examples the model slightly misjudges |
 | show the GT and ask "is this right?" | sycophancy — rubber-stamps wrong GTs |
 
-**`smart` (default) combines them.** An independent **blind count** (the model never
-sees the GT) is LLM-as-extraction + our own exact-match metric. If it matches GT
-exactly → `CORRECT` in one call. On mismatch we run an **answer-aware auditor** that
-is explicitly told *hard ≠ wrong*: it returns one of
+**`smart` (default) combines them.** An independent **blind** pass (the model never sees
+the GT) → if it matches GT exactly, `CORRECT` in one call. On mismatch, an **answer-aware
+auditor** that is explicitly told *hard ≠ wrong* returns:
 
-- `CORRECT` — its recount matches GT
-- `PLAUSIBLE` — too dense to count exactly, but GT is in a believable range, no
-  evidence it's wrong → **KEEP** (these are the valuable hard examples)
-- `WRONG` — concrete evidence the true count differs → drop
-- `UNANSWERABLE` — ambiguous question/category or unusable image → drop
+- `CORRECT` — recount matches GT
+- `PLAUSIBLE` — can't pin exact, but GT is believable with no evidence it's wrong → **KEEP** (the valuable hard examples)
+- `WRONG` — concrete evidence the true value differs → drop
+- `AMBIGUOUS` — ill-posed / subjective question ("innermost stripe", "all the windows" across a painting) → drop
+- `UNANSWERABLE` — requested category absent / unusable input → drop
 
 `keep = verdict in {CORRECT, PLAUSIBLE}`.
 
-Guardrails learned from the pilots (see "Pilot findings") that keep the filter
-fair on hard examples:
-- **Count only visible instances.** The prompts forbid inferring hidden objects
-  (a solid 3D stack's interior, background buildings) that the point-annotated GT
-  excludes — otherwise the model over-counts and calls a correct GT "too low".
-- **Numeric tolerance override.** If the auditor says WRONG but its own count is
-  within `max(abs_tol, ceil(rel_tol*gt))` of GT *and is > 0*, we override to
-  PLAUSIBLE+keep — so off-by-1-2 on a hard image is not dropped. The `> 0` guard
-  is essential: `model_count == 0` means "category absent / mismatch" (geese ≠
-  cranes), a real drop signal the tolerance must never paper over.
-- **GT points as a stage-2 audit guide.** ~50% of records (fsc147, rec8k) ship
-  point annotations where `GT == len(points)`. We draw them as magenta rings on
-  the stage-2 image and tell the model they are a noisy guide to audit (each ring
-  on a distinct instance? any missed/spurious/doubled?), not truth. This recovers
-  hard dense examples the model alone slightly miscounts. The independent stage-1
-  blind count still runs WITHOUT the points, preserving an unbiased signal.
-- **AMBIGUOUS verdict (drop).** Ill-posed / subjective questions ("innermost
-  stripe", "all the windows" across a painting) are dropped even when a count
-  exists — we don't want ambiguity in the dataset. Verdicts: keep = CORRECT /
-  PLAUSIBLE; drop = WRONG / AMBIGUOUS / UNANSWERABLE.
+### Guardrails (from the pilots)
+- **Judge only visible instances.** Prompts forbid inferring hidden objects (a solid
+  3-D stack's interior, background buildings) that point-annotated GT excludes.
+- **Numeric-tolerance override, small-count-safe.** If the auditor says WRONG but its own
+  count is within `max(abs_tol, floor(rel_tol*gt))` of GT **and > 0**, override to
+  PLAUSIBLE+keep. Defaults `abs_tol=0, rel_tol=0.15` → tolerance is **0 for gt ≤ 6**
+  (small counts must match ~exactly: GT=1/model=2 and GT=2/model=4 are NOT rescued), and
+  the 15 % band only opens on large counts (gt=100 → ±15). The `> 0` guard is essential:
+  `model_count == 0` means "category absent/mismatch" (geese ≠ cranes), a real drop.
+- **GT points as a stage-2 audit guide.** Where records ship point annotations
+  (`extra_info.metadata.original_points`, `GT == len(points)`), stage-2 draws them as
+  magenta rings and tells the model they're a *noisy* guide to audit — not truth. Stage-1
+  blind still runs WITHOUT points, preserving an unbiased signal.
 
 ## Files
-- `prompts.py` — blind + auditor prompts (anti-laziness / anti-sycophancy / visible-only)
-- `filter_counting.py` — run the filter; emits a resumable per-example JSONL of decisions
-- `rescore.py` — re-derive keep/verdict from stored model outputs under new
-  `--abs-tol`/`--rel-tol` **without new API calls** (tune the decision layer for free)
-- `compare_runs.py` — diff two decision files (keep rate, verdict flips, overrides)
-- `cost_estimate.py` — $ cost to filter the full split, from a pilot's measured tokens
-- `make_report.py` — self-contained before/after HTML (`--points-from <dir>` overlays GT marks)
-- `filter_apply.py` — turn decisions into `*.filtered.verl.jsonl` + `keep_ids.json`
-- `../.claude/commands/go.md` — the `/go` slash command that drives the whole thing
+| file | role |
+|---|---|
+| `prompts.py` | blind + auditor prompts (anti-laziness / anti-sycophancy / visible-only / ambiguity) — the only dataset-specific piece |
+| `localize_paths.py` | rewrite metadata image paths to a local copy → `*_<split>.local.verl.jsonl`; **fails closed** if any image is missing |
+| `filter_counting.py` | synchronous filter; resumable per-example decisions JSONL + `<out>.config.json` guard + 2-key failover |
+| `batch_runner.py` | same pipeline via the Portkey **batch API** (~50 % cheaper) — ready but blocked on the sandbox key (see [Batch](#batch-status)) |
+| `filter_apply.py` | decisions → `<dataset>_<split>.filtered.verl.jsonl` (+ keep_ids / dropped / undecided); **fail-closed** |
+| `rescore.py` | re-derive keep/verdict under new `--abs-tol`/`--rel-tol` from stored outputs — **no new API calls** |
+| `compare_runs.py` | diff two decision files (keep rate, verdict flips, overrides) |
+| `cost_estimate.py` | project $ to filter a full split from measured tokens |
+| `make_report.py` / `make_exam_report.py` / `make_compare_report.py` | HTML reports; `make_exam_report` is GT-neutral + zoomable for manual audit |
+| `../.claude/commands/gt-filter.md` | the `/gt-filter` slash command that drives the whole flow |
 
-## Quick use
+## Quick use (synchronous — the working path today)
 ```bash
 PY=/scratch/gpfs/ZHUANGL/lc1556/conda/envs/reason-vlm/bin/python
+DATA=/scratch/gpfs/ZHUANGL/lc1556/vero2/datasets/combined_counting_hq
 RUNS=/scratch/gpfs/ZHUANGL/lc1556/vero2/dataset_filter_runs
+cd /home/lc1556/repo/reason-vlm/vero2/dataset_filter
 
-# 1. filter (resumable; grow N to reuse earlier results with the same --seed)
-$PY filter_counting.py --n 200 --strategy smart --out "$RUNS/train_smart.jsonl"
+# 0. one-time: self-contained local images + fail-closed coverage check
+$PY localize_paths.py --data-dir "$DATA" --dataset combined_counting
 
-# 2. before/after report
-$PY make_report.py --decisions "$RUNS/train_smart.jsonl" --k 40 --out "$RUNS/report.html"
+# 1. filter (resumable; ALWAYS pin --reasoning-effort; 2-key failover on quota)
+$PY filter_counting.py --data-dir "$DATA" --dataset combined_counting --local-meta \
+    --split train --n 0 --strategy smart --reasoning-effort high \
+    --abs-tol 0 --rel-tol 0.15 --workers 8 --out "$RUNS/combined_counting_train.jsonl"
 
-# 3. apply -> filtered dataset (undecided records are kept, never silently dropped)
-$PY filter_apply.py --decisions "$RUNS/train_smart.jsonl" --split train \
-    --out-dir /scratch/gpfs/ZHUANGL/lc1556/vero2/datasets/combined_counting_hq
+# 2. GT-neutral, zoomable report for manual spot-check
+$PY make_exam_report.py --run "gemini=$RUNS/combined_counting_train.jsonl" \
+    --points-from "$DATA" --out "$RUNS/combined_counting_train_exam.html"
+
+# 3. apply -> filtered dataset (FAILS if anything is undecided; --allow-partial to override)
+$PY filter_apply.py --data-dir "$DATA" --dataset combined_counting --local-meta \
+    --decisions "$RUNS/combined_counting_train.jsonl" --splits train --out-dir "$RUNS/filtered"
 ```
-Or just run `/go 200` (then `/go 500`, `/go 0 --apply` for the full split).
+Or just run `/gt-filter 200` → `/gt-filter 0 --effort high --apply` for the full split.
+
+## Filter a new dataset
+No code changes — the pipeline is dataset-agnostic. To filter `mydata`:
+1. Put verl JSONL(s) at `<DATA>/mydata_<split>.verl.jsonl`. Required per record:
+   `images[0]` (path), `extra_info.id` (unique), `reward_model.ground_truth`.
+   Optional: `extra_info.metadata.original_points` + `original_size` (enables the point
+   overlay), `extra_info.question`, `extra_info.metadata.annotation_category`.
+2. `localize_paths.py --data-dir <DATA> --dataset mydata` (skip if paths already point at
+   readable local images, then omit `--local-meta`).
+3. `filter_counting.py --dataset mydata --split <sp> ...` then `filter_apply.py --dataset mydata ...`.
+4. If the task isn't counting, adapt `prompts.py` (the judging rubric) — that's the only
+   task-specific file; the harness, resume, tolerance, apply, and reports are generic.
+
+## Robustness (fail-closed everywhere — GT is not trusted)
+- **Resumable + config-guarded.** Re-running the same `--out` continues where it left off.
+  A `<out>.config.json` sidecar records the run settings; resuming with an incompatible
+  setting (model / effort / tolerance / split / dataset …) is **refused** (`--force` to
+  override). New config fields never spuriously block older runs.
+- **Terminal-only "done".** A row counts as done only with an explicit `keep ∈ {True,False}`
+  and a valid verdict. API/parse failures (`ERROR` / `PARSE_ERROR`) are **re-queued** on
+  the next run — never silently treated as a drop, never skipped.
+- **Fail-closed apply.** `filter_apply.py` classifies every source id keep / drop /
+  **undecided** (missing, `keep is None`, or `ERROR`/`PARSE_ERROR`) and **errors out** if
+  any is undecided, rather than emitting a partial dataset that looks complete.
+  `--allow-partial` excludes + lists undecided (`undecided_<split>.txt`); output is named
+  `*.filtered.partial.verl.jsonl`. Only an explicit `keep is False` is ever dropped.
+- **2-key failover.** `AI_SANDBOX_KEY` (primary) → `AI_SANDBOX_KEY2…` (backups) on quota /
+  auth exhaustion; transient rate-limits are backed-off, not failed-over. If all keys are
+  exhausted it fast-fails (stays resumable) instead of spinning.
+
+## Batch status
+Provider-native batch (`batch_runner.py`, ~50 % cheaper) is **not usable on the sandbox
+key**: it routes through a multi-target Portkey config, and `/v1/files`+`/v1/batches`
+require a **single** target. Client-side overrides don't help — it needs Princeton to
+provide a single-target **config id** or **virtual key** for the Gemini/Vertex provider
+(Vertex batch also needs a same-region GCS bucket). `batch_runner.py` is complete and
+`--selftest`-gated for the moment that lands; until then use the synchronous path.
 
 ## Decision record schema (one JSON line per example)
 `id, index, image, question, ground_truth, category, source_dataset, original_size,
-strategy, model, blind{count,count_low,count_high,difficulty,confidence,reasoning,raw},
-verify{your_count,verdict,confidence,reasoning,raw}, verdict, best_count, keep,
-short_circuit`
+n_points, strategy, model, reasoning_effort, abs_tol, rel_tol,
+blind{count,count_low,count_high,difficulty,confidence,reasoning[,raw]},
+verify{your_count,verdict,confidence,reasoning[,raw]}, verdict, best_count, keep,
+short_circuit, used_points, override, usage_total{prompt,completion,total,calls}`
 
-## Pilot findings (train, smart strategy, gemini-3.1-pro-preview)
-- 200-sample pilot keep rates: **v1 78.5% → v2/v3 ≈ 87-89%** after adding the two
-  guardrails. The recovered ~24/200 were genuine hard-but-correct examples wrongly
-  dropped over ±1-2 (oranges 47 vs GT 48 with one green fruit; biscuits; the "blue"
-  keyboard where the blue/periwinkle boundary is fuzzy; dense FSC147 piles).
-- Correct drops are dominated by: **category mismatch** (question asks "cranes",
-  image is geese → model counts 0 → drop) and **large genuine over/under-counts**.
-- Hand-checked 15+ images against the verdicts; CORRECT/PLAUSIBLE are reliable,
-  and the remaining WRONG drops are defensible. Re-verify by hand at any new scale.
+## Cost
+Driven by `--reasoning-effort` (hidden thinking tokens dominate). Measured on
+`combined_counting_hq` at **high** effort: ~6.2k tok/example, ~1.5 calls/example ⇒
+**~$630 synchronous** for train+val (10,589) at gemini list price ($2/$12 per 1M);
+batch would be ~half but is blocked (above). The org limit is ~200K tok/min shared, so
+keep `--workers ≤ ~12`. Use `cost_estimate.py` to project from a pilot.
 
-## Tuning the decision layer for free
+## Pilot findings & model choice
+- By hand-eval on disagreement cases (GT treated as unverified), **gemini-3.1-pro is the
+  best auditor** (5/5) vs gemini-3.5-flash 4/5, gpt-5 3/5, gpt-5.5 2/5 — the Gemini family
+  beats GPT-5 variants at this visual-audit task. Use gemini-3.1-pro-preview.
+- Full-run keep rate ≈ **80 %** (drop ≈ 20 %: WRONG ~15 %, AMBIGUOUS ~3 %, UNANSWERABLE ~1 %).
+- Recurring GT failure the filter catches: dense FSC147/rec8k annotations that **under-count**
+  (mark ~half the objects). Always spot-check a handful by hand at any new scale, watching
+  specifically for a hard-but-correct example wrongly marked `WRONG`.
+
+## Tune the decision layer for free
 ```bash
-# try a tighter / looser tolerance without re-calling Gemini:
-$PY rescore.py --in "$RUNS/train_smart_v2.jsonl" --out "$RUNS/train_smart_tight.jsonl" \
-    --abs-tol 1 --rel-tol 0.10
-$PY compare_runs.py "$RUNS/train_smart_v2.jsonl" "$RUNS/train_smart_tight.jsonl"
+$PY rescore.py --in "$RUNS/combined_counting_train.jsonl" \
+    --out "$RUNS/combined_counting_train_tight.jsonl" --abs-tol 1 --rel-tol 0.10
+$PY compare_runs.py "$RUNS/combined_counting_train.jsonl" "$RUNS/combined_counting_train_tight.jsonl"
 ```
-
-## Notes
-- Images are upscaled on disk (e.g. 384→2240); we downscale the long side to
-  `--max-side` (default 1536) — never below the real source resolution's worth of detail.
-- Concurrency `--workers` ≤ ~16 (org limit ≈ 200K tokens/min, shared).
-- `gemini-3.1-pro-preview` is the only Gemini on this key; it has strong vision.
-- For reported keep/drop numbers, spot-check a handful of images by hand (the `/go`
-  command does this automatically) and watch specifically for hard examples wrongly
-  marked `WRONG`.

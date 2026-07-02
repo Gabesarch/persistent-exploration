@@ -38,6 +38,8 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data-dir",
                     default="/scratch/gpfs/ZHUANGL/lc1556/vero2/datasets/combined_counting_hq")
+    ap.add_argument("--dataset", default="combined_counting",
+                    help="metadata file prefix: <dataset>_<split>.verl.jsonl")
     ap.add_argument("--splits", nargs="+", default=["train", "val"])
     ap.add_argument("--images-subdir", default="images")
     args = ap.parse_args()
@@ -50,10 +52,10 @@ def main():
     plans = []  # (split, src_path, out_path, [rewritten records])
     total_missing = 0
     for split in args.splits:
-        src = os.path.join(args.data_dir, f"combined_counting_{split}.verl.jsonl")
+        src = os.path.join(args.data_dir, f"{args.dataset}_{split}.verl.jsonl")
         if not os.path.exists(src):
             sys.exit(f"[localize] FATAL: metadata not found: {src}")
-        out = os.path.join(args.data_dir, f"combined_counting_{split}.local.verl.jsonl")
+        out = os.path.join(args.data_dir, f"{args.dataset}_{split}.local.verl.jsonl")
         recs, missing = [], []
         with open(src) as f:
             for line in f:

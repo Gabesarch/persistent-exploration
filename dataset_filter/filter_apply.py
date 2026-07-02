@@ -46,10 +46,9 @@ def classify(d):
     return "keep" if d["keep"] is True else "drop"
 
 
-def source_path(data_dir, split, local):
-    name = (f"combined_counting_{split}.local.verl.jsonl" if local
-            else f"combined_counting_{split}.verl.jsonl")
-    return os.path.join(data_dir, name)
+def source_path(data_dir, split, local, dataset="combined_counting"):
+    ext = "local.verl.jsonl" if local else "verl.jsonl"
+    return os.path.join(data_dir, f"{dataset}_{split}.{ext}")
 
 
 def main():
@@ -58,8 +57,10 @@ def main():
     ap.add_argument("--decisions", required=True)
     ap.add_argument("--data-dir",
                     default="/scratch/gpfs/ZHUANGL/lc1556/vero2/datasets/combined_counting_hq")
+    ap.add_argument("--dataset", default="combined_counting",
+                    help="metadata file prefix: <dataset>_<split>.verl.jsonl")
     ap.add_argument("--local-meta", action="store_true",
-                    help="read combined_counting_<split>.local.verl.jsonl")
+                    help="read <dataset>_<split>.local.verl.jsonl")
     ap.add_argument("--splits", nargs="+", default=["train"])
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--allow-partial", action="store_true",
@@ -78,7 +79,7 @@ def main():
     plans = []  # (split, src, [(rec, rid, cls)], counts)
     grand_undecided = 0
     for split in args.splits:
-        src = source_path(args.data_dir, split, args.local_meta)
+        src = source_path(args.data_dir, split, args.local_meta, args.dataset)
         if not os.path.exists(src):
             sys.exit(f"[apply] FATAL: source not found: {src}")
         rows = []
@@ -109,7 +110,7 @@ def main():
     partial = bool(grand_undecided)  # only true when --allow-partial got us here
     suffix = "filtered.partial" if partial else "filtered"
     for split, src, rows, counts in plans:
-        out_path = os.path.join(args.out_dir, f"combined_counting_{split}.{suffix}.verl.jsonl")
+        out_path = os.path.join(args.out_dir, f"{args.dataset}_{split}.{suffix}.verl.jsonl")
         drop_path = os.path.join(args.out_dir, f"dropped_{split}.jsonl")
         ids_path = os.path.join(args.out_dir, f"keep_ids_{split}.json")
         undec_path = os.path.join(args.out_dir, f"undecided_{split}.txt")

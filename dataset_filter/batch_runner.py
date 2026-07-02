@@ -349,7 +349,8 @@ def save_manifest(manifest, out_dir):
 
 
 def cfg_of(args):
-    return {"model": args.model, "reasoning_effort": args.reasoning_effort,
+    return {"dataset": args.dataset, "model": args.model,
+            "reasoning_effort": args.reasoning_effort,
             "abs_tol": args.abs_tol, "rel_tol": args.rel_tol,
             "use_points": bool(args.use_points), "max_side": args.max_side,
             "splits": list(args.splits), "local_meta": bool(args.local_meta),
@@ -575,6 +576,8 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data-dir",
                     default="/scratch/gpfs/ZHUANGL/lc1556/vero2/datasets/combined_counting_hq")
+    ap.add_argument("--dataset", default="combined_counting",
+                    help="metadata file prefix: <dataset>_<split>.verl.jsonl")
     ap.add_argument("--local-meta", action="store_true")
     ap.add_argument("--splits", nargs="+", default=["train", "val"])
     ap.add_argument("--model", default=DEFAULT_MODEL)
@@ -603,7 +606,7 @@ def main():
     # load dataset views (self-contained local metadata when --local-meta)
     views = []
     for split in args.splits:
-        for rec in load_records(args.data_dir, split, local=args.local_meta):
+        for rec in load_records(args.data_dir, split, local=args.local_meta, dataset=args.dataset):
             v = record_view(rec); v["split"] = split
             views.append(v)
     for v in views:
@@ -626,7 +629,7 @@ def main():
     if os.path.exists(man_path):
         manifest = json.load(open(man_path))
         old = manifest.get("config", {})
-        diff = {k: (old.get(k), cfg[k]) for k in cfg if old.get(k) != cfg[k]}
+        diff = {k: (old.get(k), cfg[k]) for k in cfg if k in old and old.get(k) != cfg[k]}
         if diff and not args.force:
             raise SystemExit(f"[batch] manifest config mismatch: {diff}\n"
                              f"  Use a fresh --out-dir or pass --force.")

@@ -51,10 +51,15 @@ DEFAULT_MODEL = "gemini-3.1-pro-preview"
 
 # --------------------------------------------------------------------------- IO
 
-def load_records(data_dir: str, split: str, local: bool = False):
-    name = (f"combined_counting_{split}.local.verl.jsonl" if local
-            else f"combined_counting_{split}.verl.jsonl")
-    path = os.path.join(data_dir, name)
+def load_records(data_dir: str, split: str, local: bool = False,
+                 dataset: str = "combined_counting"):
+    """Read <data_dir>/<dataset>_<split>.verl.jsonl (or the .local. variant).
+
+    `dataset` is the metadata file prefix — change it (or pass --dataset) to filter a
+    different dataset with the same tooling; nothing else here is counting-specific.
+    """
+    ext = "local.verl.jsonl" if local else "verl.jsonl"
+    path = os.path.join(data_dir, f"{dataset}_{split}.{ext}")
     recs = []
     with open(path) as f:
         for line in f:
@@ -476,9 +481,11 @@ def is_terminal(row: dict) -> bool:
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data-dir", default=DEFAULT_DATA)
+    ap.add_argument("--dataset", default="combined_counting",
+                    help="metadata file prefix: <dataset>_<split>.verl.jsonl (reusable across datasets)")
     ap.add_argument("--split", default="train", choices=["train", "val"])
     ap.add_argument("--local-meta", action="store_true",
-                    help="read the self-contained combined_counting_<split>.local.verl.jsonl")
+                    help="read the self-contained <dataset>_<split>.local.verl.jsonl")
     ap.add_argument("--strategy", default="smart", choices=["smart", "blind", "verify"])
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--n", type=int, default=200, help="number of records (0 = all)")
@@ -506,7 +513,7 @@ def main():
         src, dst = args.image_root_remap.split(":", 1)
         remap = (src, dst)
 
-    recs = load_records(args.data_dir, args.split, local=args.local_meta)
+    recs = load_records(args.data_dir, args.split, local=args.local_meta, dataset=args.dataset)
     views = [record_view(r) for r in recs]
     if args.sample == "random":
         rng = random.Random(args.seed)
@@ -517,14 +524,16 @@ def main():
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
 
     # --- run-config compatibility guard (fail closed on drift) ---
-    cfg = {"split": args.split, "strategy": args.strategy, "model": args.model,
-           "reasoning_effort": args.reasoning_effort, "max_side": args.max_side,
-           "abs_tol": args.abs_tol, "rel_tol": args.rel_tol,
+    cfg = {"dataset": args.dataset, "split": args.split, "strategy": args.strategy,
+           "model": args.model, "reasoning_effort": args.reasoning_effort,
+           "max_side": args.max_side, "abs_tol": args.abs_tol, "rel_tol": args.rel_tol,
            "use_points": not args.no_points, "local_meta": args.local_meta}
     cfg_path = args.out + ".config.json"
     if os.path.exists(cfg_path):
         old = json.load(open(cfg_path))
-        diff = {k: (old.get(k), cfg[k]) for k in cfg if old.get(k) != cfg[k]}
+        # tolerant: only flag keys the old sidecar actually recorded, so adding new
+        # config fields later never spuriously blocks resuming an older run.
+        diff = {k: (old.get(k), cfg[k]) for k in cfg if k in old and old.get(k) != cfg[k]}
         if diff and not args.force:
             raise SystemExit(
                 f"[filter] run-config mismatch vs {cfg_path}: {diff}\n"
