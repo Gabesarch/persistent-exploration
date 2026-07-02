@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import math
 import re
 import threading
 from decimal import Decimal, InvalidOperation
@@ -18,7 +19,11 @@ from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig, Stri
 from sympy import Basic
 from sympy.matrices import MatrixBase
 from verl.utils.reward_score import click_reward, grounding_reward, instructions as instruction_lib
-from verl.utils.reward_score.text_normalization import normalize_text_for_match, search_string_reward
+from verl.utils.reward_score.text_normalization import (
+    _parse_simple_integer,
+    normalize_text_for_match,
+    search_string_reward,
+)
 
 __all__ = [
     "format_reward",
@@ -917,6 +922,54 @@ def _numeric_reward(stripped_predicted: str, truth: str, *, extra_info: Any | No
     return 1.0 if result == 1 else 0.0
 
 
+# Intrinsic full-credit band as a fraction of the ground-truth count; the floor()
+# keeps small counts exact (floor(0.05*gt)=0 for gt<20) while gt=100 accepts +/-5.
+_COUNTING_REL_TOL = 0.05
+# A per-row absolute tolerance can widen the band, but never beyond this fraction of
+# the ground-truth count, so tolerance=2 on gt=1 still requires an exact answer.
+_COUNTING_REL_BAND_CAP = 0.15
+# Width of the decay outside the band, as a fraction of the ground-truth count.
+_COUNTING_REL_SIGMA = 0.15
+# Floor on the decay width: keeps small counts near-exact (gt=1, pred=0 -> ~0.06)
+# without a division blow-up at gt=0.
+_COUNTING_MIN_SIGMA = 0.5
+
+
+def counting_reward_value(pred_count: int, truth_count: int, tolerance: float | None = None) -> float:
+    """Scale-aware graded reward for counting answers.
+
+    Full credit within ``floor(_COUNTING_REL_TOL * |gt|)`` of the ground truth, a
+    band derived from the count itself so no per-row tolerance is needed: small
+    counts (gt < 20) must be exact while gt=100 accepts 95-105. A per-row absolute
+    ``tolerance`` may widen the band up to ``_COUNTING_REL_BAND_CAP * |gt|`` but can
+    never loosen small counts. Outside the band the reward decays as a Gaussian
+    over ``max(_COUNTING_MIN_SIGMA, _COUNTING_REL_SIGMA * |gt|)``: gt=100/pred=110
+    -> ~0.90 while gt=1/pred=0 -> ~0.06.
+    """
+    diff = abs(float(pred_count) - float(truth_count))
+    if diff == 0.0:
+        return 1.0
+
+    band = float(math.floor(_COUNTING_REL_TOL * abs(float(truth_count))))
+    if tolerance is not None and tolerance > 0:
+        band = max(band, min(float(tolerance), _COUNTING_REL_BAND_CAP * abs(float(truth_count))))
+    if diff <= band:
+        return 1.0
+
+    sigma = max(_COUNTING_MIN_SIGMA, _COUNTING_REL_SIGMA * abs(float(truth_count)))
+    return math.exp(-(((diff - band) / sigma) ** 2))
+
+
+def _counting_reward(stripped_predicted: str, truth: str, *, extra_info: Any | None = None, **_: Any) -> float:
+    truth_count = _parse_simple_integer(truth)
+    if truth_count is None:
+        return _string_match_reward(stripped_predicted, truth)
+    pred_count = _parse_simple_integer(stripped_predicted)
+    if pred_count is None:
+        return 0.0
+    return counting_reward_value(pred_count, truth_count, tolerance=_extract_tolerance(extra_info))
+
+
 def _grounding_reward(stripped_predicted: str, truth: str, *, extra_info: Any | None = None, **_: Any) -> float:
     image_path = _extract_image_path(extra_info)
     image_size = _extract_image_size(extra_info)
@@ -1028,7 +1081,7 @@ def acc_reward(predict_str: str, ground_truth: str, use_boxed: bool = False, ext
         "web_action": _web_action_reward,
         "numeric": _numeric_reward,
         "list_string_match": _list_string_match_reward,
-        "counting": _string_match_reward,
+        "counting": _counting_reward,
         "search": search_string_reward,
         "grounding": _grounding_reward,
         "clicking": _clicking_reward,

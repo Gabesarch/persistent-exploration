@@ -7,6 +7,7 @@ import math
 import re
 from typing import Any
 
+from verl.utils.reward_score.math_verify_reward_type_boxed import _counting_reward
 from verl.utils.reward_score.math_verify_reward_type_fixations_no_think_point_boxed import (
     _extract_reward_answer,
     _extract_reward_type,
@@ -175,7 +176,7 @@ def acc_reward(predict_str: str, ground_truth: str, use_boxed: bool = False, ext
         "multiple_choice": _multiple_choice_reward,
         "number_list": _number_list_reward,
         "numeric": _numeric_reward,
-        "counting": _short_string_reward,
+        "counting": _counting_reward,
         "search": search_string_reward,
         "grounding": _grounding_reward,
     }

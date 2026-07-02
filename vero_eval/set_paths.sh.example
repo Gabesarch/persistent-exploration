@@ -32,6 +32,8 @@ export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
 
 # ---- vero_eval serving defaults (policy model served via vLLM) ----
 export VERO_EVAL_DIR="$REPO_ROOT/vero_eval"
+# Hstar bench panorama strips (bundled JSONL references absolute paths under this root).
+export HSTARBENCH_ROOT="${HSTARBENCH_ROOT:-/scratch/gpfs/ZHUANGL/shared/Hstarbench}"
 export CHECKPOINT_PATH="${CHECKPOINT_PATH:-/scratch/gpfs/ZHUANGL/hw0171/Qwen3-VL-8B-Instruct}"
 export PORT="${PORT:-9001}"
 export MODEL_NAME="${MODEL_NAME:-qwen_vllm}"

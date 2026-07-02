@@ -13,6 +13,8 @@ declare -gA DOMAIN_TASK_BASES=(
   [spatial_action]="cv_bench embspatial erqa game_qa_lite blink"
   [knowledge_rec]="realworldqa simplevqa_en fvqa mmvetv2_group_img"
   [grounding_counting_search]="countbenchqa countqa mme_realworld_lite vstar_bench aerialvg_bbox visual_probe_easy visual_probe_medium visual_probe_hard screenspot_point_in_box screenspotpro_point_in_box"
+  # Humanoid 360° visual search (Hstar bench). Not in `all`; use --domain hstarbench.
+  [hstarbench]="hstarbench_mixed hstarbench_hos hstarbench_hps"
   [instruction_following]="mia_bench mm_mt_bench mmifeval"
   [ball_drop]="balldrop"
   [vlms_are_biased]="vlms_are_biased"

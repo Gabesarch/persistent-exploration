@@ -10,6 +10,10 @@
 
 /pyrightconfig.json
 
+# Local agent instruction overrides
+/AGENTS.md
+/CLAUDE.md
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -133,3 +137,5 @@ outputs
 
 vero_eval/results/*
 vero_eval/results/.*
+
+set_paths.local.sh
