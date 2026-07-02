@@ -24,7 +24,7 @@ from tqdm import tqdm
 Image.MAX_IMAGE_PIXELS = None
 
 
-DEFAULT_DATA_DIR = Path("/scratch/gpfs/ZHUANGL/gs1693/reason_vlm_datasets/chart_search_counting_rl")
+DEFAULT_DATA_DIR = Path("/scratch/gpfs/ZHUANGL/gs1693/vigorl_gaze_datasets/chart_search_counting_rl")
 DEFAULT_TRAIN_JSONL = DEFAULT_DATA_DIR / "chart_search_counting_train.verl.jsonl"
 DEFAULT_VAL_JSONL = DEFAULT_DATA_DIR / "chart_search_counting_val.verl.jsonl"
 DEFAULT_MAX_PIXELS = 16_777_216

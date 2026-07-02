@@ -212,6 +212,30 @@ multi_turn:
   # Number of repeat rollouts for each interaction
   num_repeat_rollouts: null
 
+  # Force <tool_call> until the final allowable assistant turn (ban <answer> early),
+  # then force <answer> on the final turn. Implemented via vLLM bad_words.
+  force_tool_calls_until_final_turn: False
+
+  # Token headroom reserved for the final <answer> turn; if remaining response budget
+  # drops below this, switch to forcing an answer to avoid an answerless overflow.
+  final_answer_token_margin: 2048
+
+  # Append turn-dependent guidance to tool responses without forcing logits/actions.
+  tool_response_turn_suffix_enabled: False
+  tool_response_explore_turns: 10
+  tool_response_explore_suffix: "Even if you are confident in your answer, please explore more by outputting a zoom tool call in the next turn. You are encouraged to use depth first search (zooming deeper into previously explored regions) and breadth first search (zooming into image regions not yet examined), and are discouraged from similarly repeating previous zoom explorations."
+  tool_response_final_suffix: "The maximum amount of tool calling has been reached. Please output a final answer in the next turn."
+
+  # When enabled, grade normal final answers during rollout. Incorrect answers
+  # are removed, the previous user/tool message receives this suffix, and the
+  # next assistant turn can be forced to make a tool call.
+  conditional_answer_retry_enabled: False
+  conditional_answer_retry_force_next_tool_call: True
+  conditional_answer_retry_suffix: "You have not gathered enough information yet. In your next turn, keep exploring rather than answering prematurely: use more tool calls to broaden the search, test alternative hypotheses, look for disconfirming evidence, and dig deeper into the most likely explanations. Finalize only when the evidence clearly supports a conclusion."
+  conditional_answer_retry_assistant_prefill: ""
+  conditional_answer_retry_correct_accuracy_threshold: 0.0
+  conditional_answer_retry_max_retries: null
+
 # support logging rollout prob for debugging purpose
 # "Truncated importance sampling" requires rollout log probs, set to True when turning on Truncated importance sampling
 calculate_log_probs: False

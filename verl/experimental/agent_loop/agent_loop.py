@@ -999,11 +999,21 @@ class AgentLoopWorker:
         if self.reward_loop_worker_handles is None and input_non_tensor_batch:
             non_tensor_batch.update(input_non_tensor_batch)
 
-        # add reward_extra_info to non_tensor_batch
-        reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
-        reward_extra_keys = list(reward_extra_infos[0].keys())
+        # Add reward_extra_info to non_tensor_batch. Reward functions can emit sparse
+        # metadata, e.g. LLM-judge keys only for reward types where the judge applies.
+        reward_extra_infos = []
+        for input in inputs:
+            info = input.extra_fields.get("reward_extra_info", {})
+            reward_extra_infos.append(info if isinstance(info, dict) else {})
+        reward_extra_keys = []
+        seen_reward_extra_keys = set()
+        for info in reward_extra_infos:
+            for key in info:
+                if key not in seen_reward_extra_keys:
+                    reward_extra_keys.append(key)
+                    seen_reward_extra_keys.add(key)
         for key in reward_extra_keys:
-            non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
+            non_tensor_batch[key] = np.array([info.get(key) for info in reward_extra_infos], dtype=object)
 
         # Add multi_modal_inputs to non_tensor_batch if any samples have them
         multi_modal_inputs_list = [input.multi_modal_inputs for input in inputs]
@@ -1021,6 +1031,12 @@ class AgentLoopWorker:
         # Keep a stable set of keys so downstream batch concat stays consistent across agent loops.
         extra_fields = {}
         default_extra_keys = {
+            "forced_structure_error",
+            "forced_structure_error_reason",
+            "forced_structure_error_assistant_turn",
+            "conditional_answer_retry_count",
+            "conditional_answer_retry_last_grade",
+            "conditional_answer_retry_skipped_reason",
             "turn_scores",
             "tool_rewards",
             "min_global_steps",

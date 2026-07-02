@@ -175,3 +175,17 @@ trainer:
   use_legacy_worker_impl: auto
   default_local_dir: ${oc.env:SAVE_PATH}/checkpoints/${trainer.project_name}/${trainer.experiment_name}
   validation_data_dir: ${trainer.default_local_dir}/validation_data
+  comprehensive_debug_logging:
+    enabled: true
+    dir: ${trainer.default_local_dir}/debug_logs
+    log_every_n_steps: ${trainer.test_freq}
+    save_cropped_images: false
+    save_source_images: false
+    max_text_chars: null
+    gpu_memory_logging:
+      enabled: false
+      sync_cuda: false
+      reset_peak_stats: true
+      log_driver_stages: true
+      log_worker_stages: true
+      log_nvidia_smi: true

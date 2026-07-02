@@ -20,8 +20,8 @@ algorithm:
     kl_coef: 0
 
 data:
-  train_files: /scratch/gpfs/ZHUANGL/gs1693/reason_vlm_datasets/chart_search_counting_rl/preprocessed_max_pixels_10240000/chart_search_counting_train.verl.preprocessed.jsonl
-  val_files: /scratch/gpfs/ZHUANGL/gs1693/reason_vlm_datasets/chart_search_counting_rl/preprocessed_max_pixels_10240000/chart_search_counting_val.verl.preprocessed.jsonl
+  train_files: /scratch/gpfs/ZHUANGL/gs1693/vigorl_gaze_datasets/chart_search_counting_rl/preprocessed_max_pixels_10240000/chart_search_counting_train.verl.preprocessed.jsonl
+  val_files: /scratch/gpfs/ZHUANGL/gs1693/vigorl_gaze_datasets/chart_search_counting_rl/preprocessed_max_pixels_10240000/chart_search_counting_val.verl.preprocessed.jsonl
   filter_overlong_prompts_workers: 64
   image_root: ${oc.env:IMAGE_ROOT}
   system_prompt: ${oc.env:VERL_ROOT}/vero2_scripts/prompts/system_prompt_chatting_tool_calling.txt
@@ -315,7 +315,7 @@ trainer:
   n_gpus_per_node: 8
   project_name: vero2_verl
   total_epochs: 1000
-  total_training_steps: 1000
+  total_training_steps: 400
   log_val_generations: 0
   esi_redundant_time: 1500
   resume_mode: auto
@@ -327,8 +327,8 @@ trainer:
   comprehensive_debug_logging:
     enabled: true
     dir: ${trainer.default_local_dir}/debug_logs
-    log_every_n_steps: 5
-    save_cropped_images: true
+    log_every_n_steps: ${trainer.test_freq}
+    save_cropped_images: false
     save_source_images: false
     max_text_chars: null
     gpu_memory_logging:

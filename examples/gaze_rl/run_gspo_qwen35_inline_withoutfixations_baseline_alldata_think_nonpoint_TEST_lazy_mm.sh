@@ -15,8 +15,8 @@ set -x
 set -o pipefail
 
 # SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_TRAIN_JSONL="/scratch/gpfs/ZHUANGL/gs1693/reason_vlm_datasets/chart_search_counting_rl/chart_search_counting_train.verl.jsonl"
-DEFAULT_VAL_JSONL="/scratch/gpfs/ZHUANGL/gs1693/reason_vlm_datasets/chart_search_counting_rl/chart_search_counting_val.verl.jsonl"
+DEFAULT_TRAIN_JSONL="/scratch/gpfs/ZHUANGL/gs1693/vigorl_gaze_datasets/chart_search_counting_rl/chart_search_counting_train.verl.jsonl"
+DEFAULT_VAL_JSONL="/scratch/gpfs/ZHUANGL/gs1693/vigorl_gaze_datasets/chart_search_counting_rl/chart_search_counting_val.verl.jsonl"
 export TRAIN_DATA="${TRAIN_DATA:-$DEFAULT_TRAIN_JSONL}"
 export VAL_DATA="${VAL_DATA:-$DEFAULT_VAL_JSONL}"
 source "./set_paths.sh"

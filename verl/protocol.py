@@ -929,7 +929,27 @@ class DataProto:
             batch_lst.append(batch.batch)
         new_batch = torch.cat(batch_lst, dim=0) if batch_lst[0] is not None else None
 
-        non_tensor_batch = list_of_dict_to_dict_of_list(list_of_dict=[d.non_tensor_batch for d in data])
+        reward_extra_keys = []
+        seen_reward_extra_keys = set()
+        for d in data:
+            for key in d.meta_info.get("reward_extra_keys", []):
+                if key not in seen_reward_extra_keys:
+                    reward_extra_keys.append(key)
+                    seen_reward_extra_keys.add(key)
+
+        # Reward extra metadata can be sparse across rollout workers, e.g. LLM-judge
+        # fields only appear for samples whose reward type uses the judge. Fill missing
+        # columns so concatenation preserves batch alignment instead of treating the
+        # per-worker key list as conflicting scalar metadata.
+        non_tensor_dicts = [dict(d.non_tensor_batch) for d in data]
+        for d, non_tensor in zip(data, non_tensor_dicts, strict=True):
+            for key in reward_extra_keys:
+                if key not in non_tensor:
+                    values = np.empty(len(d), dtype=object)
+                    values[:] = None
+                    non_tensor[key] = values
+
+        non_tensor_batch = list_of_dict_to_dict_of_list(list_of_dict=non_tensor_dicts)
         for key, val in non_tensor_batch.items():
             non_tensor_batch[key] = np.concatenate(val, axis=0)
 
@@ -946,6 +966,8 @@ class DataProto:
                                 all_metrics.extend(v)
                             else:
                                 all_metrics.append(v)
+                    elif k == "reward_extra_keys":
+                        continue
                     else:
                         if k in merged_meta_info:
                             # Ensure consistency for overlapping non-metric keys
@@ -956,6 +978,8 @@ class DataProto:
             # Flatten list of dicts to dict of lists for consistent metrics structure
             if all_metrics:
                 merged_meta_info["metrics"] = list_of_dict_to_dict_of_list(all_metrics)
+            if reward_extra_keys:
+                merged_meta_info["reward_extra_keys"] = reward_extra_keys
 
         cls = type(data[0]) if len(data) > 0 else DataProto
         return cls(batch=new_batch, non_tensor_batch=non_tensor_batch, meta_info=merged_meta_info)

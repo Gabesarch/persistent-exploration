@@ -87,6 +87,43 @@ class MultiTurnConfig(BaseConfig):
     tokenization_sanity_check_mode: str = "strict"
     format: str = "hermes"
     num_repeat_rollouts: Optional[int] = None
+    force_tool_calls_until_final_turn: bool = False
+    final_answer_token_margin: int = 2048
+    # Text forced immediately after the `<answer>` tag on the forced final turn (e.g. "\n\\boxed{"
+    # to start a boxed answer). Empty string forces only the `<answer>` tag, as before.
+    force_final_answer_prefix: str = ""
+    tool_response_turn_suffix_enabled: bool = False
+    tool_response_explore_turns: int = 10
+    tool_response_explore_suffix: str = (
+        "Even if you are confident in your answer, please explore more by outputting a zoom tool call in the next "
+        "turn. You are encouraged to use depth first search (zooming deeper into previously explored regions) and "
+        "breadth first search (zooming into image regions not yet examined), and are discouraged from similarly "
+        "repeating previous zoom explorations."
+    )
+    tool_response_final_suffix: str = (
+        "The maximum amount of tool calling has been reached. Please output a final answer in the next turn."
+    )
+    conditional_answer_retry_enabled: bool = False
+    conditional_answer_retry_force_next_tool_call: bool = True
+    conditional_answer_retry_suffix: str = (
+        "You have not gathered enough information yet. In your next turn, keep exploring rather than answering "
+        "prematurely: use more tool calls to broaden the search, test alternative hypotheses, look for "
+        "disconfirming evidence, and dig deeper into the most likely explanations. Finalize only when the evidence "
+        "clearly supports a conclusion."
+    )
+    conditional_answer_retry_assistant_prefill: str = ""
+    conditional_answer_retry_correct_accuracy_threshold: float = 0.0
+    conditional_answer_retry_max_retries: Optional[int] = None
+    llm_judge_enabled: bool = False
+    llm_judge_prompt_path: Optional[str] = None
+    llm_judge_reward_types: list[str] = field(default_factory=lambda: ["search"])
+    llm_judge_max_tokens: int = 48
+    llm_judge_temperature: float = 0.0
+    llm_judge_top_p: float = 1.0
+    llm_judge_partial_credit_score: float = 0.5
+    llm_judge_timeout_s: Optional[float] = None
+    llm_judge_fallback_to_string_reward: bool = True
+    llm_judge_assistant_prefill: str = "{"
 
 
 @dataclass
