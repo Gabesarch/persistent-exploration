@@ -1,0 +1,14 @@
+#!/bin/bash
+# Personal overrides for set_paths.sh.
+# Copy to set_paths.local.sh (git-ignored) and set your own values; set_paths.sh
+# sources it before applying its defaults, so anything you export here wins.
+# $SCRIPT_DIR is already set to the directory containing set_paths.sh.
+
+# Use this clone's code and configs instead of the default checkout:
+# export VERL_ROOT="$SCRIPT_DIR"
+
+# Write checkpoints/wandb/caches to your own scratch:
+# export ROOT_PATH="/scratch/gpfs/ZHUANGL/$USER"
+
+# Use a different conda environment:
+# export VERO2_CONDA_ENV="/path/to/your/conda/env"
