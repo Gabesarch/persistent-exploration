@@ -10,6 +10,10 @@
 
 /pyrightconfig.json
 
+# Local agent instruction overrides
+/AGENTS.md
+/CLAUDE.md
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
