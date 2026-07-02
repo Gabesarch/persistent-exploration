@@ -114,6 +114,16 @@ class MultiTurnConfig(BaseConfig):
     conditional_answer_retry_assistant_prefill: str = ""
     conditional_answer_retry_correct_accuracy_threshold: float = 0.0
     conditional_answer_retry_max_retries: Optional[int] = None
+    llm_judge_enabled: bool = False
+    llm_judge_prompt_path: Optional[str] = None
+    llm_judge_reward_types: list[str] = field(default_factory=lambda: ["search"])
+    llm_judge_max_tokens: int = 48
+    llm_judge_temperature: float = 0.0
+    llm_judge_top_p: float = 1.0
+    llm_judge_partial_credit_score: float = 0.5
+    llm_judge_timeout_s: Optional[float] = None
+    llm_judge_fallback_to_string_reward: bool = True
+    llm_judge_assistant_prefill: str = "{"
 
 
 @dataclass

@@ -46,6 +46,7 @@ class _FakeTokenizer:
             20: "<",
             21: "answer",
             22: ">",
+            23: "</answer>",
             30: "<think>",
             31: "reason",
             40: '{"name":"image_zoom_in_tool","arguments":{}}',
@@ -264,6 +265,18 @@ def _make_conditional_retry_loop(
     loop.conditional_answer_retry_correct_accuracy_threshold = 0.0
     loop.conditional_answer_retry_max_retries = None
     loop.conditional_answer_retry_reward_fn = reward_fn
+    loop.llm_judge_enabled = False
+    loop.llm_judge_prompt_template = None
+    loop.llm_judge_reward_types = {"search"}
+    loop.llm_judge_max_tokens = 48
+    loop.llm_judge_temperature = 0.0
+    loop.llm_judge_top_p = 1.0
+    loop.llm_judge_partial_credit_score = 0.5
+    loop.llm_judge_timeout_s = None
+    loop.llm_judge_fallback_to_string_reward = True
+    loop.llm_judge_assistant_prefill = "{"
+    loop.llm_judge_format_score = 0.1
+    loop.llm_judge_tool_efficiency_score_weight = 0.0
     loop._debug_enabled_for_agent = lambda agent_data: False
 
     async def apply_chat_template(
@@ -323,6 +336,9 @@ def test_tool_agent_loop_init_tolerates_missing_optional_multi_turn_keys(monkeyp
     assert loop.conditional_answer_retry_enabled is False
     assert loop.conditional_answer_retry_force_next_tool_call is True
     assert loop.conditional_answer_retry_assistant_prefill == ""
+    assert loop.llm_judge_enabled is False
+    assert loop.llm_judge_reward_types == {"search"}
+    assert loop.llm_judge_assistant_prefill == "{"
 
 
 def _make_agent_data() -> AgentData:
@@ -483,6 +499,96 @@ def test_conditional_answer_retry_grades_with_response_display_prefix():
     assert graded_solution["solution_str"] == "<think>reason</think><answer>final"
     assert agent_data.extra_fields["conditional_answer_retry_last_grade"]["accuracy"] == 1.0
     assert agent_data.extra_fields.get("conditional_answer_retry_count") is None
+
+
+def test_llm_judge_response_parser_prepends_open_brace():
+    loop = object.__new__(ToolAgentLoop)
+    loop.llm_judge_assistant_prefill = "{"
+
+    parsed = loop._parse_llm_judge_response('"is_equivalent": true, "partial_credit": false}')
+
+    assert parsed == {"is_equivalent": True, "partial_credit": False}
+
+
+def test_conditional_answer_retry_uses_llm_judge_for_search_answer():
+    tokenizer = _FakeTokenizer()
+    tokenizer.id_to_text[80] = '"is_equivalent": true, "partial_credit": false}'
+    server_manager = _SequencedFakeServerManager(
+        [
+            [30, 31, 1, 20, 21, 22, 50, 23],
+            [80],
+        ]
+    )
+    tool_parser = _SequencedFakeToolParser([[]])
+    agent_data = _make_agent_data()
+    calls = {"reward_fn": 0}
+
+    def reward_fn(**kwargs):
+        calls["reward_fn"] += 1
+        assert kwargs["solution_str"] == "<think>reason</think><answer>final</answer>"
+        return {"score": 0.1, "accuracy": 0.0, "format": 1.0}
+
+    async def run_test():
+        loop = _make_conditional_retry_loop(tokenizer, server_manager, tool_parser, reward_fn)
+        loop.llm_judge_enabled = True
+        loop.llm_judge_prompt_template = "Question: [QUESTION]\nReference answer: [REFERENCE]\nModel answer: [PREDICTION]"
+        loop._encode_llm_judge_prompt = lambda prompt: [999]
+        return await loop._handle_generating_state(
+            agent_data,
+            {"temperature": 1.0},
+            rollout_kwargs={
+                "data_source": "unit",
+                "reward_model": {"ground_truth": "a ship"},
+                "extra_info": {"reward_type": "search", "question": "What object is visible?"},
+            },
+        )
+
+    state = asyncio.run(run_test())
+
+    assert state == AgentState.TERMINATED
+    assert calls["reward_fn"] == 1
+    assert server_manager.prompt_ids_by_call[1] == [999]
+    grade = agent_data.extra_fields["conditional_answer_retry_last_grade"]
+    assert grade["llm_judge_used"] is True
+    assert grade["accuracy"] == 1.0
+    assert grade["score"] == 1.0
+    assert agent_data.response_ids == [30, 31, 1, 20, 21, 22, 50, 23]
+
+
+def test_final_llm_judge_score_uses_final_trajectory_without_mutating_tokens():
+    tokenizer = _FakeTokenizer()
+    tokenizer.id_to_text[80] = '"is_equivalent": false, "partial_credit": true}'
+    server_manager = _SequencedFakeServerManager([[80]])
+    tool_parser = _SequencedFakeToolParser([])
+    agent_data = _make_agent_data()
+    agent_data.prompt_ids = [100, 30, 31, 1, 20, 21, 22, 50, 23]
+    agent_data.response_mask = [1] * 8
+
+    def reward_fn(**kwargs):
+        assert kwargs["solution_str"] == "<think>reason</think><answer>final</answer>"
+        return {"score": 0.1, "accuracy": 0.0, "format": 1.0}
+
+    async def run_test():
+        loop = _make_conditional_retry_loop(tokenizer, server_manager, tool_parser, reward_fn)
+        loop.llm_judge_enabled = True
+        loop.llm_judge_prompt_template = "Question: [QUESTION]\nReference answer: [REFERENCE]\nModel answer: [PREDICTION]"
+        loop._encode_llm_judge_prompt = lambda prompt: [999]
+        return await loop._maybe_score_final_with_llm_judge(
+            agent_data,
+            {
+                "data_source": "unit",
+                "reward_model": {"ground_truth": "a ship"},
+                "extra_info": {"reward_type": "search", "question": "What object is visible?"},
+            },
+        )
+
+    grade = asyncio.run(run_test())
+
+    assert grade["llm_judge_used"] is True
+    assert grade["accuracy"] == 0.5
+    assert grade["score"] == pytest.approx(0.55)
+    assert agent_data.prompt_ids == [100, 30, 31, 1, 20, 21, 22, 50, 23]
+    assert agent_data.response_mask == [1] * 8
 
 
 def test_conditional_answer_retry_rolls_back_appends_suffix_and_forces_next_tool_call():

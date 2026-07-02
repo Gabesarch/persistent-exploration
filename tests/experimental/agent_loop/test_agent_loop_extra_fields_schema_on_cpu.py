@@ -308,6 +308,53 @@ def test_agent_loop_postprocess_keeps_forced_structure_schema_stable_across_work
     assert merged.non_tensor_batch["forced_structure_error_assistant_turn"].tolist() == [None, 1]
 
 
+def test_agent_loop_postprocess_accepts_sparse_reward_extra_info_on_cpu():
+    dummy_worker = type(
+        "_DummyWorker",
+        (),
+        {"reward_loop_worker_handles": None, "distillation_enabled": False, "stream_teacher_with_rollout": False},
+    )()
+
+    base_kwargs = {
+        "output_prompt_ids": [101, 102],
+        "output_response_ids": [11, 12],
+        "output_response_mask": [1, 1],
+        "metrics": AgentLoopMetrics(),
+        "num_turns": 2,
+        "prompt_len": 4,
+        "response_len": 4,
+    }
+    with_judge_metadata = _to_internal(
+        **base_kwargs,
+        extra_fields={
+            "reward_extra_info": {
+                "accuracy": 1.0,
+                "llm_judge_used": True,
+            },
+        },
+    )
+    without_judge_metadata = _to_internal(
+        **base_kwargs,
+        extra_fields={
+            "reward_extra_info": {
+                "accuracy": 0.0,
+            },
+        },
+    )
+
+    merged = AgentLoopWorker._postprocess(
+        dummy_worker,
+        inputs=[with_judge_metadata, without_judge_metadata],
+        input_non_tensor_batch={
+            "index": np.array([0, 1], dtype=object),
+            "agent_name": np.array(["tool_agent", "tool_agent"], dtype=object),
+        },
+    )
+
+    assert merged.non_tensor_batch["accuracy"].tolist() == [1.0, 0.0]
+    assert merged.non_tensor_batch["llm_judge_used"].tolist() == [True, None]
+
+
 @pytest.mark.asyncio
 async def test_agent_loop_postprocess_accepts_read_only_routed_experts_on_cpu():
     class _DummyWorker:

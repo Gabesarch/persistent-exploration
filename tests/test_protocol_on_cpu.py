@@ -354,6 +354,29 @@ def test_concat_conflicting_non_metric_keys():
         DataProto.concat([data1, data2])
 
 
+def test_concat_merges_sparse_reward_extra_keys():
+    """Reward extra metadata can be sparse across rollout workers."""
+    obs1 = torch.tensor([1, 2])
+    obs2 = torch.tensor([3])
+
+    data1 = DataProto.from_dict(
+        tensors={"obs": obs1},
+        non_tensors={"llm_judge_used": np.array([True, False], dtype=object)},
+        meta_info={"reward_extra_keys": ["llm_judge_used"]},
+    )
+    data2 = DataProto.from_dict(
+        tensors={"obs": obs2},
+        non_tensors={"llm_judge_score": np.array([0.5], dtype=object)},
+        meta_info={"reward_extra_keys": ["llm_judge_score"]},
+    )
+
+    concat_data = DataProto.concat([data1, data2])
+
+    assert concat_data.meta_info["reward_extra_keys"] == ["llm_judge_used", "llm_judge_score"]
+    assert concat_data.non_tensor_batch["llm_judge_used"].tolist() == [True, False, None]
+    assert concat_data.non_tensor_batch["llm_judge_score"].tolist() == [None, None, 0.5]
+
+
 def test_pop():
     obs = torch.randn(100, 10)
     act = torch.randn(100, 3)

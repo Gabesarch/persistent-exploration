@@ -46,6 +46,11 @@ from verl.utils.debug.comprehensive_logging import (
 )
 from verl.utils.profiler import simple_timer
 from verl.utils.response_display import apply_response_display_prefix, get_response_display_prefix
+from verl.utils.reward_score.math_verify_reward_type_multiturn_tool_calling_optional_think import (
+    _extract_reward_answer,
+    _extract_reward_type,
+    _parse_multiturn_tool_calling_output,
+)
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.utils.forced_action_tags import (
     FORCE_ACTION_AFTER_THINK_IDS_OPTIONS_KEY,
@@ -69,6 +74,16 @@ TERMINAL_TOOL_EXTRA_FIELD_DEFAULTS: dict[str, Any] = {
     "conditional_answer_retry_last_grade": None,
     "conditional_answer_retry_skipped_reason": None,
 }
+
+_LLM_JUDGE_SYSTEM_PROMPT = (
+    "You are a strict reward judge. Respond with exactly one JSON object and no extra text."
+)
+_VISION_PLACEHOLDER_REPLACEMENTS = (
+    "<|vision_start|><|image_pad|><|vision_end|>",
+    "<|vision_start|><|video_pad|><|vision_end|>",
+    "<image>",
+    "<video>",
+)
 
 
 class AgentState(Enum):
@@ -185,9 +200,30 @@ class ToolAgentLoop(AgentLoopBase):
         self.conditional_answer_retry_max_retries = getattr(
             multi_turn_config, "conditional_answer_retry_max_retries", None
         )
+        self.llm_judge_enabled = bool(getattr(multi_turn_config, "llm_judge_enabled", False))
         self.conditional_answer_retry_reward_fn = (
-            get_custom_reward_fn(self.config) if self.conditional_answer_retry_enabled else None
+            get_custom_reward_fn(self.config)
+            if self.conditional_answer_retry_enabled or self.llm_judge_enabled
+            else None
         )
+        self.llm_judge_prompt_path = getattr(multi_turn_config, "llm_judge_prompt_path", None)
+        self.llm_judge_prompt_template = self._load_llm_judge_prompt_template(self.llm_judge_prompt_path)
+        self.llm_judge_reward_types = set(getattr(multi_turn_config, "llm_judge_reward_types", ["search"]) or [])
+        self.llm_judge_max_tokens = int(getattr(multi_turn_config, "llm_judge_max_tokens", 48))
+        self.llm_judge_temperature = float(getattr(multi_turn_config, "llm_judge_temperature", 0.0))
+        self.llm_judge_top_p = float(getattr(multi_turn_config, "llm_judge_top_p", 1.0))
+        self.llm_judge_partial_credit_score = float(
+            getattr(multi_turn_config, "llm_judge_partial_credit_score", 0.5)
+        )
+        self.llm_judge_timeout_s = getattr(multi_turn_config, "llm_judge_timeout_s", None)
+        self.llm_judge_fallback_to_string_reward = bool(
+            getattr(multi_turn_config, "llm_judge_fallback_to_string_reward", True)
+        )
+        self.llm_judge_assistant_prefill = getattr(multi_turn_config, "llm_judge_assistant_prefill", "{")
+        reward_config = getattr(self.config, "reward", {}) if self.config is not None else {}
+        reward_kwargs = dict(reward_config.get("custom_reward_function", {}).get("reward_kwargs", {}))
+        self.llm_judge_format_score = float(reward_kwargs.get("format_score", 0.5))
+        self.llm_judge_tool_efficiency_score_weight = float(reward_kwargs.get("tool_efficiency_score_weight", 0.0))
         tool_config_path = multi_turn_config.tool_config_path
         tool_list = initialize_tools_from_config(tool_config_path) if tool_config_path else []
         self.tools = {tool.name: tool for tool in tool_list}
@@ -317,6 +353,10 @@ class ToolAgentLoop(AgentLoopBase):
                 CROP_IMAGE_REFS_KEY: agent_data.crop_image_refs,
             }
         )
+        final_grade = await self._maybe_score_final_with_llm_judge(agent_data, kwargs)
+        if final_grade is not None:
+            output.reward_score = float(final_grade.get("score", 0.0) or 0.0)
+            output.extra_fields["reward_extra_info"] = final_grade
         if debug_enabled:
             await self._debug_log_sample_final(output, agent_data, kwargs, debug_trajectory)
         return output
@@ -643,19 +683,262 @@ class ToolAgentLoop(AgentLoopBase):
             None, lambda: self.tokenizer.decode(response_ids, skip_special_tokens=True)
         )
         solution_str = apply_response_display_prefix(solution_str, self.response_display_prefix)
+        return await self._score_solution_with_optional_llm_judge(
+            agent_data=agent_data,
+            solution_str=solution_str,
+            rollout_kwargs=rollout_kwargs,
+            use_llm_judge=bool(getattr(self, "llm_judge_enabled", False)),
+        )
+
+    async def _maybe_score_final_with_llm_judge(
+        self, agent_data: AgentData, rollout_kwargs: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        if not getattr(self, "llm_judge_enabled", False):
+            return None
+        if self.conditional_answer_retry_reward_fn is None:
+            return None
+
+        response_ids = agent_data.prompt_ids[-len(agent_data.response_mask) :] if agent_data.response_mask else []
+        solution_str = await self.loop.run_in_executor(
+            None, lambda: self.tokenizer.decode(response_ids, skip_special_tokens=True)
+        )
+        solution_str = apply_response_display_prefix(solution_str, self.response_display_prefix)
+        grade = await self._score_solution_with_optional_llm_judge(
+            agent_data=agent_data,
+            solution_str=solution_str,
+            rollout_kwargs=rollout_kwargs,
+            use_llm_judge=True,
+        )
+        if grade.get("llm_judge_used"):
+            return grade
+        if grade.get("llm_judge_error") and not getattr(self, "llm_judge_fallback_to_string_reward", True):
+            return grade
+        return None
+
+    async def _score_solution_with_optional_llm_judge(
+        self,
+        agent_data: AgentData,
+        solution_str: str,
+        rollout_kwargs: dict[str, Any],
+        use_llm_judge: bool,
+    ) -> dict[str, Any]:
         reward_model = rollout_kwargs.get("reward_model") or {}
         ground_truth = reward_model.get("ground_truth") if isinstance(reward_model, dict) else None
-        result = self.conditional_answer_retry_reward_fn(
+        extra_info = rollout_kwargs.get("extra_info")
+        base_result = self.conditional_answer_retry_reward_fn(
             data_source=rollout_kwargs.get("data_source", "unknown"),
             solution_str=solution_str,
             ground_truth=ground_truth,
-            extra_info=rollout_kwargs.get("extra_info"),
+            extra_info=extra_info,
         )
-        if inspect.isawaitable(result):
-            result = await result
-        if isinstance(result, dict):
-            return result
-        return {"score": float(result), "accuracy": float(result)}
+        if inspect.isawaitable(base_result):
+            base_result = await base_result
+        if isinstance(base_result, dict):
+            grade = dict(base_result)
+        else:
+            grade = {"score": float(base_result), "accuracy": float(base_result)}
+
+        if not use_llm_judge or not self._llm_judge_applies(extra_info):
+            return grade
+
+        judge_result = await self._run_llm_judge(
+            agent_data=agent_data,
+            solution_str=solution_str,
+            ground_truth=ground_truth,
+            extra_info=extra_info,
+        )
+        if judge_result.get("llm_judge_used"):
+            return self._merge_llm_judge_accuracy(grade, judge_result)
+        if getattr(self, "llm_judge_fallback_to_string_reward", True):
+            grade.update(judge_result)
+            return grade
+
+        grade.update(judge_result)
+        grade["accuracy"] = 0.0
+        grade["score"] = self._compose_score_from_grade(grade, 0.0)
+        return grade
+
+    def _llm_judge_applies(self, extra_info: Any) -> bool:
+        reward_type = _extract_reward_type(extra_info)
+        return bool(reward_type and reward_type in getattr(self, "llm_judge_reward_types", {"search"}))
+
+    @staticmethod
+    def _load_llm_judge_prompt_template(prompt_path: str | None) -> str | None:
+        if not prompt_path:
+            return None
+        try:
+            with open(os.path.expandvars(str(prompt_path)), encoding="utf-8") as handle:
+                return handle.read()
+        except OSError as exc:
+            logger.warning("failed to read llm judge prompt template %s: %s", prompt_path, exc)
+            return None
+
+    async def _run_llm_judge(
+        self,
+        agent_data: AgentData,
+        solution_str: str,
+        ground_truth: Any,
+        extra_info: Any,
+    ) -> dict[str, Any]:
+        if not getattr(self, "llm_judge_prompt_template", None):
+            return {"llm_judge_used": False, "llm_judge_error": "missing_prompt_template"}
+
+        is_valid, final_answer_text, _ = _parse_multiturn_tool_calling_output(solution_str)
+        if not is_valid or not final_answer_text:
+            return {"llm_judge_used": False, "llm_judge_error": "invalid_trajectory_format"}
+
+        reward_type = _extract_reward_type(extra_info)
+        final_answer = _extract_reward_answer(final_answer_text, reward_type)
+        if final_answer is None:
+            return {"llm_judge_used": False, "llm_judge_error": "missing_final_answer"}
+
+        question = self._extract_llm_judge_question(agent_data, extra_info)
+        if not question:
+            return {"llm_judge_used": False, "llm_judge_error": "missing_question"}
+
+        judge_prompt = self._format_llm_judge_prompt(
+            question=question,
+            reference=str(ground_truth).strip(),
+            prediction=str(final_answer).strip(),
+        )
+        prompt_ids = self._encode_llm_judge_prompt(judge_prompt)
+        sampling_params = {
+            "max_tokens": int(getattr(self, "llm_judge_max_tokens", 48)),
+            "temperature": float(getattr(self, "llm_judge_temperature", 0.0)),
+            "top_p": float(getattr(self, "llm_judge_top_p", 1.0)),
+            "top_k": -1,
+            "logprobs": False,
+        }
+
+        try:
+            judge_coro = self.server_manager.generate(
+                request_id=f"{agent_data.request_id}-llm-judge-{uuid4().hex}",
+                prompt_ids=prompt_ids,
+                sampling_params=sampling_params,
+                image_data=None,
+                video_data=None,
+            )
+            timeout_s = getattr(self, "llm_judge_timeout_s", None)
+            output = await asyncio.wait_for(judge_coro, timeout=float(timeout_s)) if timeout_s else await judge_coro
+            raw_suffix = await self.loop.run_in_executor(
+                None, lambda: self.tokenizer.decode(output.token_ids, skip_special_tokens=True)
+            )
+            parsed = self._parse_llm_judge_response(raw_suffix)
+        except Exception as exc:  # noqa: BLE001 - judge failures should be recoverable.
+            return {"llm_judge_used": False, "llm_judge_error": f"{type(exc).__name__}: {exc}"}
+
+        is_equivalent = bool(parsed.get("is_equivalent"))
+        partial_credit = bool(parsed.get("partial_credit"))
+        if is_equivalent:
+            accuracy = 1.0
+        elif partial_credit:
+            accuracy = float(getattr(self, "llm_judge_partial_credit_score", 0.5))
+        else:
+            accuracy = 0.0
+
+        return {
+            "llm_judge_used": True,
+            "llm_judge_raw_response": self._llm_judge_prefilled_response(raw_suffix),
+            "llm_judge_is_equivalent": is_equivalent,
+            "llm_judge_partial_credit": partial_credit,
+            "llm_judge_accuracy": accuracy,
+            "llm_judge_error": None,
+        }
+
+    def _format_llm_judge_prompt(self, question: str, reference: str, prediction: str) -> str:
+        return (
+            str(self.llm_judge_prompt_template)
+            .replace("[QUESTION]", question)
+            .replace("[REFERENCE]", reference)
+            .replace("[PREDICTION]", prediction)
+        )
+
+    def _encode_llm_judge_prompt(self, judge_prompt: str) -> list[int]:
+        prefill = getattr(self, "llm_judge_assistant_prefill", "{") or ""
+        text = (
+            f"<|im_start|>system\n{_LLM_JUDGE_SYSTEM_PROMPT}<|im_end|>\n"
+            f"<|im_start|>user\n{judge_prompt}<|im_end|>\n"
+            f"<|im_start|>assistant\n{prefill}"
+        )
+        return self.tokenizer.encode(text, add_special_tokens=False)
+
+    def _parse_llm_judge_response(self, raw_suffix: str) -> dict[str, Any]:
+        raw_response = self._llm_judge_prefilled_response(raw_suffix)
+        start = raw_response.find("{")
+        end = raw_response.rfind("}")
+        if start < 0 or end < start:
+            raise ValueError(f"judge response did not contain a JSON object: {raw_response!r}")
+        parsed = json.loads(raw_response[start : end + 1])
+        if not isinstance(parsed, dict):
+            raise ValueError("judge response JSON was not an object")
+        return parsed
+
+    def _llm_judge_prefilled_response(self, raw_suffix: str) -> str:
+        prefill = getattr(self, "llm_judge_assistant_prefill", "{") or ""
+        suffix = str(raw_suffix or "").strip()
+        if prefill and suffix.startswith(prefill):
+            return suffix
+        return f"{prefill}{suffix}"
+
+    @staticmethod
+    def _extract_llm_judge_question(agent_data: AgentData, extra_info: Any) -> str | None:
+        if isinstance(extra_info, dict):
+            for key in ("question", "problem", "prompt", "query"):
+                value = extra_info.get(key)
+                if value:
+                    return ToolAgentLoop._clean_llm_judge_question(value)
+
+        for message in agent_data.messages:
+            if message.get("role") == "user":
+                text = ToolAgentLoop._message_content_to_text(message.get("content"))
+                if text:
+                    return ToolAgentLoop._clean_llm_judge_question(text)
+        return None
+
+    @staticmethod
+    def _message_content_to_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict):
+                    if "text" in item:
+                        parts.append(str(item["text"]))
+                    elif item.get("type") in {"image", "video"} or "image" in item or "image_url" in item:
+                        continue
+                elif isinstance(item, str):
+                    parts.append(item)
+            return "\n".join(parts)
+        return str(content) if content is not None else ""
+
+    @staticmethod
+    def _clean_llm_judge_question(value: Any) -> str:
+        text = str(value)
+        for placeholder in _VISION_PLACEHOLDER_REPLACEMENTS:
+            text = text.replace(placeholder, " ")
+        return " ".join(text.split())
+
+    def _merge_llm_judge_accuracy(self, grade: dict[str, Any], judge_result: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(grade)
+        accuracy = float(judge_result.get("llm_judge_accuracy", 0.0) or 0.0)
+        merged.update(judge_result)
+        merged["accuracy"] = accuracy
+        merged["score"] = self._compose_score_from_grade(merged, accuracy)
+        return merged
+
+    def _compose_score_from_grade(self, grade: dict[str, Any], accuracy: float) -> float:
+        formatting = float(grade.get("format", 0.0) or 0.0)
+        format_score = float(getattr(self, "llm_judge_format_score", 0.5))
+        tool_efficiency_score_weight = float(getattr(self, "llm_judge_tool_efficiency_score_weight", 0.0))
+        tool_efficiency = float(grade.get("tool_efficiency", 0.0) or 0.0)
+        tool_call_bonus = float(grade.get("tool_call_bonus", 0.0) or 0.0)
+        return (
+            (1.0 - format_score - tool_efficiency_score_weight) * float(accuracy)
+            + format_score * formatting
+            + tool_efficiency_score_weight * tool_efficiency
+            + tool_call_bonus
+        )
 
     @staticmethod
     def _grade_accuracy(grade: Any) -> float:

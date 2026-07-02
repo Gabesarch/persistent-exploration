@@ -1,0 +1,17 @@
+# Primary Hstar eval for Vero RL checkpoints (training-faithful zoom tool schema).
+include:
+  - hstarbench_mixed_reasoning.yaml
+  - ../_tool_templates/_toolset_zoom_vero_yaml
+task: "hstarbench_mixed_reasoning_zoom"
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 0.7
+  do_sample: true
+doc_to_messages: !function utils.hstarbench_bbox_zoom_doc_to_messages_vero
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: "\n"
+    post_prompt: ""
+metadata:
+  image_indexing: training_faithful
+  description: "Hstar mixed strip+zoom for Vero RL checkpoints"

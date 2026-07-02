@@ -1,0 +1,13 @@
+metric_list:
+  - metric: hstarbench_cone_success
+    aggregation: !function utils.hstarbench_aggregate_success
+    higher_is_better: true
+  - metric: hstarbench_bbox_iou_success
+    aggregation: !function utils.hstarbench_aggregate_success
+    higher_is_better: true
+  - metric: hstarbench_bbox_iou
+    aggregation: !function utils.hstarbench_aggregate_bbox_iou
+    higher_is_better: true
+  - metric: hstarbench_has_answer_bbox
+    aggregation: !function utils.hstarbench_aggregate_has_answer_bbox
+    higher_is_better: true
