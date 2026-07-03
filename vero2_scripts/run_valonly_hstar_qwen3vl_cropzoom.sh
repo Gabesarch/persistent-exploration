@@ -35,7 +35,7 @@ HYDRA_ARGS=("$@")
 
 export HF_CACHE="${HF_CACHE:-$HF_HOME}"
 export MODEL_PATH="${MODEL_PATH:-$HF_CACHE/Qwen/Qwen3-VL-8B-Instruct}"
-VAL_FILE="/scratch/gpfs/ZHUANGL/shared/Hstarbench/data/verl/hstarbench_mixed_rl_val.verl.jsonl"
+VAL_FILE="/scratch/gpfs/ZHUANGL/shared/Hstarbench/data/verl/hstarbench_mixed_rl.verl.jsonl"
 SYSTEM_PROMPT="$VERL_ROOT/vero2_scripts/prompts/system_prompt_chatting_tool_calling.txt"
 
 if [ ! -f "$VAL_FILE" ]; then

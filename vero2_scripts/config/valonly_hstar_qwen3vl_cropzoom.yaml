@@ -13,8 +13,8 @@ algorithm:
     kl_coef: 0
 
 data:
-  train_files: /scratch/gpfs/ZHUANGL/shared/Hstarbench/data/verl/hstarbench_mixed_rl_train.verl.jsonl
-  val_files: /scratch/gpfs/ZHUANGL/shared/Hstarbench/data/verl/hstarbench_mixed_rl_val.verl.jsonl
+  train_files: /scratch/gpfs/ZHUANGL/shared/Hstarbench/data/verl/hstarbench_mixed_rl.verl.jsonl
+  val_files: /scratch/gpfs/ZHUANGL/shared/Hstarbench/data/verl/hstarbench_mixed_rl.verl.jsonl
   filter_overlong_prompts_workers: 64
   image_root: ${oc.env:IMAGE_ROOT}
   system_prompt: ${oc.env:VERL_ROOT}/vero2_scripts/prompts/system_prompt_chatting_tool_calling.txt

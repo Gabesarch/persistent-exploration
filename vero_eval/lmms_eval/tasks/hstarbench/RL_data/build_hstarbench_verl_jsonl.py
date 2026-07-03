@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Convert hstarbench JSONL (test/RL/SFT) to verl training/validation format."""
+"""Convert hstarbench JSONL (test/RL/SFT) to verl format (single merged file per split)."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import random
 import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
@@ -73,45 +72,23 @@ def _write_jsonl(rows: Iterable[Dict[str, Any]], out_path: Path) -> int:
     return n
 
 
-def _split_train_val(rows: List[Dict[str, Any]], val_ratio: float, seed: int) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    shuffled = list(rows)
-    rng = random.Random(seed)
-    rng.shuffle(shuffled)
-    if val_ratio <= 0:
-        return shuffled, []
-    val_n = max(1, int(len(shuffled) * val_ratio))
-    return shuffled[val_n:], shuffled[:val_n]
-
-
 def export_verl(
     *,
     src_path: Path,
     out_dir: Path,
     split_tag: str,
-    val_ratio: float,
-    seed: int,
     limit: int = 0,
-) -> Dict[str, int]:
+) -> int:
     rows = _load_rows(src_path)
     if limit > 0:
         rows = rows[:limit]
     verl_rows = [_to_verl_row(doc, split_tag=split_tag) for doc in rows]
-    train_rows, val_rows = _split_train_val(verl_rows, val_ratio, seed)
 
     stem = src_path.stem.replace("hstarbench_", "")
-    counts = {}
-    if train_rows:
-        train_path = out_dir / f"hstarbench_{stem}_train.verl.jsonl"
-        counts["train"] = _write_jsonl(train_rows, train_path)
-        print(f"Wrote {counts['train']} -> {train_path}")
-    if val_rows:
-        val_path = out_dir / f"hstarbench_{stem}_val.verl.jsonl"
-        counts["val"] = _write_jsonl(val_rows, val_path)
-        print(f"Wrote {counts['val']} -> {val_path}")
-    full_path = out_dir / f"hstarbench_{stem}.verl.jsonl"
-    counts["all"] = _write_jsonl(verl_rows, full_path)
-    print(f"Wrote {counts['all']} -> {full_path}")
-    return counts
+    out_path = out_dir / f"hstarbench_{stem}.verl.jsonl"
+    n = _write_jsonl(verl_rows, out_path)
+    print(f"Wrote {n} -> {out_path}")
+    return n
 
 
 def main() -> None:
@@ -124,8 +101,6 @@ def main() -> None:
     )
     p.add_argument("--bench-root", default=str(_DEFAULT_BENCH_ROOT))
     p.add_argument("--out-dir", default=str(_DEFAULT_OUT_DIR))
-    p.add_argument("--val-ratio", type=float, default=0.1, help="Hold-out ratio for val.verl.jsonl")
-    p.add_argument("--seed", type=int, default=42)
     p.add_argument("--limit", type=int, default=0)
     args = p.parse_args()
 
@@ -158,8 +133,6 @@ def main() -> None:
             src_path=src,
             out_dir=out_dir,
             split_tag=tag,
-            val_ratio=args.val_ratio,
-            seed=args.seed,
             limit=args.limit,
         )
 

@@ -68,6 +68,7 @@ During verl RL training, validation uses **in-loop** logic that differs from off
 ```bash
 # Build verl JSONL (one merged file per split; train/val split is up to you)
 python vero_eval/lmms_eval/tasks/hstarbench/build_hstarbench_verl_jsonl.py --source all
+# or: --source rl | --source sft
 
 # In-loop val-only smoke (8 GPU)
 bash vero2_scripts/run_valonly_hstar_qwen3vl_cropzoom.sh
