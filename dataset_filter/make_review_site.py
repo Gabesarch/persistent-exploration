@@ -471,7 +471,7 @@ pre{background:#0d1117;color:#e6edf3;border-radius:8px;padding:12px 14px;overflo
 <li>Your main job: <b>Keep</b> if the labeled count is believable; <b>Drop</b> if it is clearly wrong (required for a card to count as reviewed). The <b>confident count</b> is optional — enter a number only if you are 100% sure of the exact count (leave blank otherwise); a note is optional too.</li>
 </ol>
 <h2>Two ways to open your shard</h2>
-<p><b>A. Download the single HTML file.</b> Everything (images included) is embedded, so you can download your <code>review_&lt;name&gt;.html</code> and open it locally in any browser — no server, no Della session needed while reviewing. When done, click <b>Export JSON</b> and send the file back.</p>
+<p><b>A. Open the single HTML file.</b> Your shard is one self-contained file, <code>review_&lt;name&gt;.html</code>, in this folder (<code>__OUTDIR__</code>). Either have the coordinator send it to you (no Della needed), or in VS Code's Della explorer right-click it &rarr; <b>Download</b>. Open it in any browser; when done, click <b>Export JSON</b> and send the file back. (The reviewer cards above link to each file.)</p>
 <p><b>B. Serve from a Della login node + VS Code port-forward (submit straight back).</b></p>
 <pre>ssh &lt;netid&gt;@della.princeton.edu
 cd __OUTDIR__
