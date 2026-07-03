@@ -63,6 +63,7 @@ auditor** that is explicitly told *hard ≠ wrong* returns:
 | `cost_estimate.py` | project $ to filter a full split from measured tokens |
 | `make_report.py` / `make_exam_report.py` / `make_compare_report.py` | HTML reports; `make_exam_report` is GT-neutral + zoomable for manual audit |
 | `make_review_site.py` | builds the **PLAUSIBLE-tier manual-review site** — one self-contained HTML per reviewer with keep/drop + corrected-count capture and JSON export ([below](#manual-review-of-the-plausible-tier)) |
+| `serve_review.py` | stdlib server for the review site with a `POST /submit` upload endpoint, so reviewers submit straight to scratch instead of downloading + re-uploading |
 | `merge_reviews.py` | merges the reviewers' exported JSONs → an override decisions file `filter_apply.py` consumes |
 | `../.claude/commands/gt-filter.md` | the `/gt-filter` slash command that drives the whole flow |
 
@@ -143,24 +144,29 @@ the auto verdict). Reviewer-supplied **corrected counts** are written to `gt_cor
 (with the labeled count) so a wrong-GT-but-keep example isn't silently shipped on the old GT;
 `filter_apply.py` keeps each source record's GT as-is, so apply those corrections as a separate step.
 
-### Two ways to open your shard
-Everything (images included) is embedded, so a reviewer needs **no GPU and no running server**
-to review — only to fetch the file once.
+### Two ways for a reviewer to open their shard
+Everything (images included) is embedded, so a reviewer needs **no GPU** to review. A concise
+reviewer-facing guide lives in `REVIEWING.md` (copied into the deploy dir next to the HTML).
 
-**A. Download the single HTML file.** From VS Code's Della explorer (or `scp`), download your
-`manual_review/review_<name>.html` and open it in any local browser. Work through it offline;
-your progress lives in that browser's `localStorage`. When done, click **Export decisions JSON**.
+**A. Download the single HTML file (offline).** From VS Code's Della explorer (or `scp`), download
+`manual_review/review_<name>.html` and open it in any local browser. Progress lives in that
+browser's `localStorage`. When done, click **Export JSON** and send the file back for merging.
 
-**B. Serve the folder from a Della login node + VS Code port-forward.**
+**B. Serve from a Della login node + VS Code port-forward (submit straight back).**
 ```bash
 ssh <netid>@della.princeton.edu
 cd /scratch/gpfs/ZHUANGL/lc1556/vero2/dataset_filter_runs/full_sync/manual_review
-python -m http.server 8000                 # any free port
-# VS Code (Remote-SSH to della): Ports panel → Forward a Port → 8000,
-# then open http://localhost:8000/ in your local browser → click your name
+python serve_review.py                     # prints the localhost URL + port to forward
+# VS Code (Remote-SSH to della): Ports panel → Forward the printed port,
+# open http://localhost:<port>/ → click your name. When done, click "Submit to Della".
 ```
-The site is written **group `zhuangl`-readable** (`chmod -R g+rX`), so anyone in the group can
-download or serve the same folder. `index.html` restates these recipes and the review rubric.
+`serve_review.py` is a stdlib server: it serves the site **and** accepts `POST /submit`, writing
+`exports/review_<name>.json` straight into the folder — no download/re-upload. It binds to
+localhost (SSH-tunnel-only) and the submit filename is sanitized to `review_<slug>.json`, so a
+submit can never escape `exports/`. The site is **group `zhuangl`-readable** and `exports/` is
+setgid + group-writable, so all four reviewers (each running their own `serve_review.py`) submit
+into one place; the coordinator collects them and runs `merge_reviews.py`. `index.html` restates
+these recipes; the page's **Export JSON** button is the offline fallback if there's no server.
 
 ## Filter a new dataset
 No code changes — the pipeline is dataset-agnostic. To filter `mydata`:

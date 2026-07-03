@@ -290,7 +290,8 @@ body.hideReviewed .card.reviewed{display:none}
     <span class="progwrap"><span class="progbar" id="pbar"></span></span>
     <label class="filterlbl"><input type="checkbox" id="fhide" onchange="toggleHide(this.checked)"> hide reviewed</label>
     <button type="button" onclick="jumpNext()">next unreviewed</button>
-    <button type="button" class="primary" onclick="exportJSON()">Export decisions JSON</button>
+    <button type="button" class="primary" onclick="submitToServer()">Submit to Della</button>
+    <button type="button" onclick="exportJSON()">Export JSON</button>
     <button type="button" onclick="showHelp()">help</button>
   </div>
 </header>
@@ -363,14 +364,24 @@ function toggleMarks(btn){
 function toast(m){var t=document.getElementById('toast');t.textContent=m;t.classList.add('show');
   clearTimeout(t._h);t._h=setTimeout(function(){t.classList.remove('show');},2200);}
 
+function buildPayload(){return {reviewer:REVIEWER,exported_at:new Date().toISOString(),
+  n_reviewed:reviewedCount(),n_total:TOTAL,decisions:pageDecisions()};}
 function exportJSON(){
-  var out={reviewer:REVIEWER,exported_at:new Date().toISOString(),
-           n_reviewed:reviewedCount(),n_total:TOTAL,decisions:pageDecisions()};
-  var blob=new Blob([JSON.stringify(out,null,2)],{type:'application/json'});
+  var blob=new Blob([JSON.stringify(buildPayload(),null,2)],{type:'application/json'});
   var url=URL.createObjectURL(blob),a=document.createElement('a');
   a.href=url;a.download='review_'+SLUG+'.json';document.body.appendChild(a);a.click();
   document.body.removeChild(a);URL.revokeObjectURL(url);
   toast('exported '+reviewedCount()+'/'+TOTAL+' decisions');
+}
+// Submit straight to Della when the page is served by serve_review.py; if there's no
+// upload server (e.g. the file was opened locally), fall back to the JSON download.
+function submitToServer(){
+  fetch('submit',{method:'POST',headers:{'Content-Type':'application/json'},
+                  body:JSON.stringify(buildPayload())})
+    .then(function(r){return r.json();})
+    .then(function(j){ if(j&&j.ok){toast('✓ submitted '+j.n_reviewed+'/'+TOTAL+' to Della → '+j.file);}
+      else{toast('submit failed: '+((j&&j.error)||'?')+' — use Export JSON instead');} })
+    .catch(function(){toast('no upload server — downloading JSON instead');exportJSON();});
 }
 var SLUG=__SLUG_JSON__;
 function showHelp(){alert(
@@ -379,7 +390,8 @@ function showHelp(){alert(
   '2. KEEP if the dataset\\'s labeled count is believable; DROP if it is clearly wrong.\\n'+
   '3. Optionally type the CORRECTED COUNT and a note.\\n'+
   '4. Progress is saved in this browser (localStorage). Refreshing is safe.\\n'+
-  '5. Click \"Export decisions JSON\" and send the downloaded file back for merging.\\n\\n'+
+  '5. When done: click \"Submit to Della\" (if serving via serve_review.py) to save straight\\n'+
+  '   to exports/, or \"Export JSON\" to download the file and send it back for merging.\\n\\n'+
   'Keys: k=keep, d=drop, j/n=next unreviewed, z=zoom focused image.');}
 
 document.addEventListener('keydown',function(ev){
@@ -447,7 +459,7 @@ pre{background:#0d1117;color:#e6edf3;border-radius:8px;padding:12px 14px;overflo
 <main>
 <h2>Your shard</h2>
 <div class="grid">__LINKS__</div>
-<div class="note">Progress is stored per-page in your browser (<code>localStorage</code>). Work through your shard, then click <b>Export decisions JSON</b> and send the downloaded <code>review_&lt;name&gt;.json</code> back for merging. Refreshing the page is safe; your decisions survive.</div>
+<div class="note">Progress is stored per-page in your browser (<code>localStorage</code>) — refreshing is safe. When done: if you opened your shard via <b>serve_review.py</b> (recipe B), click <b>Submit to Della</b> and it saves straight to <code>exports/review_&lt;name&gt;.json</code>; otherwise click <b>Export JSON</b> and send the downloaded file back for merging.</div>
 <h2>What you're doing</h2>
 <ol>
 <li>Each card shows an image, the question, and the dataset's <b>labeled count</b> — the number we are auditing (it is <b>not</b> trusted ground truth).</li>
@@ -455,14 +467,14 @@ pre{background:#0d1117;color:#e6edf3;border-radius:8px;padding:12px 14px;overflo
 <li><b>Keep</b> if the labeled count is believable; <b>Drop</b> if it is clearly wrong. Optionally record a <b>corrected count</b> and a note. Keep/Drop is required for a card to count as reviewed.</li>
 </ol>
 <h2>Two ways to open your shard</h2>
-<p><b>A. Download the single HTML file.</b> Everything (images included) is embedded, so you can download your <code>review_&lt;name&gt;.html</code> and open it locally in any browser — no server, no Della session needed while reviewing.</p>
-<p><b>B. Serve the folder from a Della login node + VS Code port-forward.</b></p>
+<p><b>A. Download the single HTML file.</b> Everything (images included) is embedded, so you can download your <code>review_&lt;name&gt;.html</code> and open it locally in any browser — no server, no Della session needed while reviewing. When done, click <b>Export JSON</b> and send the file back.</p>
+<p><b>B. Serve from a Della login node + VS Code port-forward (submit straight back).</b></p>
 <pre>ssh &lt;netid&gt;@della.princeton.edu
 cd __OUTDIR__
-python -m http.server 8000          # pick any free port
-# In VS Code (Remote-SSH to della): Ports panel -> Forward Port -> 8000
-# then open http://localhost:8000/  in your local browser</pre>
-<p class="note">The files are group <code>zhuangl</code>-readable, so anyone in the group can serve this same folder.</p>
+python serve_review.py              # prints the localhost URL + port
+# VS Code (Remote-SSH to della): Ports panel -> Forward the printed port,
+# open the URL, click your name. When done, click "Submit to Della".</pre>
+<p class="note">With recipe B, <b>Submit to Della</b> writes <code>exports/review_&lt;name&gt;.json</code> directly into this folder — no download/re-upload. The site + <code>serve_review.py</code> are group <code>zhuangl</code>-readable and <code>exports/</code> is group-writable, so all four reviewers submit to one place.</p>
 </main></body></html>"""
 
 
