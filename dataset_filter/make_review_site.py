@@ -211,15 +211,16 @@ def card_html(rec: dict, clean: str, marked, n_marks: int) -> str:
     <div class="sub">id={html.escape(eid)}<br>img: {path}</div>
   </div>
   <div class="right">
+    <div class="declabel">your call</div>
     <div class="decision">
       <button type="button" class="keep" data-act="keep" onclick="setDecision('{html.escape(eid)}','keep')">✓ keep</button>
       <button type="button" class="drop" data-act="drop" onclick="setDecision('{html.escape(eid)}','drop')">✕ drop</button>
     </div>
-    <label class="cc">corrected count
-      <input type="number" step="1" inputmode="numeric" placeholder="(if labeled count is wrong)"
+    <label class="cc">confident count <span class="opt">optional — only if 100% sure</span>
+      <input type="number" step="1" inputmode="numeric" placeholder="leave blank unless certain"
              oninput="setCount('{html.escape(eid)}',this.value)"></label>
-    <label class="nt">note
-      <textarea rows="2" placeholder="(optional)" oninput="setNote('{html.escape(eid)}',this.value)"></textarea></label>
+    <label class="nt">note <span class="opt">optional</span>
+      <textarea rows="2" placeholder="" oninput="setNote('{html.escape(eid)}',this.value)"></textarea></label>
     <button type="button" class="clear" onclick="clearCard('{html.escape(eid)}')">clear</button>
   </div>
 </div>"""
@@ -274,7 +275,9 @@ body.hideReviewed .card.reviewed{display:none}
 .decision button{flex:1;padding:9px 0;border-radius:8px;border:2px solid var(--bd);background:#fff;font-weight:700;font-size:14px;cursor:pointer}
 .decision .keep.on{background:var(--keep);border-color:var(--keep);color:#fff}
 .decision .drop.on{background:var(--drop);border-color:var(--drop);color:#fff}
+.declabel{font-size:11px;font-weight:700;color:#57606a;text-transform:uppercase;letter-spacing:.04em}
 .right label{font-size:12px;color:#57606a;display:flex;flex-direction:column;gap:3px}
+.right label .opt{font-weight:400;color:var(--mut);font-size:10.5px;text-transform:none;letter-spacing:0}
 .right input,.right textarea{font-size:13px;padding:5px 7px;border:1px solid var(--bd);border-radius:6px;font-family:inherit;resize:vertical}
 .clear{align-self:flex-start;font-size:11px;padding:2px 8px;border:1px solid var(--bd);border-radius:6px;background:var(--bg);color:#57606a;cursor:pointer}
 #lb{display:none;position:fixed;inset:0;background:rgba(0,0,0,.94);z-index:99;overflow:auto;cursor:zoom-out;text-align:center}
@@ -295,7 +298,7 @@ body.hideReviewed .card.reviewed{display:none}
     <button type="button" onclick="showHelp()">help</button>
   </div>
 </header>
-<div class="tip">The <b>labeled count</b> is the dataset's number — the thing you are auditing, <b>not</b> trusted ground truth. Count the image yourself (zoom, toggle GT marks), then <b>keep</b> if the labeled count is believable or <b>drop</b> if it's wrong. Add a <b>corrected count</b> when you know the right number. Keys: <b>k</b>=keep, <b>d</b>=drop, <b>j</b>/<b>n</b>=next, <b>z</b>=zoom.</div>
+<div class="tip">The <b>labeled count</b> is the dataset's number — the thing you are auditing, <b>not</b> trusted ground truth. Count the image yourself (zoom, toggle GT marks), then — your main job — <b>keep</b> if the labeled count is believable or <b>drop</b> if it's wrong. The <b>confident count</b> is optional: only fill it in if you're <b>100% sure</b> of the exact number (leave blank otherwise). Keys: <b>k</b>=keep, <b>d</b>=drop, <b>j</b>/<b>n</b>=next, <b>z</b>=zoom.</div>
 <main id="cards">
 __CARDS__
 </main>
@@ -310,7 +313,7 @@ try{STATE=JSON.parse(localStorage.getItem(STORAGE_KEY))||{};}catch(e){STATE={};}
 var focusEl=null;
 
 function save(){try{localStorage.setItem(STORAGE_KEY,JSON.stringify(STATE));}catch(e){toast('localStorage full/blocked — export often!');}}
-function ent(id){return STATE[id]||(STATE[id]={decision:null,corrected_count:null,note:""});}
+function ent(id){return STATE[id]||(STATE[id]={decision:null,confident_count:null,note:""});}
 function cardEl(id){return document.querySelector('.card[data-id="'+CSS.escape(id)+'"]');}
 
 function paint(id){
@@ -325,7 +328,7 @@ function setDecision(id,act){
 }
 function setCount(id,v){
   var e=ent(id);v=v.trim();
-  e.corrected_count=(v===''?null:(isNaN(parseInt(v,10))?null:parseInt(v,10)));save();
+  e.confident_count=(v===''?null:(isNaN(parseInt(v,10))?null:parseInt(v,10)));save();
 }
 function setNote(id,v){ent(id).note=v;save();}
 function clearCard(id){
@@ -387,8 +390,9 @@ var SLUG=__SLUG_JSON__;
 function showHelp(){alert(
   'PLAUSIBLE manual review — '+REVIEWER+'\\n\\n'+
   '1. For each card, count the objects yourself (zoom in; toggle GT marks to check the annotation).\\n'+
-  '2. KEEP if the dataset\\'s labeled count is believable; DROP if it is clearly wrong.\\n'+
-  '3. Optionally type the CORRECTED COUNT and a note.\\n'+
+  '2. Your main job: KEEP if the dataset\\'s labeled count is believable; DROP if it is clearly wrong.\\n'+
+  '3. The CONFIDENT COUNT is optional — only enter a number if you are 100% sure of the exact\\n'+
+  '   count (leave blank if unsure). A note is optional too.\\n'+
   '4. Progress is saved in this browser (localStorage). Refreshing is safe.\\n'+
   '5. When done: click \"Submit to Della\" (if serving via serve_review.py) to save straight\\n'+
   '   to exports/, or \"Export JSON\" to download the file and send it back for merging.\\n\\n'+
@@ -408,7 +412,7 @@ document.querySelectorAll('.card').forEach(function(c){
 // hydrate UI from saved STATE
 document.querySelectorAll('.card').forEach(function(c){
   var id=c.dataset.id,e=STATE[id];if(!e)return;
-  if(e.corrected_count!=null){var i=c.querySelector('input[type=number]');if(i)i.value=e.corrected_count;}
+  if(e.confident_count!=null){var i=c.querySelector('input[type=number]');if(i)i.value=e.confident_count;}
   if(e.note){var tx=c.querySelector('textarea');if(tx)tx.value=e.note;}
   paint(id);
 });
@@ -464,7 +468,7 @@ pre{background:#0d1117;color:#e6edf3;border-radius:8px;padding:12px 14px;overflo
 <ol>
 <li>Each card shows an image, the question, and the dataset's <b>labeled count</b> — the number we are auditing (it is <b>not</b> trusted ground truth).</li>
 <li>Count the objects yourself. Zoom in (click the image); toggle the magenta <b>GT marks</b> to see where the annotation placed points.</li>
-<li><b>Keep</b> if the labeled count is believable; <b>Drop</b> if it is clearly wrong. Optionally record a <b>corrected count</b> and a note. Keep/Drop is required for a card to count as reviewed.</li>
+<li>Your main job: <b>Keep</b> if the labeled count is believable; <b>Drop</b> if it is clearly wrong (required for a card to count as reviewed). The <b>confident count</b> is optional — enter a number only if you are 100% sure of the exact count (leave blank otherwise); a note is optional too.</li>
 </ol>
 <h2>Two ways to open your shard</h2>
 <p><b>A. Download the single HTML file.</b> Everything (images included) is embedded, so you can download your <code>review_&lt;name&gt;.html</code> and open it locally in any browser — no server, no Della session needed while reviewing. When done, click <b>Export JSON</b> and send the file back.</p>

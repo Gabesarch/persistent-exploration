@@ -20,8 +20,8 @@ In VS Code (Remote-SSH to Della): **Ports → Forward** the printed port → ope
 
 - Count the objects yourself. Click the image to **zoom**; toggle **GT marks** to see where the
   annotation placed its points (magenta rings; shown only where the image has point annotations).
-- **Keep** if the labeled count is believable · **Drop** if it's clearly wrong.
-- Optional: type a **corrected count** and/or a note.
+- **Keep** if the labeled count is believable · **Drop** if it's clearly wrong. *(this is the main call)*
+- Optional **confident count**: enter a number **only if you're 100% sure** of the exact count (leave blank otherwise). A note is optional too.
 - Keys: `k` keep · `d` drop · `j`/`n` next unreviewed · `z` zoom.
 - Progress auto-saves in your browser (`localStorage`) — refreshing is safe.
 

@@ -1,14 +1,17 @@
 #!/usr/bin/env python
 """Merge the exported human-review JSONs into a decisions file `filter_apply.py` consumes.
 
-Each reviewer's site (`make_review_site.py`) exports a JSON like
+The primary job of the review is keep vs drop. Each reviewer's site (`make_review_site.py`)
+exports a JSON like
   {"reviewer": "...", "exported_at": "...", "decisions": {"<id>": {"decision":"keep|drop",
-   "corrected_count": <int|null>, "note": "..."}}}
-This tool combines the (typically 4) exports, reports coverage + any conflicts, and writes:
+   "confident_count": <int|null>, "note": "..."}}}
+where confident_count is an OPTIONAL count the reviewer is 100% sure of (may confirm or correct
+the labeled count). This tool combines the (typically 4) exports, reports coverage + conflicts, and writes:
 
   1. a merged human-decisions map keyed by id (`--merged-out`, an audit/portable summary),
-  2. `gt_corrections.jsonl` — every reviewer-supplied corrected count (kept, dropped, or
-     count-only rows), so a wrong-GT-but-keep example isn't silently shipped on the old GT, and
+  2. `confident_counts.jsonl` — every reviewer-supplied confident count with the labeled count and
+     a `differs` flag (differs=true → a real GT-correction candidate), so a wrong-GT-but-keep
+     example isn't silently shipped on the old GT, and
   3. the **override decisions JSONL** (`--decisions-out`) that `filter_apply.py` reads: it is the
      base `decisions.jsonl` with every human-reviewed PLAUSIBLE row overridden —
         keep -> keep=True,  verdict stays PLAUSIBLE      (still classified KEEP)
@@ -19,9 +22,9 @@ This tool combines the (typically 4) exports, reports coverage + any conflicts, 
 Fail-closed, like the rest of the filter: conflicting decisions error out (--allow-conflicts),
 reviewed ids that aren't a PLAUSIBLE tier row in --base error out (the exports don't match the
 base), and an incompletely-reviewed tier errors out unless --allow-incomplete (which then tags
-the output *.partial* and passes unreviewed rows through on the auto verdict). corrected_count
-is captured but not auto-written into the dataset GT (filter_apply stays generic — apply
-gt_corrections.jsonl separately).
+the output *.partial* and passes unreviewed rows through on the auto verdict). confident_count is
+captured but not auto-written into the dataset GT (filter_apply stays generic — apply the
+`differs` rows of confident_counts.jsonl separately). Old exports' `corrected_count` is still read.
 
   python merge_reviews.py review_chris-cai.json review_gabe-sarch.json \
       review_yipeng-zhang.json review_haoyang-wu.json \
@@ -41,7 +44,7 @@ TERMINAL = {"keep", "drop"}
 
 
 def load_review(path: str):
-    """-> (reviewer, {id: {decision, corrected_count, note}})."""
+    """-> (reviewer, {id: {decision, confident_count|corrected_count, note}})."""
     obj = json.load(open(path))
     if not isinstance(obj, dict) or "decisions" not in obj:
         sys.exit(f"[merge] FATAL: {path} is not a review export (no 'decisions' key)")
@@ -90,14 +93,16 @@ def main():
                     help="proceed when the tier is not fully reviewed (default: error out, "
                          "fail-closed). Emits a *.partial.* decisions file; unreviewed rows "
                          "pass through on the auto verdict.")
-    ap.add_argument("--gt-corrections-out", default=None,
-                    help="output JSONL of reviewer-supplied corrected counts (default: "
-                         "alongside --decisions-out as gt_corrections.jsonl)")
+    ap.add_argument("--counts-out", default=None,
+                    help="output JSONL of reviewer-supplied confident counts (default: "
+                         "alongside --decisions-out as confident_counts.jsonl)")
     args = ap.parse_args()
 
     # ---- 1. load + merge exports (track provenance + incomplete signals) ----
-    merged = {}                      # id -> {reviewer, decision, corrected_count, note}
-    incomplete = {}                  # id -> {reviewer, corrected_count, note}  (count/note, no keep/drop)
+    # confident_count = a count the reviewer is 100% sure of (optional; may confirm OR
+    # correct the labeled count). Read the new key, fall back to the old corrected_count.
+    merged = {}                      # id -> {reviewer, decision, confident_count, note}
+    incomplete = {}                  # id -> {reviewer, confident_count, note}  (count/note, no keep/drop)
     per_reviewer = defaultdict(lambda: {"keep": 0, "drop": 0, "incomplete": 0, "file": None})
     conflicts = []
     for path in args.reviews:
@@ -106,33 +111,33 @@ def main():
         for rid, d in dec.items():
             d = d or {}
             decision = d.get("decision")
-            cc = norm_count(d.get("corrected_count"))
+            cc = norm_count(d.get("confident_count", d.get("corrected_count")))
             note = d.get("note") or ""
             if decision not in TERMINAL:
                 # touched but not decided (a note/count with no keep/drop) — captured,
                 # never silently folded into the auto keep
                 if cc is not None or note:
                     per_reviewer[reviewer]["incomplete"] += 1
-                    incomplete[rid] = {"reviewer": reviewer, "corrected_count": cc, "note": note}
+                    incomplete[rid] = {"reviewer": reviewer, "confident_count": cc, "note": note}
                 continue
             per_reviewer[reviewer][decision] += 1
             if rid in merged and merged[rid]["decision"] != decision:
                 conflicts.append((rid, merged[rid], {"reviewer": reviewer, "decision": decision}))
             merged[rid] = {"reviewer": reviewer, "decision": decision,
-                           "corrected_count": cc, "note": note}
+                           "confident_count": cc, "note": note}
 
     # ---- 2. report ----
     n_keep = sum(1 for v in merged.values() if v["decision"] == "keep")
     n_drop = sum(1 for v in merged.values() if v["decision"] == "drop")
-    n_corr = sum(1 for v in merged.values() if v["corrected_count"] is not None)
+    n_conf = sum(1 for v in merged.values() if v["confident_count"] is not None)
     print(f"[merge] {len(args.reviews)} export(s) -> {len(merged)} reviewed ids "
-          f"(keep={n_keep}, drop={n_drop}, with corrected_count={n_corr})")
+          f"(keep={n_keep}, drop={n_drop}, with confident_count={n_conf})")
     for reviewer, s in per_reviewer.items():
         inc = f", incomplete={s['incomplete']}" if s["incomplete"] else ""
         print(f"    {reviewer}: keep={s['keep']} drop={s['drop']}{inc}  [{Path(s['file']).name}]")
     if incomplete:
-        print(f"[merge] {len(incomplete)} id(s) have a corrected_count/note but no keep/drop "
-              f"(NOT counted as reviewed; captured in gt_corrections)")
+        print(f"[merge] {len(incomplete)} id(s) have a confident_count/note but no keep/drop "
+              f"(NOT counted as reviewed; captured in confident_counts)")
 
     # conflicts are decided regardless of --base
     if conflicts:
@@ -189,8 +194,8 @@ def main():
         decisions_out = decisions_out.with_suffix(".partial" + decisions_out.suffix)
     merged_out = Path(args.merged_out) if args.merged_out else \
         decisions_out.with_name("reviews_merged.json")
-    gt_out = Path(args.gt_corrections_out) if args.gt_corrections_out else \
-        decisions_out.with_name("gt_corrections.jsonl")
+    counts_out = Path(args.counts_out) if args.counts_out else \
+        decisions_out.with_name("confident_counts.jsonl")
     decisions_out.parent.mkdir(parents=True, exist_ok=True)
 
     # ---- 5. write merged human-decisions map (keyed by id) ----
@@ -201,23 +206,23 @@ def main():
          "decisions": merged, "incomplete": incomplete}, indent=2))
     print(f"[merge] wrote merged human decisions -> {merged_out}")
 
-    # ---- 6. write GT-correction candidates (kept/dropped/incomplete rows w/ a corrected count) ----
-    gt_rows = []
-    for rid, hv in merged.items():
-        if hv["corrected_count"] is not None:
-            gt_rows.append({"id": rid, "labeled_count": base_by_id.get(rid, {}).get("ground_truth"),
-                            "corrected_count": hv["corrected_count"], "decision": hv["decision"],
-                            "reviewer": hv["reviewer"], "note": hv["note"]})
-    for rid, iv in incomplete.items():
-        if iv["corrected_count"] is not None:
-            gt_rows.append({"id": rid, "labeled_count": base_by_id.get(rid, {}).get("ground_truth"),
-                            "corrected_count": iv["corrected_count"], "decision": None,
-                            "reviewer": iv["reviewer"], "note": iv["note"]})
+    # ---- 6. write confident counts (100%-sure counts; `differs` flags a real GT correction) ----
+    def count_row(rid, cc, decision, reviewer, note):
+        labeled = base_by_id.get(rid, {}).get("ground_truth")
+        return {"id": rid, "labeled_count": labeled, "confident_count": cc,
+                "differs": (labeled is not None and cc != labeled),
+                "decision": decision, "reviewer": reviewer, "note": note}
+    gt_rows = [count_row(rid, hv["confident_count"], hv["decision"], hv["reviewer"], hv["note"])
+               for rid, hv in merged.items() if hv["confident_count"] is not None]
+    gt_rows += [count_row(rid, iv["confident_count"], None, iv["reviewer"], iv["note"])
+                for rid, iv in incomplete.items() if iv["confident_count"] is not None]
+    n_differ = sum(1 for r in gt_rows if r["differs"])
     if gt_rows:
-        with open(gt_out, "w") as f:
+        with open(counts_out, "w") as f:
             for row in gt_rows:
                 f.write(json.dumps(row) + "\n")
-        print(f"[merge] wrote {len(gt_rows)} GT-correction candidate(s) -> {gt_out}")
+        print(f"[merge] wrote {len(gt_rows)} confident count(s) ({n_differ} differ from the "
+              f"labeled count) -> {counts_out}")
 
     # ---- 7. write the filter_apply-consumable override decisions JSONL ----
     flipped = []  # human DROPs = the ids whose keep/drop differs from the auto run
@@ -252,10 +257,10 @@ def main():
     print(f"[merge] wrote override decisions -> {decisions_out}  ({n_lines} rows)")
     print(f"[merge] human DROPs flip {len(flipped)} id(s) kept->dropped vs the auto run"
           + (f": {flipped[:8]}{'…' if len(flipped) > 8 else ''}" if flipped else ""))
-    if gt_rows:
-        print(f"[merge] NOTE: {len(gt_rows)} row(s) carry a corrected_count. filter_apply keeps "
-              f"each kept record's source GT unchanged — apply {gt_out.name} to the dataset as a "
-              f"separate GT-correction step if desired.")
+    if n_differ:
+        print(f"[merge] NOTE: {n_differ} confident count(s) differ from the labeled count "
+              f"(GT-correction candidates in {counts_out.name}). filter_apply keeps each kept "
+              f"record's source GT unchanged — apply them to the dataset as a separate step if desired.")
     if args.no_base:
         print("[merge] NOTE: --no-base output omits ground_truth/question/etc, so filter_apply's "
               "dropped_*.jsonl audit will be sparse. Prefer base mode for a full drop audit.")

@@ -62,7 +62,7 @@ auditor** that is explicitly told *hard ≠ wrong* returns:
 | `compare_runs.py` | diff two decision files (keep rate, verdict flips, overrides) |
 | `cost_estimate.py` | project $ to filter a full split from measured tokens |
 | `make_report.py` / `make_exam_report.py` / `make_compare_report.py` | HTML reports; `make_exam_report` is GT-neutral + zoomable for manual audit |
-| `make_review_site.py` | builds the **PLAUSIBLE-tier manual-review site** — one self-contained HTML per reviewer with keep/drop + corrected-count capture and JSON export ([below](#manual-review-of-the-plausible-tier)) |
+| `make_review_site.py` | builds the **PLAUSIBLE-tier manual-review site** — one self-contained HTML per reviewer with keep/drop (+ an optional 100%-confident count) and JSON export ([below](#manual-review-of-the-plausible-tier)) |
 | `serve_review.py` | stdlib server for the review site with a `POST /submit` upload endpoint, so reviewers submit straight to scratch instead of downloading + re-uploading |
 | `merge_reviews.py` | merges the reviewers' exported JSONs → an override decisions file `filter_apply.py` consumes |
 | `../.claude/commands/gt-filter.md` | the `/gt-filter` slash command that drives the whole flow |
@@ -102,9 +102,10 @@ splits the ids deterministically across the reviewers, and emits **one self-cont
 page per reviewer** + an `index.html` hub. Each page embeds its images as base64 JPEGs (no
 server needed to view), shows the question, the neutrally-labeled count (the thing being
 audited — *not* trusted GT), the source/category, and both model passes (blind + verify), with
-a clean/GT-points toggle and a click-to-zoom lightbox. The reviewer records **keep / drop**
-(required to count as reviewed), an optional **corrected count**, and a note; decisions persist
-in `localStorage` keyed by record id (refresh-safe) and download via **Export decisions JSON**.
+a clean/GT-points toggle and a click-to-zoom lightbox. The main job is **keep / drop** (required
+to count as reviewed); a **confident count** (fill in only if 100% sure of the exact number) and a
+note are optional. Decisions persist in `localStorage` keyed by record id (refresh-safe) and
+download via **Export JSON** (or **Submit to Della**, below).
 `merge_reviews.py` folds the exports back into a decisions file `filter_apply.py` re-applies.
 
 ```bash
@@ -140,9 +141,10 @@ rows on the auto verdict, so re-applying flips exactly the human-dropped ids. Li
 filter it is **fail-closed**: it errors out if a reviewed id isn't a PLAUSIBLE row in `--base`
 (the exports don't match the base) or if the tier isn't fully reviewed — pass `--allow-incomplete`
 to proceed on a partial review (the output is then tagged `*.partial*` and unreviewed rows keep
-the auto verdict). Reviewer-supplied **corrected counts** are written to `gt_corrections.jsonl`
-(with the labeled count) so a wrong-GT-but-keep example isn't silently shipped on the old GT;
-`filter_apply.py` keeps each source record's GT as-is, so apply those corrections as a separate step.
+the auto verdict). Reviewer-supplied **confident counts** (optional, only when 100% sure) are
+written to `confident_counts.jsonl` with the labeled count and a `differs` flag — a `differs`
+row is a real GT-correction candidate. `filter_apply.py` keeps each source record's GT as-is, so
+apply the `differs` rows as a separate step if you want to correct GT later.
 
 ### Two ways for a reviewer to open their shard
 Everything (images included) is embedded, so a reviewer needs **no GPU** to review. A concise
