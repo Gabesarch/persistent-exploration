@@ -62,6 +62,11 @@ auditor** that is explicitly told *hard ≠ wrong* returns:
 | `compare_runs.py` | diff two decision files (keep rate, verdict flips, overrides) |
 | `cost_estimate.py` | project $ to filter a full split from measured tokens |
 | `make_report.py` / `make_exam_report.py` / `make_compare_report.py` | HTML reports; `make_exam_report` is GT-neutral + zoomable for manual audit |
+| `review_site/` | the **PLAUSIBLE-tier manual-review** tooling (separate from the filter above), see [below](#manual-review-of-the-plausible-tier): |
+| &nbsp;&nbsp;`review_site/make_review_site.py` | builds one self-contained HTML per reviewer — keep/drop (+ an optional 100%-confident count) + JSON export |
+| &nbsp;&nbsp;`review_site/serve_review.py` | stdlib server for the site with a `POST /submit` upload endpoint, so reviewers submit straight to scratch |
+| &nbsp;&nbsp;`review_site/merge_reviews.py` | merges the reviewers' exported JSONs → an override decisions file `filter_apply.py` consumes |
+| &nbsp;&nbsp;`review_site/REVIEWING.md` | concise reviewer-facing guide (deployed next to the HTML) |
 | `../.claude/commands/gt-filter.md` | the `/gt-filter` slash command that drives the whole flow |
 
 ## Quick use (synchronous — the working path today)
@@ -88,6 +93,84 @@ $PY filter_apply.py --data-dir "$DATA" --dataset combined_counting --local-meta 
     --decisions "$RUNS/combined_counting_train.jsonl" --splits train --out-dir "$RUNS/filtered"
 ```
 Or just run `/gt-filter 200` → `/gt-filter 0 --effort high --apply` for the full split.
+
+## Manual review of the PLAUSIBLE tier
+
+`PLAUSIBLE` is the "GT is believable but unverifiable" middle band the auto-filter keeps —
+the valuable hard examples that separate the standard tier (`CORRECT` + `PLAUSIBLE`) from a
+strict correct-only tier. To put a **human** verdict on those, `make_review_site.py` builds a
+manual-review website: it reads the run's `decisions.jsonl`, keeps `verdict == PLAUSIBLE`,
+splits the ids deterministically across the reviewers, and emits **one self-contained HTML
+page per reviewer** + an `index.html` hub. Each page embeds its images as base64 JPEGs (no
+server needed to view), shows the question, the neutrally-labeled count (the thing being
+audited — *not* trusted GT), the source/category, and both model passes (blind + verify), with
+a clean/GT-points toggle and a click-to-zoom lightbox. The main job is **keep / drop** (required
+to count as reviewed); a **confident count** (fill in only if 100% sure of the exact number) and a
+note are optional. Decisions persist in `localStorage` keyed by record id (refresh-safe) and
+download via **Export JSON** (or **Submit to Della**, below).
+`merge_reviews.py` folds the exports back into a decisions file `filter_apply.py` re-applies.
+
+```bash
+PY=/scratch/gpfs/ZHUANGL/lc1556/conda/envs/reason-vlm/bin/python
+RUNS=/scratch/gpfs/ZHUANGL/lc1556/vero2/dataset_filter_runs/full_sync
+DATA=/scratch/gpfs/ZHUANGL/lc1556/vero2/datasets/combined_counting_hq
+cd /home/lc1556/repo/reason-vlm/vero2/dataset_filter   # filter_apply.py here; review tools in review_site/
+
+# 1. generate the 4-reviewer site + install the server/guide into the deploy dir
+$PY review_site/make_review_site.py                    # -> $RUNS/manual_review/{index,review_*}.html
+cp review_site/serve_review.py review_site/REVIEWING.md "$RUNS/manual_review/"
+chmod -R g+rX "$RUNS/manual_review"                    # group zhuangl can read/serve it
+
+# 2. reviewers each open their shard (see "how a reviewer opens their shard" below),
+#    keep/drop every card, then Submit to Della (-> exports/) or Export JSON and send it back
+
+# 3. merge the exports -> an override decisions file, then re-apply to regenerate the tier
+$PY review_site/merge_reviews.py "$RUNS/manual_review/exports"/review_*.json \
+    --base "$RUNS/decisions.jsonl" --decisions-out "$RUNS/decisions.human_reviewed.jsonl"
+$PY filter_apply.py --data-dir "$DATA" --dataset combined_counting --local-meta \
+    --decisions "$RUNS/decisions.human_reviewed.jsonl" --splits train val \
+    --out-dir "$RUNS/filtered_human_reviewed" --allow-partial
+```
+
+The default split is **round-robin over sorted ids** (`--split-mode`), which balances the
+source datasets (fsc147/rec8k/rpine/pixmo) across reviewers; 801 → shards of **201/200/200/200**.
+The generator asserts the shards are disjoint and cover every id, and `--help` documents every
+flag (`--decisions`, `--reviewers`, `--side`, `--limit`, …). Regeneration is idempotent.
+
+`merge_reviews.py` maps each human **keep** → `keep=True`/verdict `PLAUSIBLE` (still classified
+KEEP) and each **drop** → `keep=False`/verdict `HUMAN_DROP` (classified DROP), leaving unreviewed
+rows on the auto verdict, so re-applying flips exactly the human-dropped ids. Like the rest of the
+filter it is **fail-closed**: it errors out if a reviewed id isn't a PLAUSIBLE row in `--base`
+(the exports don't match the base) or if the tier isn't fully reviewed — pass `--allow-incomplete`
+to proceed on a partial review (the output is then tagged `*.partial*` and unreviewed rows keep
+the auto verdict). Reviewer-supplied **confident counts** (optional, only when 100% sure) are
+written to `confident_counts.jsonl` with the labeled count and a `differs` flag — a `differs`
+row is a real GT-correction candidate. `filter_apply.py` keeps each source record's GT as-is, so
+apply the `differs` rows as a separate step if you want to correct GT later.
+
+### Two ways for a reviewer to open their shard
+Everything (images included) is embedded, so a reviewer needs **no GPU** to review. A concise
+reviewer-facing guide lives in `REVIEWING.md` (copied into the deploy dir next to the HTML).
+
+**A. Download the single HTML file (offline).** From VS Code's Della explorer (or `scp`), download
+`manual_review/review_<name>.html` and open it in any local browser. Progress lives in that
+browser's `localStorage`. When done, click **Export JSON** and send the file back for merging.
+
+**B. Serve from a Della login node + VS Code port-forward (submit straight back).**
+```bash
+ssh <netid>@della.princeton.edu
+cd /scratch/gpfs/ZHUANGL/lc1556/vero2/dataset_filter_runs/full_sync/manual_review
+python serve_review.py                     # prints the localhost URL + port to forward
+# VS Code (Remote-SSH to della): Ports panel → Forward the printed port,
+# open http://localhost:<port>/ → click your name. When done, click "Submit to Della".
+```
+`serve_review.py` is a stdlib server: it serves the site **and** accepts `POST /submit`, writing
+`exports/review_<name>.json` straight into the folder — no download/re-upload. It binds to
+localhost (SSH-tunnel-only) and the submit filename is sanitized to `review_<slug>.json`, so a
+submit can never escape `exports/`. The site is **group `zhuangl`-readable** and `exports/` is
+setgid + group-writable, so all four reviewers (each running their own `serve_review.py`) submit
+into one place; the coordinator collects them and runs `merge_reviews.py`. `index.html` restates
+these recipes; the page's **Export JSON** button is the offline fallback if there's no server.
 
 ## Filter a new dataset
 No code changes — the pipeline is dataset-agnostic. To filter `mydata`:
