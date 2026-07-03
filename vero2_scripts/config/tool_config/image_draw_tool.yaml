@@ -1,0 +1,149 @@
+# Drawing-only toolset: five annotation tools backed by verl.tools.image_draw_tool.ImageDrawTool.
+# Each tool annotates the image at img_idx and returns the annotated image as a NEW image the
+# model can inspect (and address by a later img_idx), mirroring the eval MCP tools in
+# vero_eval/lmms_eval/mcp/vero2_mcp.py. All coordinates use the 0-1000 normalized scale where
+# (0,0)=top-left and (1000,1000)=bottom-right. Only type/description/enum survive schema
+# validation, so each array's shape is spelled out in its description.
+#
+# NOTE: this draw-only file is provided for completeness. For training from the zoom-trained
+# checkpoint prefer image_zoom_in_draw_tool.yaml (zoom + draw): a draw-only tool list makes the
+# model's reflexive image_zoom_in_tool calls hit the unknown-tool path, which terminates the
+# trajectory (tool_agent_loop.py:1438). With zoom also registered those calls stay productive.
+tools:
+  - class_name: verl.tools.image_draw_tool.ImageDrawTool
+    config:
+      type: native
+      coordinate_system: normalized_1000
+      cropped_max_pixels: 1048576
+    tool_schema:
+      type: function
+      function:
+        name: draw_points
+        description: "Draw one or more point markers on an image and return the annotated image. Coordinates use the 0-1000 scale where (0,0) is top-left and (1000,1000) is bottom-right. For a single point pass points as [x, y]; for multiple points pass points as [[x1, y1], [x2, y2], ...]. Example: points=[[500, 500], [600, 600]] draws two markers."
+        parameters:
+          type: object
+          properties:
+            img_idx:
+              type: number
+              description: "The 0-based index of the image to annotate (0 is the first image)."
+            points:
+              type: array
+              description: "A single point [x, y] or a list of points [[x1, y1], [x2, y2], ...] on the 0-1000 scale."
+            color:
+              type: string
+              description: "Marker color name such as lime, red, or blue. Defaults to lime."
+            radius:
+              type: number
+              description: "Marker radius on the 0-1000 scale (relative to image width). Defaults to 15."
+          required: ["img_idx", "points"]
+
+  - class_name: verl.tools.image_draw_tool.ImageDrawTool
+    config:
+      type: native
+      coordinate_system: normalized_1000
+      cropped_max_pixels: 1048576
+    tool_schema:
+      type: function
+      function:
+        name: draw_lines
+        description: "Draw one or more line segments on an image and return the annotated image. Coordinates use the 0-1000 scale. For a single line pass lines as [x1, y1, x2, y2]; for multiple lines pass lines as [[x1, y1, x2, y2], ...]. Example: lines=[200, 300, 800, 700] draws one diagonal line."
+        parameters:
+          type: object
+          properties:
+            img_idx:
+              type: number
+              description: "The 0-based index of the image to annotate (0 is the first image)."
+            lines:
+              type: array
+              description: "A single line [x1, y1, x2, y2] or a list of lines [[x1, y1, x2, y2], ...] on the 0-1000 scale."
+            color:
+              type: string
+              description: "Line color name such as red, lime, or blue. Defaults to red."
+            linewidth:
+              type: number
+              description: "Line width in pixels. Defaults to 3."
+          required: ["img_idx", "lines"]
+
+  - class_name: verl.tools.image_draw_tool.ImageDrawTool
+    config:
+      type: native
+      coordinate_system: normalized_1000
+      cropped_max_pixels: 1048576
+    tool_schema:
+      type: function
+      function:
+        name: draw_boxes
+        description: "Draw one or more bounding boxes on an image and return the annotated image. Coordinates use the 0-1000 scale where (0,0) is top-left and (1000,1000) is bottom-right. For a single box pass boxes as [x1, y1, x2, y2]; for multiple boxes pass boxes as [[x1, y1, x2, y2], ...]. Example: boxes=[[100, 100, 200, 200], [300, 300, 400, 400]] draws two boxes."
+        parameters:
+          type: object
+          properties:
+            img_idx:
+              type: number
+              description: "The 0-based index of the image to annotate (0 is the first image)."
+            boxes:
+              type: array
+              description: "A single box [x1, y1, x2, y2] or a list of boxes [[x1, y1, x2, y2], ...] on the 0-1000 scale."
+            color:
+              type: string
+              description: "Box outline color name such as lime, red, or blue. Defaults to lime."
+            alpha:
+              type: number
+              description: "Outline opacity from 0 (transparent) to 1 (opaque). Defaults to 0.8."
+            linewidth:
+              type: number
+              description: "Outline width in pixels. Defaults to 3."
+          required: ["img_idx", "boxes"]
+
+  - class_name: verl.tools.image_draw_tool.ImageDrawTool
+    config:
+      type: native
+      coordinate_system: normalized_1000
+      cropped_max_pixels: 1048576
+    tool_schema:
+      type: function
+      function:
+        name: draw_texts
+        description: "Add one or more text labels to an image and return the annotated image. Coordinates use the 0-1000 scale. Each label is an object with fields x, y, and text. For a single label pass one object; for multiple labels pass a list of objects. Example: texts=[{x: 500, y: 100, text: title}] adds one label at top center."
+        parameters:
+          type: object
+          properties:
+            img_idx:
+              type: number
+              description: "The 0-based index of the image to annotate (0 is the first image)."
+            texts:
+              type: array
+              description: "A single object with fields x, y, text, or a list of such objects; x and y use the 0-1000 scale."
+            color:
+              type: string
+              description: "Text color name such as red, yellow, or lime. Defaults to red."
+            font_size:
+              type: number
+              description: "Font size in pixels. Defaults to 18."
+          required: ["img_idx", "texts"]
+
+  - class_name: verl.tools.image_draw_tool.ImageDrawTool
+    config:
+      type: native
+      coordinate_system: normalized_1000
+      cropped_max_pixels: 1048576
+    tool_schema:
+      type: function
+      function:
+        name: draw_polygons
+        description: "Draw one or more filled polygons on an image and return the annotated image. Coordinates use the 0-1000 scale. For a single polygon pass polygons as [[x1, y1], [x2, y2], [x3, y3], ...] with at least 3 points; for multiple polygons pass a list of polygons. Example: polygons=[[[200, 200], [800, 200], [500, 800]]] draws a triangle."
+        parameters:
+          type: object
+          properties:
+            img_idx:
+              type: number
+              description: "The 0-based index of the image to annotate (0 is the first image)."
+            polygons:
+              type: array
+              description: "A single polygon [[x1, y1], [x2, y2], ...] with at least 3 points, or a list of polygons, on the 0-1000 scale."
+            color:
+              type: string
+              description: "Polygon color name such as red, cyan, or lime. Defaults to red."
+            alpha:
+              type: number
+              description: "Fill opacity from 0 (transparent) to 1 (opaque). Defaults to 0.5."
+          required: ["img_idx", "polygons"]
