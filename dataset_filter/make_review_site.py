@@ -181,10 +181,12 @@ def card_html(rec: dict, clean: str, marked, n_marks: int) -> str:
         f'difficulty {html.escape(str(b.get("difficulty") or "?"))} &middot; '
         f'conf {html.escape(str(b.get("confidence") or "?"))}'
         f'<div class="reason">{_reason(b.get("reasoning"))}</div></div>')
+    vf_verdict = str(vf.get("verdict") or "?")
+    vf_color = VC.get(vf_verdict, "#6e7781")  # color the verify verdict by ITS OWN verdict
     verify_line = (
         f'<div class="pass"><span class="tag verify">verify</span> '
         f'count <b>{vf.get("your_count")}</b> &middot; '
-        f'verdict <b style="color:{color}">{html.escape(str(vf.get("verdict") or "?"))}</b> &middot; '
+        f'verdict <b style="color:{vf_color}">{html.escape(vf_verdict)}</b> &middot; '
         f'conf {html.escape(str(vf.get("confidence") or "?"))}'
         f'{" &middot; used GT points" if vf.get("used_points") else ""}'
         f'<div class="reason">{_reason(vf.get("reasoning"))}</div></div>')
@@ -330,7 +332,13 @@ function clearCard(id){
   var c=cardEl(id);if(c){var i=c.querySelector('input[type=number]');if(i)i.value='';var t=c.querySelector('textarea');if(t)t.value='';}
   paint(id);updateProg();
 }
-function reviewedCount(){var n=0;for(var k in STATE){var d=STATE[k]&&STATE[k].decision;if(d==='keep'||d==='drop')n++;}return n;}
+// Only count/export ids rendered on THIS page. localStorage is keyed by reviewer
+// slug, so if the shard split is ever regenerated, STATE may hold stale decisions
+// for ids no longer on this page — scoping to the DOM cards keeps those out.
+function pageDecisions(){var o={};document.querySelectorAll('.card').forEach(function(c){
+  var e=STATE[c.dataset.id];if(e)o[c.dataset.id]=e;});return o;}
+function reviewedCount(){var n=0;var d=pageDecisions();
+  for(var k in d){if(d[k].decision==='keep'||d[k].decision==='drop')n++;}return n;}
 function updateProg(){
   var n=reviewedCount();document.getElementById('ndone').textContent=n;
   document.getElementById('pbar').style.width=(TOTAL?100*n/TOTAL:0)+'%';
@@ -357,7 +365,7 @@ function toast(m){var t=document.getElementById('toast');t.textContent=m;t.class
 
 function exportJSON(){
   var out={reviewer:REVIEWER,exported_at:new Date().toISOString(),
-           n_reviewed:reviewedCount(),n_total:TOTAL,decisions:STATE};
+           n_reviewed:reviewedCount(),n_total:TOTAL,decisions:pageDecisions()};
   var blob=new Blob([JSON.stringify(out,null,2)],{type:'application/json'});
   var url=URL.createObjectURL(blob),a=document.createElement('a');
   a.href=url;a.download='review_'+SLUG+'.json';document.body.appendChild(a);a.click();
@@ -396,6 +404,13 @@ updateProg();
 </script></body></html>"""
 
 
+def js_literal(x) -> str:
+    """json.dumps + escape the chars that can break out of a <script> element
+    (`<`, `>`, `&`, U+2028/2029), so a reviewer name like '</script>' stays inert."""
+    return (json.dumps(x).replace("<", "\\u003c").replace(">", "\\u003e")
+            .replace("&", "\\u0026").replace(chr(0x2028), "\\u2028").replace(chr(0x2029), "\\u2029"))
+
+
 def render_page(reviewer: str, cards: list) -> str:
     slug = slugify(reviewer)
     page = HEAD
@@ -403,10 +418,10 @@ def render_page(reviewer: str, cards: list) -> str:
     # non-JS text substitutions
     page = page.replace("__REVIEWER__", html.escape(reviewer))
     page = page.replace("__TOTAL__", str(len(cards)))
-    # JS literals (json.dumps -> safe quoting)
-    page = page.replace("__REVIEWER_JSON__", json.dumps(reviewer))
-    page = page.replace("__SLUG_JSON__", json.dumps(slug))
-    page = page.replace("__STORAGE_KEY_JSON__", json.dumps(f"plausible_review_v1::{slug}"))
+    # JS literals (script-breakout-safe)
+    page = page.replace("__REVIEWER_JSON__", js_literal(reviewer))
+    page = page.replace("__SLUG_JSON__", js_literal(slug))
+    page = page.replace("__STORAGE_KEY_JSON__", js_literal(f"plausible_review_v1::{slug}"))
     return page
 
 
@@ -548,10 +563,15 @@ def main():
                     help="embedded image long edge in px (default 1100; higher = sharper zoom, "
                          "bigger file)")
     ap.add_argument("--limit", type=int, default=0,
-                    help="only take the first N PLAUSIBLE records (0 = all; for smoke tests)")
+                    help="only take the first N PLAUSIBLE records (0 = all; for smoke tests). "
+                         "Requires an explicit --out-dir so a smoke run can't overwrite the "
+                         "production site.")
     ap.add_argument("--out-dir", default=DEF_OUT_DIR,
                     help=f"output directory for the HTML site (default {DEF_OUT_DIR})")
     args = ap.parse_args()
+    if args.limit and Path(args.out_dir) == Path(DEF_OUT_DIR):
+        sys.exit("[review-site] FATAL: --limit is a smoke/dev flag; refusing to write a "
+                 "truncated site to the default production dir. Pass an explicit --out-dir.")
     build(args)
 
 
