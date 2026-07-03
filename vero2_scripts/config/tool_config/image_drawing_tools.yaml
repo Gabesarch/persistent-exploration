@@ -1,0 +1,151 @@
+# Drawing tools for training - mirrors vero_eval/lmms_eval/mcp/vero2_mcp.py exactly
+#
+# All coordinates use 0-1000 scale:
+#   - (0, 0) = top-left corner
+#   - (1000, 1000) = bottom-right corner
+#   - (500, 500) = center of image
+#
+# Image referencing:
+#   - Tools use img_idx (0-based) to reference images in the conversation
+#   - img_idx=0 is the original input image
+#   - Tool outputs are appended, so img_idx=1 would be the first tool output, etc.
+
+tools:
+  - class_name: verl.tools.image_drawing_tools.DrawPointsTool
+    config:
+      type: native
+    tool_schema:
+      type: function
+      function:
+        name: draw_points
+        description: "Draw one or more point markers on an image. Coordinates use 0-1000 scale where (0,0)=top-left, (1000,1000)=bottom-right. For a single point, pass [x, y]. For multiple points, pass [[x1, y1], [x2, y2], ...]. Example: draw_points(img_idx=0, points=[[500, 500], [600, 600]]) draws 2 points."
+        parameters:
+          type: object
+          properties:
+            img_idx:
+              type: integer
+              description: "Index of the image to draw on (0-based)."
+            points:
+              type: array
+              description: "Either [x, y] for a single point, or [[x1, y1], [x2, y2], ...] for multiple points. Coordinates use 0-1000 scale."
+            color:
+              type: string
+              description: "Color name for markers."
+              default: "lime"
+            radius:
+              type: integer
+              description: "Radius of the circle markers (0-1000, relative to image width)."
+              default: 15
+          required: ["img_idx", "points"]
+
+  - class_name: verl.tools.image_drawing_tools.DrawLinesTool
+    config:
+      type: native
+    tool_schema:
+      type: function
+      function:
+        name: draw_lines
+        description: "Draw one or more lines on an image. Coordinates use 0-1000 scale. For a single line, pass [x1, y1, x2, y2]. For multiple lines, pass [[x1, y1, x2, y2], [x1, y1, x2, y2], ...]. Example: draw_lines(img_idx=0, lines=[[200, 300, 800, 700]]) draws one diagonal line."
+        parameters:
+          type: object
+          properties:
+            img_idx:
+              type: integer
+              description: "Index of the image to draw on (0-based)."
+            lines:
+              type: array
+              description: "Either [x1, y1, x2, y2] for a single line, or [[x1, y1, x2, y2], ...] for multiple lines. Coordinates use 0-1000 scale."
+            color:
+              type: string
+              description: "Color name."
+              default: "red"
+            linewidth:
+              type: number
+              description: "Width of the lines in pixels."
+              default: 3
+          required: ["img_idx", "lines"]
+
+  - class_name: verl.tools.image_drawing_tools.DrawBoxesTool
+    config:
+      type: native
+    tool_schema:
+      type: function
+      function:
+        name: draw_boxes
+        description: "Draw one or more bounding boxes on an image. Coordinates use 0-1000 scale where (0,0)=top-left, (1000,1000)=bottom-right. For a single box, pass [x1, y1, x2, y2]. For multiple boxes, pass [[x1, y1, x2, y2], ...]. Example: draw_boxes(img_idx=0, boxes=[[100, 100, 200, 200], [300, 300, 400, 400]]) draws 2 boxes."
+        parameters:
+          type: object
+          properties:
+            img_idx:
+              type: integer
+              description: "Index of the image to draw on (0-based)."
+            boxes:
+              type: array
+              description: "Either [x1, y1, x2, y2] for a single box, or [[x1, y1, x2, y2], ...] for multiple boxes. Coordinates use 0-1000 scale."
+            color:
+              type: string
+              description: "Color name for all boxes (e.g., 'lime', 'red', 'blue')."
+              default: "lime"
+            alpha:
+              type: number
+              description: "Opacity of the box outlines."
+              default: 0.8
+            linewidth:
+              type: integer
+              description: "Width of box outlines in pixels."
+              default: 3
+          required: ["img_idx", "boxes"]
+
+  - class_name: verl.tools.image_drawing_tools.DrawTextsTool
+    config:
+      type: native
+    tool_schema:
+      type: function
+      function:
+        name: draw_texts
+        description: "Add one or more text annotations to an image. Coordinates use 0-1000 scale. For a single text, pass {\"x\": x, \"y\": y, \"text\": \"label\"}. For multiple, pass a list. Example: draw_texts(img_idx=0, texts=[{\"x\": 500, \"y\": 100, \"text\": \"Title\"}]) adds text at top center."
+        parameters:
+          type: object
+          properties:
+            img_idx:
+              type: integer
+              description: "Index of the image to draw on (0-based)."
+            texts:
+              type: array
+              description: "Either {\"x\": x, \"y\": y, \"text\": \"label\"} for a single text, or a list of such dicts for multiple texts. Coordinates use 0-1000 scale."
+            color:
+              type: string
+              description: "Text color name."
+              default: "red"
+            font_size:
+              type: integer
+              description: "Size of the font in pixels."
+              default: 18
+          required: ["img_idx", "texts"]
+
+  - class_name: verl.tools.image_drawing_tools.DrawPolygonsTool
+    config:
+      type: native
+    tool_schema:
+      type: function
+      function:
+        name: draw_polygons
+        description: "Draw one or more polygons on an image. Coordinates use 0-1000 scale. For a single polygon, pass [[x1,y1], [x2,y2], [x3,y3], ...]. For multiple polygons, pass [[[x1,y1], ...], [[x1,y1], ...], ...]. Example: draw_polygons(img_idx=0, polygons=[[[200,200], [800,200], [500,800]]]) draws a triangle."
+        parameters:
+          type: object
+          properties:
+            img_idx:
+              type: integer
+              description: "Index of the image to draw on (0-based)."
+            polygons:
+              type: array
+              description: "Either [[x1,y1], [x2,y2], ...] for a single polygon, or [[[x1,y1], ...], [[x1,y1], ...]] for multiple polygons. Coordinates use 0-1000 scale."
+            color:
+              type: string
+              description: "Color name."
+              default: "red"
+            alpha:
+              type: number
+              description: "Opacity of the fill."
+              default: 0.5
+          required: ["img_idx", "polygons"]
