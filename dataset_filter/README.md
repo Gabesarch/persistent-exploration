@@ -62,9 +62,11 @@ auditor** that is explicitly told *hard ≠ wrong* returns:
 | `compare_runs.py` | diff two decision files (keep rate, verdict flips, overrides) |
 | `cost_estimate.py` | project $ to filter a full split from measured tokens |
 | `make_report.py` / `make_exam_report.py` / `make_compare_report.py` | HTML reports; `make_exam_report` is GT-neutral + zoomable for manual audit |
-| `make_review_site.py` | builds the **PLAUSIBLE-tier manual-review site** — one self-contained HTML per reviewer with keep/drop (+ an optional 100%-confident count) and JSON export ([below](#manual-review-of-the-plausible-tier)) |
-| `serve_review.py` | stdlib server for the review site with a `POST /submit` upload endpoint, so reviewers submit straight to scratch instead of downloading + re-uploading |
-| `merge_reviews.py` | merges the reviewers' exported JSONs → an override decisions file `filter_apply.py` consumes |
+| `review_site/` | the **PLAUSIBLE-tier manual-review** tooling (separate from the filter above), see [below](#manual-review-of-the-plausible-tier): |
+| &nbsp;&nbsp;`review_site/make_review_site.py` | builds one self-contained HTML per reviewer — keep/drop (+ an optional 100%-confident count) + JSON export |
+| &nbsp;&nbsp;`review_site/serve_review.py` | stdlib server for the site with a `POST /submit` upload endpoint, so reviewers submit straight to scratch |
+| &nbsp;&nbsp;`review_site/merge_reviews.py` | merges the reviewers' exported JSONs → an override decisions file `filter_apply.py` consumes |
+| &nbsp;&nbsp;`review_site/REVIEWING.md` | concise reviewer-facing guide (deployed next to the HTML) |
 | `../.claude/commands/gt-filter.md` | the `/gt-filter` slash command that drives the whole flow |
 
 ## Quick use (synchronous — the working path today)
@@ -112,18 +114,18 @@ download via **Export JSON** (or **Submit to Della**, below).
 PY=/scratch/gpfs/ZHUANGL/lc1556/conda/envs/reason-vlm/bin/python
 RUNS=/scratch/gpfs/ZHUANGL/lc1556/vero2/dataset_filter_runs/full_sync
 DATA=/scratch/gpfs/ZHUANGL/lc1556/vero2/datasets/combined_counting_hq
-cd /home/lc1556/repo/reason-vlm/vero2/dataset_filter
+cd /home/lc1556/repo/reason-vlm/vero2/dataset_filter   # filter_apply.py here; review tools in review_site/
 
-# 1. generate the 4-reviewer site (defaults target the full_sync run + deploy dir)
-$PY make_review_site.py                    # -> $RUNS/manual_review/{index,review_*}.html
-chmod -R g+rX "$RUNS/manual_review"        # group zhuangl can read/serve it
+# 1. generate the 4-reviewer site + install the server/guide into the deploy dir
+$PY review_site/make_review_site.py                    # -> $RUNS/manual_review/{index,review_*}.html
+cp review_site/serve_review.py review_site/REVIEWING.md "$RUNS/manual_review/"
+chmod -R g+rX "$RUNS/manual_review"                    # group zhuangl can read/serve it
 
-# 2. reviewers each open their shard (see "Two ways to open your shard" below),
-#    keep/drop every card, then click "Export decisions JSON" and send back review_<name>.json
+# 2. reviewers each open their shard (see "how a reviewer opens their shard" below),
+#    keep/drop every card, then Submit to Della (-> exports/) or Export JSON and send it back
 
 # 3. merge the exports -> an override decisions file, then re-apply to regenerate the tier
-$PY merge_reviews.py review_chris-cai.json review_gabe-sarch.json \
-    review_yipeng-zhang.json review_haoyang-wu.json \
+$PY review_site/merge_reviews.py "$RUNS/manual_review/exports"/review_*.json \
     --base "$RUNS/decisions.jsonl" --decisions-out "$RUNS/decisions.human_reviewed.jsonl"
 $PY filter_apply.py --data-dir "$DATA" --dataset combined_counting --local-meta \
     --decisions "$RUNS/decisions.human_reviewed.jsonl" --splits train val \
