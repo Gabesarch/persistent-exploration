@@ -83,7 +83,6 @@ def main():
     # ---- 1. load + merge exports (track provenance for conflict reporting) ----
     merged = {}                      # id -> {reviewer, decision, corrected_count, note}
     per_reviewer = defaultdict(lambda: {"keep": 0, "drop": 0, "incomplete": 0, "file": None})
-    id_sources = defaultdict(list)   # id -> [(reviewer, file, decision)]
     conflicts = []
     for path in args.reviews:
         reviewer, dec = load_review(path)
@@ -98,7 +97,6 @@ def main():
                 if cc is not None or note:
                     per_reviewer[reviewer]["incomplete"] += 1
                 continue
-            id_sources[rid].append((reviewer, path, decision))
             per_reviewer[reviewer][decision] += 1
             if rid in merged and merged[rid]["decision"] != decision:
                 conflicts.append((rid, merged[rid], {"reviewer": reviewer, "decision": decision}))
