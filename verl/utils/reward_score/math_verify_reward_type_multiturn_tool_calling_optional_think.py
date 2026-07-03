@@ -7,6 +7,7 @@ import math
 import re
 from typing import Any
 
+from verl.utils.reward_score.hstar_strip_reward import hstar_strip_reward
 from verl.utils.reward_score.math_verify_reward_type_boxed import _counting_reward
 from verl.utils.reward_score.math_verify_reward_type_fixations_no_think_point_boxed import (
     _extract_reward_answer,
@@ -179,6 +180,7 @@ def acc_reward(predict_str: str, ground_truth: str, use_boxed: bool = False, ext
         "counting": _counting_reward,
         "search": search_string_reward,
         "grounding": _grounding_reward,
+        "hstar_strip": hstar_strip_reward,
     }
     handler = reward_handlers.get(reward_type)
     if handler is None:

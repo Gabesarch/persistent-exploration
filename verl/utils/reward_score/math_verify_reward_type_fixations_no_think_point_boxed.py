@@ -9,6 +9,7 @@ from math_verify import parse
 from math_verify.errors import TimeoutException
 from math_verify.parser import StringExtractionConfig
 
+from verl.utils.reward_score.hstar_strip_reward import hstar_strip_reward
 from verl.utils.reward_score.math_verify_reward_type_boxed import (
     _extract_grounding_clicking_answer,
     _grounding_reward,
@@ -176,6 +177,7 @@ def _extract_reward_type(extra_info: Any) -> str | None:
         "counting",
         "search",
         "grounding",
+        "hstar_strip",
     }:
         return reward_type
     return None
@@ -301,8 +303,10 @@ def _extract_reward_answer(answer_text: str, reward_type: str) -> str | None:
     candidate = str(answer_text).strip()
     if not candidate:
         return None
-    if reward_type == "grounding":
-        return _extract_grounding_clicking_answer(candidate)
+    if reward_type in {"grounding", "hstar_strip"}:
+        if reward_type == "grounding":
+            return _extract_grounding_clicking_answer(candidate)
+        return candidate
     extracted = _extract_boxed_answer(candidate)
     return extracted or None
 
@@ -389,6 +393,7 @@ def acc_reward(predict_str: str, ground_truth: str, use_boxed: bool = False, ext
         "counting": _short_string_reward,
         "search": search_string_reward,
         "grounding": _grounding_reward,
+        "hstar_strip": hstar_strip_reward,
     }
     handler = reward_handlers.get(reward_type)
     if handler is None:
