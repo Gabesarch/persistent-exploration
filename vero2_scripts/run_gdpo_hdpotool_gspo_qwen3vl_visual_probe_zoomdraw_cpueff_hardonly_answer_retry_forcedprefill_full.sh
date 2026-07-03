@@ -122,7 +122,7 @@ if ! has_hydra_override "actor_rollout_ref.rollout.multi_turn.conditional_answer
   )
 fi
 
-CONFIG_NAME="gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_zoomdraw_cpueff_hardonly_answer_retry_forcedprefill"
+CONFIG_NAME="${CONFIG_NAME:-gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_zoomdraw_cpueff_hardonly_answer_retry_forcedprefill}"
 
 echo "CONFIG_NAME=$CONFIG_NAME"
 echo "TRAINER_PROJECT_NAME=$TRAINER_PROJECT_NAME"
