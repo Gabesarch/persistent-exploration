@@ -132,10 +132,16 @@ The default split is **round-robin over sorted ids** (`--split-mode`), which bal
 source datasets (fsc147/rec8k/rpine/pixmo) across reviewers; 801 → shards of **201/200/200/200**.
 The generator asserts the shards are disjoint and cover every id, and `--help` documents every
 flag (`--decisions`, `--reviewers`, `--side`, `--limit`, …). Regeneration is idempotent.
+
 `merge_reviews.py` maps each human **keep** → `keep=True`/verdict `PLAUSIBLE` (still classified
 KEEP) and each **drop** → `keep=False`/verdict `HUMAN_DROP` (classified DROP), leaving unreviewed
-rows untouched, so re-applying flips exactly the human-dropped ids. Corrected counts ride along as
-metadata (GT-correction candidates); `filter_apply.py` keeps the source record's GT as-is.
+rows on the auto verdict, so re-applying flips exactly the human-dropped ids. Like the rest of the
+filter it is **fail-closed**: it errors out if a reviewed id isn't a PLAUSIBLE row in `--base`
+(the exports don't match the base) or if the tier isn't fully reviewed — pass `--allow-incomplete`
+to proceed on a partial review (the output is then tagged `*.partial*` and unreviewed rows keep
+the auto verdict). Reviewer-supplied **corrected counts** are written to `gt_corrections.jsonl`
+(with the labeled count) so a wrong-GT-but-keep example isn't silently shipped on the old GT;
+`filter_apply.py` keeps each source record's GT as-is, so apply those corrections as a separate step.
 
 ### Two ways to open your shard
 Everything (images included) is embedded, so a reviewer needs **no GPU and no running server**
