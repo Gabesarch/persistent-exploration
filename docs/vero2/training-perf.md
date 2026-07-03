@@ -112,7 +112,7 @@ Ordered by (win ÷ effort). Wins are share-of-step against the 3445 s real step.
 
 | # | Fix | Mechanism | Expected win | Effort | Risk |
 |---|---|---|---|---|---|
-| **1** | **Enable prefix caching + mm processor cache** on the fresh vllm-0.23 env (`enable_prefix_caching:true`, `mm_processor_cache_gb>0`) | Stop re-prefilling the growing image-heavy context each of ~16 turns → lowers **mean** `generate_sequences`, hence gen (58 % of step) | Potentially large (attacks the mean, not just the tail). **A/B measures it — §7.** | **Trivial** (2 flags, already in schema, default-off) | Was off on old vLLM; verify correctness/compat + numerics on the fresh stack before flipping the default. |
+| **1** | **Enable prefix caching + mm processor cache** on the fresh vllm-0.23 env (`enable_prefix_caching:true`, `mm_processor_cache_gb>0`) | Stop re-prefilling the growing image-heavy context each of ~16 turns → lowers **mean** `generate_sequences`, hence gen (58 % of step) | **Measured (§7): −21 % on `gen_seq/mean`** but only −3 % on the straggler-bound wall-clock — so pair with #2. Larger at real scale (16 turns). | **Trivial** (2 flags, already in schema, default-off) | Was off on old vLLM; the A/B smoke ran clean on vllm-0.23 (exit 0), but validate training numerics before flipping the default. |
 | **2** | **`over_sample_rate` straggler abort** (APRIL, arXiv 2509.18521), default-off flag | Over-provision rollouts; when `(1−rate)·N` complete, abort the tail via `abort_request`; makes gen finish near the **mean** not the **max** | ~**25 %** of step (gen 1998→~1132 s), bounded by straggler ratio 1.82 | **Medium** (code; §8) | Aborting GRPO group members breaks advantage math — must abort whole groups or resume partials; gate behind default-off flag. |
 | **3** | **`rollout_correction` bypass** (skip the `old_log_prob` forward; use rollout logprobs + truncated-IS) | Removes the 10.2 % `old_log_prob` recompute | ~**10 %** of step (353 s) | Low–medium (in-tree, unused) | Changes the IS correction; validate advantage/gradient equivalence. |
 | 4 | Tighten `max_response_length` / `max_assistant_turns` tail | 4.3 % of responses hit the 24576 cap; the tail runs all 11 turns | Small–moderate (shrinks the tail directly) | Trivial config | Quality/accuracy trade-off — measure reward impact first. |
@@ -122,8 +122,10 @@ Ordered by (win ÷ effort). Wins are share-of-step against the 3445 s real step.
 additive): #2 alone ≈ −25 %, #3 alone ≈ −10 %, together ≈ **−33 %** step time; #1 could add more
 on top by cutting the mean that #2's floor depends on.
 
-**Recommendation:** ship #1 first (it is nearly free and, if it cuts the mean, it *also* lowers
-the floor #2 can reach). Then implement #2 for the tail, and #3 for the log-prob pass.
+**Recommendation:** ship #1 and #2 **together** — the A/B (§7) shows #1 cuts the per-trajectory
+mean (−21 %) but the straggler-bound wall-clock needs #2 to realize it (#1 alone was only −3 % at
+smoke scale). #1 is nearly free and lowers the floor #2 can reach; #3 (log-prob bypass) is an
+additive ~10 %.
 
 ---
 
@@ -133,13 +135,25 @@ Two gpu-test smokes, identical `zoomdraw_debug256` config (3 steps, batch 8, n=4
 in the caching flags. Baseline = shipped default (caching off). Run from the isolated worktree
 pinned to the Phase-A commit; `over_sample_rate` stays 0 in both arms.
 
-| Arm | `enable_prefix_caching` | `mm_processor_cache_gb` | `timing_s/gen` (mean) | `timing_s/step` (mean) | Δ gen |
-|---|---|---|---:|---:|---:|
-| OFF (baseline) | false | 0 | _pending (job 10609421)_ | _pending_ | — |
-| ON | true | 4 | _pending (job 10609422)_ | _pending_ | _pending_ |
+| Arm | `enable_prefix_caching` | `mm_cache_gb` | `gen` (mean) | `step` (mean) | `gen_seq/mean` | `gen_seq/max` |
+|---|---|---|---:|---:|---:|---:|
+| OFF (baseline) | false | 0 | 284.7 s | 350.6 s | 41.7 s | 278.2 s |
+| ON | true | 4 | 275.0 s | 339.1 s | **32.7 s** | 267.9 s |
+| **Δ** | | | **−3.4 %** | **−3.3 %** | **−21.4 %** | **−3.7 %** |
 
-_(Filled from `ab_*_<jobid>.log` when both smokes finish; both are default-off in the shipped
-configs, so this is a measurement, not a default change.)_
+(3 steps each, both `SMOKE_EXIT_CODE=0`, jobs 10609421/10609422; both flags default-off in shipped
+configs, so this is a measurement, not a default change.)
+
+**Reading (this is the key result):** caching cut the **per-trajectory mean** generation time by
+**−21 %** (41.7 → 32.7 s) — confirming that re-prefilling the growing context each turn is a real
+cost — **but the rollout wall-clock (`gen` ≈ `gen_seq/max`) barely moved (−3.4 %)** because it is
+set by the *slowest* trajectory, which caching didn't shorten. So at this small, noisy scale (32
+trajectories, 3 steps) the step-time win is only ~3 %. This **empirically confirms §3's thesis**:
+the rollout is straggler-bound, so a mean-level speedup (caching) only converts to wall-clock if it
+*also* pulls in the tail. Two implications: (a) at real scale (16 turns vs ~9 here, 1024 vs 32
+trajectories) the caching win on the mean should be larger; (b) **caching should be paired with the
+tail mitigation (fix #2)** to actually move step time — neither alone is sufficient. Recommend
+landing #1 (nearly free, and it lowers the floor #2 can reach) *and* #2 together.
 
 ---
 
@@ -159,12 +173,19 @@ over_sample_rate: float = 0.0
 outputs = await asyncio.gather(*tasks)     # waits for ALL 1024 trajectories
 ```
 
+One subtlety that sets the effort level: `abort_request` (`vllm_async_server.py:693`) aborts a
+single **vLLM generation request = one turn**, but a straggler is a whole multi-turn
+**trajectory** (an `asyncio` task issuing one generate per turn). Aborting a trajectory therefore
+means `task.cancel()` **plus** aborting its current in-flight turn request **plus** teardown — not
+a single `abort_request` call. This is why it is a code change, not a config flip, and why the
+cheapest first experiment is §7's caching A/B.
+
 Concrete change (default-off, so `over_sample_rate == 0` keeps today's exact behavior):
 
 1. Launch all tasks as today. Iterate with `asyncio.as_completed`, counting completions.
-2. When `ceil((1 - over_sample_rate) * N)` have completed, `abort_request` (server:
-   `vllm_async_server.py:693`; manager fan-out `:1011`) the still-running tail, then let the
-   aborted tasks return a sentinel.
+2. When `ceil((1 - over_sample_rate) * N)` have completed, `task.cancel()` the still-running tail
+   and `abort_request` their in-flight turn requests (manager fan-out `:1011`); aborted tasks
+   return a sentinel that `_postprocess` drops.
 3. **GRPO group integrity** (the one real hazard — advantage is computed within each
    `index` group of `n` samples): pick one of
    - **abort whole groups** — only count a group "done" when all `n` of its members finish, and
