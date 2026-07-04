@@ -36,6 +36,10 @@ fi
 
 source "$SET_PATHS_SH"
 
+# Internet on the compute node for ONLINE W&B (reward-trend graph). Harmless if the
+# module is absent; localhost (vLLM async server) is excluded via NO_PROXY below.
+module load proxy/default 2>/dev/null || true
+
 ENGINE="vllm"
 if [ "$#" -gt 0 ] && [[ "$1" != -* ]]; then
   ENGINE="$1"
