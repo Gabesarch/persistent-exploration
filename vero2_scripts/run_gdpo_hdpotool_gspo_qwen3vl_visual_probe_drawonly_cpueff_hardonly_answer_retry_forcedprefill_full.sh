@@ -1,11 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=drawonly_hard_arf
-#SBATCH --partition=pli-c
+#SBATCH --partition=pli-lc
+#SBATCH --account=pli_xl
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:8
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=968G
+#SBATCH --gres=gpu:h100:8
+#SBATCH --cpus-per-task=96
+#SBATCH --mem=960G
 #SBATCH --time=24:00:00
 #SBATCH --array=1-5%1
 #SBATCH --output=slurm/output/%x_%j.log
