@@ -429,6 +429,59 @@ def plot_reward_curves(outdir: Path):
     return _savefig(fig, outdir, "reward_curves.png")
 
 
+def plot_reward_surface_3d(outdir: Path):
+    """The reward-design figure: a 3-D surface of reward over (gt, signed error).
+
+    Shows the full-credit ridge at error=0 widening into a scale-aware band + gentle
+    Gaussian walls as the count grows -- the geometry the shipped reward encodes.
+    """
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers 3d projection)
+
+    gts = np.arange(1, 121)
+    errs = np.arange(-45, 46)
+    G, E = np.meshgrid(gts, errs)
+    Z = np.array(
+        [[counting_reward_value(int(g + e), int(g)) for g in gts] for e in errs],
+        dtype=float,
+    )
+    fig = plt.figure(figsize=(9.5, 7))
+    ax = fig.add_subplot(111, projection="3d")
+    surf = ax.plot_surface(G, E, Z, cmap="viridis", linewidth=0, antialiased=True, rcount=91, ccount=120)
+    ax.set_xlabel("ground-truth count (gt)")
+    ax.set_ylabel("error  (pred − gt)")
+    ax.set_zlabel("reward")
+    ax.set_zlim(0, 1)
+    ax.set_title("Counting reward surface — scale-aware band + Gaussian decay (shipped)")
+    ax.view_init(elev=28, azim=-58)
+    fig.colorbar(surf, ax=ax, shrink=0.5, aspect=14, label="reward", pad=0.02)
+    return _savefig(fig, outdir, "reward_surface_3d.png")
+
+
+def plot_reward_heatmap(outdir: Path):
+    """2-D companion to the 3-D surface: reward over (gt, error) with band/σ envelopes overlaid."""
+    gts = np.arange(1, 121)
+    errs = np.arange(-45, 46)
+    Z = np.array(
+        [[counting_reward_value(int(g + e), int(g)) for g in gts] for e in errs],
+        dtype=float,
+    )
+    fig, ax = plt.subplots(figsize=(9.5, 5))
+    im = ax.pcolormesh(gts, errs, Z, cmap="viridis", shading="auto", vmin=0, vmax=1)
+    band = np.floor(_COUNTING_REL_TOL * gts)
+    sigma = np.maximum(_COUNTING_MIN_SIGMA, _COUNTING_REL_SIGMA * gts)
+    ax.plot(gts, band, "r-", lw=1.2, label="± full-credit band")
+    ax.plot(gts, -band, "r-", lw=1.2)
+    ax.plot(gts, band + sigma, "w--", lw=1.0, label="± (band + σ)")
+    ax.plot(gts, -(band + sigma), "w--", lw=1.0)
+    ax.axhline(0, color="w", lw=0.5, alpha=0.4)
+    ax.set_xlabel("ground-truth count (gt)")
+    ax.set_ylabel("error  (pred − gt)")
+    ax.set_title("Reward heatmap — both the full-credit band and the decay width scale with the count")
+    ax.legend(loc="upper right", fontsize=8, framealpha=0.85)
+    fig.colorbar(im, ax=ax, label="reward", pad=0.02)
+    return _savefig(fig, outdir, "reward_heatmap.png")
+
+
 def plot_band_vs_graded_and_decay(res: dict, outdir: Path):
     v = res["variants"]
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
@@ -496,6 +549,214 @@ def write_summary_json(res: dict, outdir: Path, meta: dict):
 
 
 # --------------------------------------------------------------------------- #
+# Self-contained HTML report                                                  #
+# --------------------------------------------------------------------------- #
+def _img_data_uri(path: Path) -> str:
+    import base64
+
+    b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:image/png;base64,{b64}"
+
+
+def _figure_block(outdir: Path, fname: str, caption: str) -> str:
+    uri = _img_data_uri(outdir / fname)
+    return (
+        f'<figure><img src="{uri}" alt="{caption}" loading="lazy">'
+        f"<figcaption>{caption}</figcaption></figure>"
+    )
+
+
+def build_html_report(res: dict, outdir: Path, meta: dict):
+    """Emit a single self-contained counting-reward-ablation.html (images inlined as data URIs).
+
+    Works as a committed repo file AND as a claude.ai Artifact (strict CSP: everything inline).
+    """
+    v = res["variants"]
+    n = res["n_pairs"]
+
+    def pct(x):
+        return f"{100 * x:.1f}%"
+
+    def f3(x):
+        return f"{x:.3f}"
+
+    headline_rows = "".join(
+        f"<tr><td>{lbl}</td><td>{f3(v[k]['mean_reward'])}</td><td>{f3(v[k]['frac_exact'])}</td>"
+        f"<td>{f3(v[k]['frac_in_band'])}</td><td>{f3(v[k]['frac_in_decay'])}</td>"
+        f"<td class='{'bad' if v[k]['frac_zero'] > 0.2 else 'good'}'>{f3(v[k]['frac_zero'])}</td></tr>"
+        for k, lbl in [("old_exact", "old (exact match)"), ("new_default", "new (graded, shipped)")]
+    )
+    decomp_rows = "".join(
+        f"<tr><td>{lbl}</td><td>{f3(v[k]['mean_reward'])}</td>"
+        f"<td class='{'bad' if v[k]['frac_zero'] > 0.2 else 'good'}'>{f3(v[k]['frac_zero'])}</td>"
+        f"<td>{f3(v[k]['nonexact_mean_reward'])}</td><td>{note}</td></tr>"
+        for k, lbl, note in [
+            ("old_exact", "old exact-match", "—"),
+            ("band_only", "band-only (graded=false)", "+ scale-aware leniency band"),
+            ("new_default", "graded (shipped)", "+ decay gradient"),
+        ]
+    )
+
+    # Shortlist (from the 4-lens panel + adversarial verification; see the memo).
+    shortlist = [
+        ("1", "graded_default", "reference", "(none — bit-identical to shipped)", "counting_reward_graded_shipped"),
+        ("2", "exact_match", "baseline", "+…counting_rel_tol=0.0 +…counting_rel_band_cap=0.0 +…counting_graded=false", "counting_reward_exact_baseline"),
+        ("3", "sigma030", "treatment", "+…counting_rel_sigma=0.30", "counting_reward_sigma030"),
+        ("4", "band_only", "control", "+…counting_graded=false", "counting_reward_band_only"),
+    ]
+    shortlist_rows = "".join(
+        f"<tr><td>{r}</td><td><strong>{name}</strong></td><td>{role}</td>"
+        f"<td><code>{ov}</code></td><td><code>{exp}</code></td></tr>"
+        for r, name, role, ov, exp in shortlist
+    )
+
+    html = f"""<title>Counting-reward ablation</title>
+<style>
+  :root {{
+    --bg:#ffffff; --fg:#1a1c22; --muted:#5c6270; --card:#f6f7f9; --border:#e2e5ea;
+    --accent:#2a6f97; --accent2:#2a9d8f; --bad:#c1432b; --good:#2a9d8f; --code:#eef1f5;
+  }}
+  @media (prefers-color-scheme: dark) {{
+    :root {{
+      --bg:#14161b; --fg:#e6e8ec; --muted:#9aa1ad; --card:#1d2027; --border:#2b2f38;
+      --accent:#61a5c2; --accent2:#5cc2b1; --bad:#e07a5f; --good:#5cc2b1; --code:#20242c;
+    }}
+  }}
+  :root[data-theme="light"] {{
+    --bg:#ffffff; --fg:#1a1c22; --muted:#5c6270; --card:#f6f7f9; --border:#e2e5ea;
+    --accent:#2a6f97; --accent2:#2a9d8f; --bad:#c1432b; --good:#2a9d8f; --code:#eef1f5;
+  }}
+  :root[data-theme="dark"] {{
+    --bg:#14161b; --fg:#e6e8ec; --muted:#9aa1ad; --card:#1d2027; --border:#2b2f38;
+    --accent:#61a5c2; --accent2:#5cc2b1; --bad:#e07a5f; --good:#5cc2b1; --code:#20242c;
+  }}
+  * {{ box-sizing:border-box; }}
+  body {{ margin:0; background:var(--bg); color:var(--fg);
+    font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; }}
+  .wrap {{ max-width:1040px; margin:0 auto; padding:2rem 1.25rem 4rem; }}
+  header h1 {{ font-size:1.9rem; margin:0 0 .3rem; letter-spacing:-.01em; }}
+  header p.sub {{ color:var(--muted); margin:.2rem 0 0; }}
+  .pills {{ display:flex; flex-wrap:wrap; gap:.5rem; margin:1rem 0 0; }}
+  .pill {{ background:var(--card); border:1px solid var(--border); border-radius:999px;
+    padding:.3rem .8rem; font-size:.82rem; color:var(--muted); }}
+  .pill b {{ color:var(--fg); }}
+  h2 {{ font-size:1.3rem; margin:2.6rem 0 .4rem; padding-top:1rem; border-top:1px solid var(--border); }}
+  h2 .tag {{ font-size:.72rem; font-weight:600; color:var(--accent); text-transform:uppercase;
+    letter-spacing:.06em; display:block; margin-bottom:.1rem; }}
+  p.lead {{ color:var(--fg); }}
+  .muted {{ color:var(--muted); }}
+  figure {{ margin:1.1rem 0; background:var(--card); border:1px solid var(--border);
+    border-radius:12px; padding:.75rem; }}
+  figure img {{ width:100%; height:auto; border-radius:6px; display:block; }}
+  figcaption {{ color:var(--muted); font-size:.86rem; margin-top:.55rem; }}
+  .grid2 {{ display:grid; grid-template-columns:1fr; gap:1rem; }}
+  @media (min-width:760px) {{ .grid2 {{ grid-template-columns:1fr 1fr; }} }}
+  .grid2 figure {{ margin:0; }}
+  .tablewrap {{ overflow-x:auto; margin:1rem 0; border:1px solid var(--border); border-radius:10px; }}
+  table {{ border-collapse:collapse; width:100%; font-size:.9rem; }}
+  th,td {{ text-align:left; padding:.55rem .7rem; border-bottom:1px solid var(--border); white-space:nowrap; }}
+  td {{ font-variant-numeric:tabular-nums; }}
+  th {{ background:var(--card); font-weight:600; }}
+  tr:last-child td {{ border-bottom:none; }}
+  td.good {{ color:var(--good); font-weight:600; }}
+  td.bad {{ color:var(--bad); font-weight:600; }}
+  code {{ background:var(--code); padding:.12rem .35rem; border-radius:5px; font-size:.82em;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; white-space:nowrap; }}
+  .callout {{ background:var(--card); border-left:3px solid var(--accent); border-radius:0 8px 8px 0;
+    padding:.8rem 1rem; margin:1.1rem 0; }}
+  .callout.warn {{ border-left-color:var(--bad); }}
+  .kpis {{ display:grid; grid-template-columns:repeat(2,1fr); gap:.75rem; margin:1.2rem 0; }}
+  @media (min-width:640px) {{ .kpis {{ grid-template-columns:repeat(4,1fr); }} }}
+  .kpi {{ background:var(--card); border:1px solid var(--border); border-radius:12px; padding:.9rem; }}
+  .kpi .n {{ font-size:1.5rem; font-weight:700; letter-spacing:-.02em; }}
+  .kpi .l {{ font-size:.78rem; color:var(--muted); margin-top:.15rem; }}
+  footer {{ margin-top:3rem; color:var(--muted); font-size:.85rem; }}
+  a {{ color:var(--accent); }}
+</style>
+
+<div class="wrap">
+<header>
+  <h1>Counting-reward ablation — offline study</h1>
+  <p class="sub">Old exact-match vs the scale-aware graded reward (PR #40), the band/decay knobs,
+  and a training-arm shortlist — replayed over {n:,} real (pred, gt) pairs.</p>
+  <div class="pills">
+    <span class="pill"><b>{n:,}</b> replay pairs</span>
+    <span class="pill">source: <b>blind VLM count</b> vs GT</span>
+    <span class="pill">advantage: <b>GDPO / GSPO</b></span>
+    <span class="pill">regen: <b>counting_reward_ablation.py</b></span>
+  </div>
+</header>
+
+<div class="kpis">
+  <div class="kpi"><div class="n">0.065</div><div class="l">old mean reward at gt≥100 (vs 0.73 at gt 1–4) — large counts unlearnable</div></div>
+  <div class="kpi"><div class="n">48.4%</div><div class="l">of pairs get exactly 0 under exact-match — no gradient</div></div>
+  <div class="kpi"><div class="n">&lt;1%</div><div class="l">zero-reward share under the graded reward</div></div>
+  <div class="kpi"><div class="n">~⅔</div><div class="l">of the graded gain is the decay gradient (⅓ the leniency band)</div></div>
+</div>
+
+<h2><span class="tag">Reward design</span>The shape the reward encodes</h2>
+<p class="lead muted">Reward as a function of the count and the signed error. The full-credit ridge at
+error = 0 and the decay walls both <em>widen with the count</em> — an off-by-one is fatal at gt=3 but
+forgiven at gt=100.</p>
+{_figure_block(outdir, "reward_surface_3d.png", "3-D reward surface: scale-aware full-credit band + Gaussian decay (shipped default).")}
+<div class="grid2">
+  {_figure_block(outdir, "reward_heatmap.png", "Heatmap with the ±band (red) and ±(band+σ) (white) envelopes — both scale with gt.")}
+  {_figure_block(outdir, "reward_curves.png", "Cross-sections at gt=5/20/100: Gaussian vs Laplacian vs band-only.")}
+</div>
+
+<h2><span class="tag">Headline</span>Old exact-match vs new graded</h2>
+<p class="lead">Exact-match is scale-blind and sparse: mean reward <strong>collapses 0.73 → 0.065</strong>
+from gt=1–4 to gt≥100 and zeros 48% of pairs. The graded reward stays <strong>flat ~0.67</strong>
+across every magnitude and turns the dead-zero mass into a smooth learning signal.</p>
+{_figure_block(outdir, "headline_old_vs_new.png", "Left: reward composition. Right: mean reward vs count magnitude — the crux.")}
+<div class="tablewrap"><table>
+  <thead><tr><th>reward</th><th>mean R</th><th>exact</th><th>in-band</th><th>in-decay</th><th>zero</th></tr></thead>
+  <tbody>{headline_rows}</tbody>
+</table></div>
+
+<h2><span class="tag">Decomposition</span>Leniency vs gradient (band-only isolates them)</h2>
+<p class="lead"><code>graded=false</code> keeps the scale-aware band but drops the decay, splitting the gain:
+the band alone lifts 0.516→0.585 (leniency), the decay adds 0.585→0.709 (gradient) and removes the
+zero cliff (41.5% → &lt;1%).</p>
+<div class="tablewrap"><table>
+  <thead><tr><th>reward</th><th>mean R</th><th>zero</th><th>near-miss mean R</th><th>what it adds</th></tr></thead>
+  <tbody>{decomp_rows}</tbody>
+</table></div>
+{_figure_block(outdir, "band_vs_graded_and_decay.png", "Left: band-only vs graded by error bucket. Right: Gaussian vs Laplacian decay.")}
+
+<h2><span class="tag">Knob sweeps</span>Band width and decay width</h2>
+<div class="grid2">
+  {_figure_block(outdir, "rel_tol_sweep.png", "rel_tol (band width): trades exactness for leniency; rel_tol=0.10 risks reward-hacking large counts.")}
+  {_figure_block(outdir, "sigma_grid_heatmap.png", "rel_sigma × min_sigma: rel_sigma is the dominant lever; min_sigma matters only for small counts.")}
+</div>
+
+<h2><span class="tag">Recommendation</span>Training-arm shortlist (prepared, not launched)</h2>
+<p class="lead">A 4-lens agent panel + two adversarial verifiers (all numbers reconciled to
+<code>summary.json</code>) converged on this ladder. Every arm runs the identical config and differs
+<strong>only</strong> in <code>reward_kwargs.counting_*</code>. Budget rule: 2 runs → arms 1–2; 3 → +3; 4 → +4.</p>
+<div class="tablewrap"><table>
+  <thead><tr><th>#</th><th>arm</th><th>role</th><th>Hydra overrides</th><th>experiment_name</th></tr></thead>
+  <tbody>{shortlist_rows}</tbody>
+</table></div>
+<div class="callout"><strong>Read under GDPO/GSPO:</strong> the group-relative advantage cancels the reward
+<em>level</em> — only within-group <em>spread</em> trains. A high mean isn't disqualifying; flat regions
+(mass at 0, or a full-credit plateau) are. Judge every arm on counting-domain <strong>exact-accuracy</strong>,
+not blended reward.</div>
+<div class="callout warn"><strong>sigma030 caveat:</strong> a wider σ awards ~0.97 to gt=100/pred=110 and can
+teach "roughly right is fine" on large counts. If it games in training, swap in the hack-resistant
+<code>+…counting_rel_tol=0.0</code> (arm <code>reltol0</code>). Do not launch multi-GPU without Chris.</div>
+
+<footer>
+  Regenerate everything (figures, tables, this page): <code>python vero2_scripts/debug_scripts/counting_reward_ablation.py</code>.
+  Full formula: <code>counting_reward_formula.md</code> · full write-up: <code>docs/vero2/counting-reward-ablation.md</code>.
+</footer>
+</div>
+"""
+    (outdir / "counting-reward-ablation.html").write_text(html)
+    return outdir / "counting-reward-ablation.html"
+
+
+# --------------------------------------------------------------------------- #
 # Reference-value sanity check                                                #
 # --------------------------------------------------------------------------- #
 def check_reference_values(tol: float = 5e-4) -> bool:
@@ -547,6 +808,8 @@ def main():
     outdir.mkdir(parents=True, exist_ok=True)
 
     written = [
+        plot_reward_surface_3d(outdir),
+        plot_reward_heatmap(outdir),
         plot_headline(res, outdir),
         plot_reward_histograms(res, outdir, ["old_exact", "new_default"], "Reward distribution: old vs new", "hist_old_vs_new.png"),
         plot_rel_tol(res, outdir),
@@ -556,8 +819,9 @@ def main():
     ]
     write_tables(res, outdir)
     write_summary_json(res, outdir, {"source": source, "n_pairs": len(pairs), "decisions_path": args.decisions})
+    html_path = build_html_report(res, outdir, {"source": source, "n_pairs": len(pairs)})
 
-    print(f"\nWrote {len(written)} plots + tables + summary.json to {outdir}")
+    print(f"\nWrote {len(written)} plots + tables + summary.json + {html_path.name} to {outdir}")
     print("\nVariant summary (mean reward | exact | in-band | in-decay | zero):")
     for name, d in res["variants"].items():
         print(

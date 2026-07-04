@@ -11,11 +11,26 @@ width/shape, band-only vs graded — plus a ranked shortlist of training arms.
   `vero2_scripts/debug_scripts/counting_reward_ablation.py`.
 - **Raw metrics:** [`assets/counting-reward-ablation/summary.json`](assets/counting-reward-ablation/summary.json),
   `variant_summary.{csv,md}`, `by_gt_bucket.csv`.
+- **Standalone HTML report** (self-contained, all figures inlined):
+  [`assets/counting-reward-ablation/counting-reward-ablation.html`](assets/counting-reward-ablation/counting-reward-ablation.html).
 
 ```bash
-# one command; writes plots + tables + summary.json into docs/vero2/assets/counting-reward-ablation/
+# one command; writes plots + tables + summary.json + the HTML report into docs/vero2/assets/counting-reward-ablation/
 python vero2_scripts/debug_scripts/counting_reward_ablation.py
 ```
+
+## Reward design
+
+Reward as a function of the count and the signed error `d = pred − gt`. The full-credit
+**ridge** at `d=0` and the decay **walls** both *widen with the count* — the geometry the
+shipped reward encodes (an off-by-one is fatal at gt=3 but forgiven at gt=100).
+
+![reward surface](assets/counting-reward-ablation/reward_surface_3d.png)
+
+The heatmap makes the two scale-aware envelopes explicit — the ±`floor(0.05·gt)` full-credit
+band (red, stepping at gt=20/40/…) and the ±`(band+σ)` decay envelope (white):
+
+![reward heatmap](assets/counting-reward-ablation/reward_heatmap.png)
 
 ## Data
 
