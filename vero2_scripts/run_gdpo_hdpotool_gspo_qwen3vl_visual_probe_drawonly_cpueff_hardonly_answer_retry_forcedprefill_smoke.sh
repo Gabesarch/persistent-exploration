@@ -31,12 +31,14 @@ export SKIP_SQUEUE=1
 export VERO2_COMPREHENSIVE_DEBUG_LOGGING=1
 export WANDB_MODE=offline                          # smoke: offline, no proxy needed
 export CONFIG_NAME="gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_drawonly_debug256_cpueff_answer_retry_forcedprefill"
-# Draw-only retry prefill: no "zoom in"; nudges careful annotate-and-recheck (helps counting).
-export ANSWER_RETRY_ASSISTANT_PREFILL="Let's see, I do not have enough information to answer yet. I have not examined the image carefully enough — I should use the drawing tools to mark and annotate the relevant objects and regions, then look closely at my annotation to make sure I have accounted for everything before answering."
+# Draw-only retry prefill: no "zoom in"; assumes the model may have ALREADY drawn some
+# (possibly wrong/incomplete) annotations, and nudges re-examining + correcting/completing
+# them. Kept general (not counting-specific) so it transfers across task types.
+export ANSWER_RETRY_ASSISTANT_PREFILL="Let's see, I do not have enough information to answer yet. My current annotations may be inaccurate or incomplete — let me use the drawing tools to correct and complete my markings, then re-examine the image before answering."
 export TRAINER_EXPERIMENT_NAME="drawonly_arf_smoke_${SMOKE_ID}"
 export TRAINER_DEFAULT_LOCAL_DIR="${SAVE_PATH}/checkpoints/vero2_verl/drawonly_arf_smoke_${SMOKE_ID}"
 
-exec bash vero2_scripts/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_zoomdraw_cpueff_hardonly_answer_retry_forcedprefill_full.sh vllm \
+exec bash vero2_scripts/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill_full.sh vllm \
   data.train_batch_size=8 \
   actor_rollout_ref.actor.ppo_mini_batch_size=8 \
   actor_rollout_ref.rollout.n=8 \
