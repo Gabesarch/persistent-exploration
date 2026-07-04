@@ -157,7 +157,44 @@ def format_reward(predict_str: str, extra_info: Any | None = None) -> float:  # 
     return 1.0 if is_valid else 0.0
 
 
-def acc_reward(predict_str: str, ground_truth: str, use_boxed: bool = False, extra_info=None) -> float:  # noqa: ARG001
+def _build_counting_reward_kwargs(
+    *,
+    rel_tol: float | None = None,
+    rel_band_cap: float | None = None,
+    rel_sigma: float | None = None,
+    min_sigma: float | None = None,
+    decay_exp: float | None = None,
+    graded: bool = True,
+) -> dict[str, Any]:
+    """Collect non-default counting knobs into a kwargs dict for ``counting_reward_value``.
+
+    Returns ``{}`` when every knob is at its default, so the counting reward path is
+    bit-identical to the shipped behavior unless a training arm overrides a knob via
+    ``reward.custom_reward_function.reward_kwargs.counting_*``.
+    """
+    kwargs: dict[str, Any] = {}
+    if rel_tol is not None:
+        kwargs["rel_tol"] = float(rel_tol)
+    if rel_band_cap is not None:
+        kwargs["rel_band_cap"] = float(rel_band_cap)
+    if rel_sigma is not None:
+        kwargs["rel_sigma"] = float(rel_sigma)
+    if min_sigma is not None:
+        kwargs["min_sigma"] = float(min_sigma)
+    if decay_exp is not None:
+        kwargs["decay_exp"] = float(decay_exp)
+    if not graded:
+        kwargs["graded"] = False
+    return kwargs
+
+
+def acc_reward(
+    predict_str: str,
+    ground_truth: str,
+    use_boxed: bool = False,  # noqa: ARG001
+    extra_info=None,
+    counting_reward_kwargs: dict[str, Any] | None = None,
+) -> float:
     reward_type = _extract_reward_type(extra_info)
     if reward_type is None:
         return 0.0
@@ -185,7 +222,10 @@ def acc_reward(predict_str: str, ground_truth: str, use_boxed: bool = False, ext
     handler = reward_handlers.get(reward_type)
     if handler is None:
         return 0.0
-    return handler(final_answer, truth, extra_info=extra_info)
+    handler_kwargs: dict[str, Any] = {"extra_info": extra_info}
+    if reward_type == "counting" and counting_reward_kwargs:
+        handler_kwargs["counting_reward_kwargs"] = counting_reward_kwargs
+    return handler(final_answer, truth, **handler_kwargs)
 
 
 def tool_efficiency_reward(
@@ -221,17 +261,38 @@ def compute_score(
     tool_efficiency_concave_k: float = 10.0,
     tool_efficiency_concave_q: float = 0.95,
     tool_efficiency_score_weight: float = 0.0,
+    counting_rel_tol: float | None = None,
+    counting_rel_band_cap: float | None = None,
+    counting_rel_sigma: float | None = None,
+    counting_min_sigma: float | None = None,
+    counting_decay_exp: float | None = None,
+    counting_graded: bool = True,
     extra_info=None,
 ) -> dict[str, float]:
     predict_str = str(predict_str)
     ground_truth = str(ground_truth)
+
+    counting_reward_kwargs = _build_counting_reward_kwargs(
+        rel_tol=counting_rel_tol,
+        rel_band_cap=counting_rel_band_cap,
+        rel_sigma=counting_rel_sigma,
+        min_sigma=counting_min_sigma,
+        decay_exp=counting_decay_exp,
+        graded=counting_graded,
+    )
 
     is_valid, _, tool_call_count = _parse_multiturn_tool_calling_output(predict_str)
     formatting = 1.0 if is_valid else 0.0
     if formatting == 0.0:
         accuracy = 0.0
     else:
-        accuracy = acc_reward(predict_str, ground_truth, use_boxed=use_boxed, extra_info=extra_info)
+        accuracy = acc_reward(
+            predict_str,
+            ground_truth,
+            use_boxed=use_boxed,
+            extra_info=extra_info,
+            counting_reward_kwargs=counting_reward_kwargs,
+        )
 
     tool_call_bonus_score = 0.0
     if (
@@ -279,6 +340,12 @@ def compute_score_from_data_source(
     tool_efficiency_concave_k: float = 10.0,
     tool_efficiency_concave_q: float = 0.95,
     tool_efficiency_score_weight: float = 0.0,
+    counting_rel_tol: float | None = None,
+    counting_rel_band_cap: float | None = None,
+    counting_rel_sigma: float | None = None,
+    counting_min_sigma: float | None = None,
+    counting_decay_exp: float | None = None,
+    counting_graded: bool = True,
     **_: dict,
 ) -> dict[str, float]:
     """Adapter for custom_reward_function configs that expect default signature."""
@@ -294,6 +361,12 @@ def compute_score_from_data_source(
         tool_efficiency_concave_k=tool_efficiency_concave_k,
         tool_efficiency_concave_q=tool_efficiency_concave_q,
         tool_efficiency_score_weight=tool_efficiency_score_weight,
+        counting_rel_tol=counting_rel_tol,
+        counting_rel_band_cap=counting_rel_band_cap,
+        counting_rel_sigma=counting_rel_sigma,
+        counting_min_sigma=counting_min_sigma,
+        counting_decay_exp=counting_decay_exp,
+        counting_graded=counting_graded,
         extra_info=extra_info,
     )
 
@@ -312,6 +385,12 @@ async def async_compute_score_from_data_source(
     tool_efficiency_concave_k: float = 10.0,
     tool_efficiency_concave_q: float = 0.95,
     tool_efficiency_score_weight: float = 0.0,
+    counting_rel_tol: float | None = None,
+    counting_rel_band_cap: float | None = None,
+    counting_rel_sigma: float | None = None,
+    counting_min_sigma: float | None = None,
+    counting_decay_exp: float | None = None,
+    counting_graded: bool = True,
     **_: dict,
 ) -> dict[str, float]:
     """Async adapter for reward loops."""
@@ -328,5 +407,11 @@ async def async_compute_score_from_data_source(
         tool_efficiency_concave_k=tool_efficiency_concave_k,
         tool_efficiency_concave_q=tool_efficiency_concave_q,
         tool_efficiency_score_weight=tool_efficiency_score_weight,
+        counting_rel_tol=counting_rel_tol,
+        counting_rel_band_cap=counting_rel_band_cap,
+        counting_rel_sigma=counting_rel_sigma,
+        counting_min_sigma=counting_min_sigma,
+        counting_decay_exp=counting_decay_exp,
+        counting_graded=counting_graded,
         extra_info=extra_info,
     )
