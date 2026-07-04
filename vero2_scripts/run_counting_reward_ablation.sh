@@ -3,7 +3,7 @@
 # Counting-reward ablation launcher (PREPARED — DO NOT LAUNCH WITHOUT CHRIS).
 #
 # One launcher, one arm per invocation, selected by the ARM env var. Each arm =
-#   (1) a counting-reward knob override (Hydra; see counting_reward_formula.md), and
+#   (1) a counting-reward knob override (Hydra; see docs/vero2/counting-reward-formula.md), and
 #   (2) the counting training data mixed in (the standard jsonls have ZERO counting
 #       rows — the configured chart_search_counting_* train file is 100% `search`).
 #

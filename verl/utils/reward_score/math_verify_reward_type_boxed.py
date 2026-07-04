@@ -967,7 +967,7 @@ def counting_reward_value(
     constants (``_COUNTING_REL_TOL`` etc.), so an unadorned call is identical to
     the shipped reward. Training arms override them via
     ``reward.custom_reward_function.reward_kwargs.counting_*`` (see
-    ``counting_reward_formula.md``). ``graded=False`` collapses the decay to a
+    ``docs/vero2/counting-reward-formula.md``). ``graded=False`` collapses the decay to a
     hard band (1.0 inside, 0.0 outside), isolating leniency from gradient signal.
     """
     rel_tol = _COUNTING_REL_TOL if rel_tol is None else float(rel_tol)

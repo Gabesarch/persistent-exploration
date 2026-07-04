@@ -6,16 +6,14 @@ reward with a **scale-aware graded (decaying-band)** reward. Chris asked for an
 shapes are worth GPU time. This memo is that study — old vs new, band width, decay
 width/shape, band-only vs graded — plus a ranked shortlist of training arms.
 
-- **Formula + knobs:** [`counting_reward_formula.md`](../../counting_reward_formula.md).
+- **Formula + knobs:** [`counting-reward-formula.md`](counting-reward-formula.md) — the authoritative reward math this study ablates.
 - **Harness (regenerates every figure/table below with one command):**
   `vero2_scripts/debug_scripts/counting_reward_ablation.py`.
 - **Raw metrics:** [`assets/counting-reward-ablation/summary.json`](assets/counting-reward-ablation/summary.json),
   `variant_summary.{csv,md}`, `by_gt_bucket.csv`.
-- **Standalone HTML report** (self-contained, all figures inlined):
-  [`assets/counting-reward-ablation/counting-reward-ablation.html`](assets/counting-reward-ablation/counting-reward-ablation.html).
 
 ```bash
-# one command; writes plots + tables + summary.json + the HTML report into docs/vero2/assets/counting-reward-ablation/
+# one command; writes plots + tables + summary.json into docs/vero2/assets/counting-reward-ablation/
 python vero2_scripts/debug_scripts/counting_reward_ablation.py
 ```
 
@@ -224,7 +222,7 @@ leaving near-miss gradient on the table.
 
 ## Launching an arm (prepared, not launched)
 
-> **Do not launch multi-GPU training without checking with Chris** (per TASK.md).
+> **Do not launch multi-GPU training without checking with Chris first.**
 
 Two things change per arm relative to a normal vero2 run:
 

@@ -55,7 +55,7 @@ DEFAULT_DECISIONS = (
 )
 DEFAULT_OUTDIR = _REPO_ROOT / "docs/vero2/assets/counting-reward-ablation"
 
-# Reference values (TASK.md) -- the harness must reproduce these for the default config.
+# Reference values (docs/vero2/counting-reward-formula.md) -- the harness must reproduce these for the default config.
 REFERENCE_VALUES = [
     ((110, 100), 0.8948),
     ((8, 7), 0.4037),
@@ -748,7 +748,7 @@ teach "roughly right is fine" on large counts. If it games in training, swap in 
 
 <footer>
   Regenerate everything (figures, tables, this page): <code>python vero2_scripts/debug_scripts/counting_reward_ablation.py</code>.
-  Full formula: <code>counting_reward_formula.md</code> · full write-up: <code>docs/vero2/counting-reward-ablation.md</code>.
+  Full formula: <code>docs/vero2/counting-reward-formula.md</code> · full write-up: <code>docs/vero2/counting-reward-ablation.md</code>.
 </footer>
 </div>
 """
@@ -761,7 +761,7 @@ teach "roughly right is fine" on large counts. If it games in training, swap in 
 # --------------------------------------------------------------------------- #
 def check_reference_values(tol: float = 5e-4) -> bool:
     ok = True
-    print("Reference-value check (default config, TASK.md):")
+    print("Reference-value check (default config, docs/vero2/counting-reward-formula.md):")
     for (pred, gt), expected in REFERENCE_VALUES:
         got = counting_reward_value(pred, gt)
         passed = abs(got - expected) <= tol

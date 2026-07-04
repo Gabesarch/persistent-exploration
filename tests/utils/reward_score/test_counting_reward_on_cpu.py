@@ -103,15 +103,15 @@ def test_multiturn_compute_score_uses_graded_counting_reward():
     assert result["accuracy"] < 0.1
 
 
-# --- Reference values (harness sanity checks; see TASK.md / counting_reward_formula.md) ---
+# --- Reference values (harness sanity checks; see docs/vero2/counting-reward-formula.md) ---
 
 
 @pytest.mark.parametrize(
     "pred, gt, expected",
     [
-        (110, 100, 0.8948),  # TASK.md quotes ~0.895
-        (8, 7, 0.4037),  # TASK.md quotes ~0.40
-        (0, 1, 0.0183),  # TASK.md quotes ~0.018
+        (110, 100, 0.8948),  # ~0.895
+        (8, 7, 0.4037),  # ~0.40
+        (0, 1, 0.0183),  # ~0.018
     ],
 )
 def test_reference_values_reproduce_to_three_decimals(pred, gt, expected):
@@ -132,7 +132,7 @@ def test_module_constants_have_documented_defaults():
 def test_defaults_equal_module_constants_across_grid():
     # An unadorned call must equal an explicit call that passes the module constants,
     # over the band, the decay, and the zero-gt edge -- the "no override => shipped
-    # behavior" guarantee (TASK.md Verify #3).
+    # behavior" guarantee.
     for gt in (0, 1, 2, 7, 19, 20, 50, 100, 512, 1912):
         for delta in (0, 1, 2, 3, 5, 8, 13, 40, 200):
             for pred in {gt + delta, max(gt - delta, 0)}:
