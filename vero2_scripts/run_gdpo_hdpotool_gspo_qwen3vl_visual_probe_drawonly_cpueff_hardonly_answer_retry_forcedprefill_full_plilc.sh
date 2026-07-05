@@ -30,5 +30,11 @@ export TRAINER_EXPERIMENT_SUFFIX="qwen3vl_visual_probe_drawonly_gdpo_hdpotool_ha
 
 # save_freq=5 (not 20): at this step cost a 24h task can't reach step 20, so with save_freq=20
 # every resume restarts from scratch. Checkpoint by ~step 5 instead; keep only 3 (disk is ~full).
+# Rollout throughput (inference-only, does NOT change the objective): prefix + mm caching so the
+# 11-turn drawing trajectories don't re-prefill the growing context / re-embed the annotated image
+# every turn, plus a bigger prefill batch. Biggest lever for multi-turn rollout speed.
 exec bash vero2_scripts/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill_full.sh \
-  vllm trainer.save_freq=5 trainer.max_actor_ckpt_to_keep=3
+  vllm trainer.save_freq=5 trainer.max_actor_ckpt_to_keep=3 \
+  actor_rollout_ref.rollout.enable_prefix_caching=true \
+  actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb=4 \
+  actor_rollout_ref.rollout.max_num_batched_tokens=16384
