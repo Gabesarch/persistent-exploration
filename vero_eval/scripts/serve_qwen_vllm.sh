@@ -60,11 +60,23 @@ MM_MIN_PIXELS="${MM_MIN_PIXELS:-4096}"
 echo "Starting vLLM server (log: $LOGFILE)..."
 CHAT_TEMPLATE_ARG=""
 [[ -n "$CUSTOM_CHAT_TEMPLATE" ]] && CHAT_TEMPLATE_ARG="--chat-template $CUSTOM_CHAT_TEMPLATE"
+# `--attention-config.flash_attn_version 2` is only understood by vLLM >= 0.22; older
+# stacks (e.g. the vero2 training env's vLLM 0.18) reject the unknown arg and refuse to
+# start. Gate it on the running vLLM version so serving works across env stacks; the
+# default (>= 0.22) behavior is unchanged.
+ATTN_ARGS=()
+if python - <<'PY' 2>/dev/null
+from importlib.metadata import version
+from packaging.version import Version
+raise SystemExit(0 if Version(version("vllm")) >= Version("0.22") else 1)
+PY
+then ATTN_ARGS=(--attention-config.flash_attn_version 2)
+else echo "vLLM < 0.22 detected -> omitting --attention-config.flash_attn_version (unsupported)"; fi
 nohup vllm serve "$CHECKPOINT_PATH" \
   --port "$PORT" \
   --served-model-name "$MODEL_NAME" \
   --gpu-memory-utilization 0.9 \
-  --attention-config.flash_attn_version 2 \
+  "${ATTN_ARGS[@]}" \
   --tensor-parallel-size "$NUM_GPUS" \
   --uvicorn-log-level info \
   --max-model-len "${MAX_MODEL_LEN:-32768}" \
