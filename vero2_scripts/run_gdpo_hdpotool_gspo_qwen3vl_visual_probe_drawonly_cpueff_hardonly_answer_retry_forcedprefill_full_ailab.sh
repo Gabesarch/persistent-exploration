@@ -12,8 +12,8 @@
 #SBATCH --gres=gpu:h200:8
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=1450G
-#SBATCH --time=24:00:00
-#SBATCH --array=1-5%1
+#SBATCH --time=72:00:00
+#SBATCH --array=1-10%1
 #SBATCH --output=slurm/output/%x_%j.log
 #SBATCH --error=slurm/error/%x_%j.log
 
@@ -28,4 +28,12 @@ source ./set_paths.sh                                   # env + online W&B (set_
 # so the pli / pli-lc / ailab parallel jobs never write the same directory.
 export TRAINER_EXPERIMENT_SUFFIX="qwen3vl_visual_probe_drawonly_gdpo_hdpotool_hardonly_answer_retry_forcedprefill_ailab"
 
-exec bash vero2_scripts/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill_full.sh
+# ailab reaped our last run at ~5.75h (guest job). So checkpoint AGGRESSIVELY: save_freq=1
+# (every step) means a reap costs at most one step, and the %1 resume chain (10 tasks) picks
+# up from the last checkpoint. keep=3 bounds disk (FS ~full). Plus the rollout caching speedups
+# (inference-only) so each step -- and thus each checkpoint -- lands well inside the reap window.
+exec bash vero2_scripts/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill_full.sh \
+  vllm trainer.save_freq=1 trainer.max_actor_ckpt_to_keep=3 \
+  actor_rollout_ref.rollout.enable_prefix_caching=true \
+  actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb=4 \
+  actor_rollout_ref.rollout.max_num_batched_tokens=16384
