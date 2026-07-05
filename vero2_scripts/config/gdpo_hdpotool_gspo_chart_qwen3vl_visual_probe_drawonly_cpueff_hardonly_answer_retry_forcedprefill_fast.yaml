@@ -8,10 +8,17 @@ hydra:
 
 algorithm:
   adv_estimator: gdpo
-  # Conditional retry changes tool-call counts only after incorrect answers, so
-  # keep rewards focused on task accuracy and format.
+  # accuracy (task) + format + tool_efficiency (concave length penalty -> fewer tool calls,
+  # a key speed lever ported from the friend's tested config). Weights + eligibility match his.
   gdpo_reward_keys: [accuracy, format, tool_efficiency]
-  gdpo_reward_weights: [0.9, 0.1]
+  gdpo_reward_weights: [0.8, 0.1, 0.1]
+  gdpo_reward_eligibility:
+    # tool_efficiency only rewards trajectories that got the answer right (accuracy>=1),
+    # so we never reward "few tool calls" on a wrong answer.
+    tool_efficiency:
+      key: accuracy
+      threshold: 1.0
+      min_group_size: 2
   use_kl_in_reward: false
   kl_ctrl:
     kl_coef: 0
