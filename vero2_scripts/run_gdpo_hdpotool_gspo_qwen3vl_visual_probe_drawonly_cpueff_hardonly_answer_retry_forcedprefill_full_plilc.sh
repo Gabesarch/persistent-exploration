@@ -28,13 +28,13 @@ source ./set_paths.sh                                   # env + online W&B (set_
 # so the pli / pli-lc parallel jobs never write the same directory.
 export TRAINER_EXPERIMENT_SUFFIX="qwen3vl_visual_probe_drawonly_gdpo_hdpotool_hardonly_answer_retry_forcedprefill_plilc"
 
+# FAST config = friend's tested speed levers (per-turn cap 4096, tool_efficiency reward, shorter
+# lengths, bounded answer-retry max_retries=2) + our answer-retry interruption. Validated end-to-end
+# on the 4xA100/bs16 smoke (10707390): ~8-10 min/step, no schema/advantage errors. Repointed here so
+# the full run reproduces exactly what the smoke validated (no extra CLI overrides on rollout).
+export CONFIG_NAME="gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill_fast"
+
 # save_freq=5 (not 20): at this step cost a 24h task can't reach step 20, so with save_freq=20
 # every resume restarts from scratch. Checkpoint by ~step 5 instead; keep only 3 (disk is ~full).
-# Rollout throughput (inference-only, does NOT change the objective): prefix + mm caching so the
-# 11-turn drawing trajectories don't re-prefill the growing context / re-embed the annotated image
-# every turn, plus a bigger prefill batch. Biggest lever for multi-turn rollout speed.
 exec bash vero2_scripts/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill_full.sh \
-  vllm trainer.save_freq=5 trainer.max_actor_ckpt_to_keep=3 \
-  actor_rollout_ref.rollout.enable_prefix_caching=true \
-  actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb=4 \
-  actor_rollout_ref.rollout.max_num_batched_tokens=16384
+  vllm trainer.save_freq=5 trainer.max_actor_ckpt_to_keep=3
