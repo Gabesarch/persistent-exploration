@@ -1,0 +1,23 @@
+# GREEDY (temperature 0) variant of visual_probe_hard_reasoning_zoom — for debugging
+# cross-vLLM-version accuracy differences with sampling noise removed. Identical to the
+# training-faithful yaml except temperature 0 / do_sample False, so a single run per
+# serving stack is a (near-)deterministic point estimate. Greedy argmax is insensitive
+# to top_p/top_k handling, so if greedy scores CONVERGE across vLLM versions the gap is
+# in sampling-param forwarding; if they still DIVERGE it's preprocessing/parsing/numerics.
+include:
+  - visual_probe_hard.yaml
+  - ../_tool_templates/_toolset_zoom_vero_yaml
+task: "visual_probe_hard_reasoning_zoom_greedy"
+tag: visual_search
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 0.0
+  top_p: 1.0
+  top_k: -1
+  do_sample: False
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: "\n"
+    post_prompt: ""
+metadata:
+  image_indexing: training_faithful
