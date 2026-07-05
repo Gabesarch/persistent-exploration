@@ -13,7 +13,7 @@
 #SBATCH --gres=gpu:h100:8
 #SBATCH --cpus-per-task=96
 #SBATCH --mem=960G
-#SBATCH --time=24:00:00
+#SBATCH --time=72:00:00
 #SBATCH --array=1-5%1
 #SBATCH --output=slurm/output/%x_%j.log
 #SBATCH --error=slurm/error/%x_%j.log
@@ -29,4 +29,7 @@ source ./set_paths.sh                                   # env + online W&B (set_
 # so the pli / pli-lc / ailab parallel jobs never write the same directory.
 export TRAINER_EXPERIMENT_SUFFIX="qwen3vl_visual_probe_drawonly_gdpo_hdpotool_hardonly_answer_retry_forcedprefill_pli"
 
-exec bash vero2_scripts/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill_full.sh
+# save_freq=5 (not 20): at this step cost a 24h task can't reach step 20, so with save_freq=20
+# every resume restarts from scratch. Checkpoint by ~step 5 instead; keep only 3 (disk is ~full).
+exec bash vero2_scripts/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill_full.sh \
+  vllm trainer.save_freq=5 trainer.max_actor_ckpt_to_keep=3
