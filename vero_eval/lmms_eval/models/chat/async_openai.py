@@ -49,6 +49,7 @@ _IMAGE_REGISTRY_ENV = "LMMS_EVAL_IMAGE_REGISTRY"
 _FORCE_ACTION_REQUIRED_TAG_KEY = "verl_force_action_tag_after_think_required_tag"
 _FORCE_ACTION_TAG_IDS_KEY = "verl_force_action_tag_after_think_tag_ids"
 _FORCE_ACTION_AFTER_THINK_IDS_OPTIONS_KEY = "verl_force_action_tag_after_think_after_think_ids_options"
+_ASSISTANT_THINK_PREFIX = "<think>\n"
 
 # Env var carrying the per-call image registry (img_idx -> file path) to the MCP
 # tool subprocess, so tools resolve img_idx the way training does. Keep in sync
@@ -123,6 +124,19 @@ def _composite_zoom_to_original(image_provenance, img_idx, bbox):
     return orig_idx, nsub, bbox_prime
 
 
+def _restore_assistant_forced_prefill(content: str, prefix: str = _ASSISTANT_THINK_PREFIX) -> str:
+    """Restore forced assistant prefill that is present in the prompt but omitted from completions."""
+    if not content or not prefix:
+        return content
+    stripped = content.lstrip()
+    if stripped.startswith(prefix.strip()):
+        return content
+    if "</think>" not in content:
+        return content
+    leading_ws_len = len(content) - len(stripped)
+    return content[:leading_ws_len] + prefix + stripped
+
+
 load_dotenv(verbose=True)
 
 
@@ -164,6 +178,7 @@ class AsyncOpenAIChat(lmms):
         tool_image_as_user_turn: bool = False,
         force_answer_after_max_tool_iterations: bool = False,
         force_final_answer_prefix: str = "",
+        force_final_answer_think_prefill: Optional[str] = None,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -219,6 +234,9 @@ class AsyncOpenAIChat(lmms):
         self.tool_image_as_user_turn = parse_bool(tool_image_as_user_turn)
         self.force_answer_after_max_tool_iterations = parse_bool(force_answer_after_max_tool_iterations)
         self.force_final_answer_prefix = force_final_answer_prefix or ""
+        if force_final_answer_think_prefill is None:
+            force_final_answer_think_prefill = os.getenv("FORCE_FINAL_ANSWER_THINK_PREFILL", "")
+        self.force_final_answer_think_prefill = force_final_answer_think_prefill or ""
         self._forced_action_tokenizer = None
         self._tool_functions = None
         self._task_tools_cache = {}
@@ -302,33 +320,26 @@ class AsyncOpenAIChat(lmms):
             }
         }
 
-    async def _force_final_answer_response(self, payload: dict, task: Optional[str]) -> Tuple[str, int, int, int]:
-        final_payload = dict(payload)
-        final_payload.pop("tools", None)
-        final_payload.pop("tool_choice", None)
-        extra_body = dict(final_payload.get("extra_body") or {})
-        extra_body.update(self._forced_action_extra_body("<answer>"))
-        final_payload["extra_body"] = extra_body
+    def _with_forced_action_extra_body(self, payload: dict, required_tag: str) -> dict:
+        payload = dict(payload)
+        extra_body = dict(payload.get("extra_body") or {})
+        extra_body.update(self._forced_action_extra_body(required_tag))
+        payload["extra_body"] = extra_body
+        return payload
 
-        response = await self.client.chat.completions.create(**final_payload)
-        content = response.choices[0].message.content or ""
-        input_tokens = 0
-        output_tokens = 0
-        reasoning_tokens = 0
-        if hasattr(response, "usage") and response.usage:
-            input_tokens = getattr(response.usage, "prompt_tokens", 0) or 0
-            output_tokens = getattr(response.usage, "completion_tokens", 0) or 0
-            if hasattr(response.usage, "completion_tokens_details") and response.usage.completion_tokens_details:
-                reasoning_tokens = getattr(response.usage.completion_tokens_details, "reasoning_tokens", 0) or 0
-        log_usage(
-            model_name=self.model_version,
-            task_name=task,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            reasoning_tokens=reasoning_tokens,
-            source="model",
-        )
-        return content, input_tokens, output_tokens, reasoning_tokens
+    def _with_final_answer_think_prefill(self, payload: dict) -> tuple[dict, str]:
+        if not self.force_final_answer_think_prefill:
+            return payload, ""
+
+        payload = dict(payload)
+        messages = list(payload.get("messages") or [])
+        prefill_content = f"{_ASSISTANT_THINK_PREFIX}{self.force_final_answer_think_prefill}"
+        messages.append({"role": "assistant", "content": prefill_content})
+        payload["messages"] = messages
+        extra_body = dict(payload.get("extra_body") or {})
+        extra_body.update({"continue_final_message": True, "add_generation_prompt": False})
+        payload["extra_body"] = extra_body
+        return payload, prefill_content
 
     def _rewrite_tool_schemas_for_model(self, tool_list):
         rewritten = []
@@ -614,6 +625,7 @@ class AsyncOpenAIChat(lmms):
             # Per-task image-indexing mode controls the model-visible tool_response wording
             # (training_faithful | multi_index | None=default). See _tool_image_registered_text.
             image_indexing_mode = task_metadata.get("image_indexing")
+            restore_assistant_forced_prefill = parse_bool(task_metadata.get("restore_assistant_forced_prefill", False))
 
             response = await self.client.chat.completions.create(**payload)
             last_response = response.choices[0].message.content or ""
@@ -644,10 +656,14 @@ class AsyncOpenAIChat(lmms):
             tool_iteration = 0
             tool_image_count = 0
             terminal_tool_called = False
+            forced_final_answer_requested = False
             while response.choices[0].finish_reason == "tool_calls" and tool_iteration < self.max_tool_iterations:
                 tool_iteration += 1
                 assistant_message = response.choices[0].message
-                assistant_dict = {"role": "assistant", "content": assistant_message.content or ""}
+                assistant_content = assistant_message.content or ""
+                if restore_assistant_forced_prefill:
+                    assistant_content = _restore_assistant_forced_prefill(assistant_content)
+                assistant_dict = {"role": "assistant", "content": assistant_content}
                 if assistant_message.tool_calls:
                     assistant_dict["tool_calls"] = [
                         {
@@ -750,11 +766,13 @@ class AsyncOpenAIChat(lmms):
                 if pending_user_images:
                     messages.append({"role": "user", "content": pending_user_images + [{"type": "text", "text": "Above are the tool-returned image(s)."}]})
 
+                force_final_answer_now = self.force_answer_after_max_tool_iterations and tool_iteration >= self.max_tool_iterations
+
                 # Once the image budget is spent, stop offering image-producing tools
                 # so the model answers. Terminal (answer-protocol) tools stay offered:
                 # they return no images and may be the task's only answer channel
                 # (e.g. screenspot's computer_use).
-                if tool_image_count >= self.max_tool_images:
+                if tool_image_count >= self.max_tool_images and not force_final_answer_now:
                     terminal_only = [f for f in payload.get("tools", []) if f["function"]["name"] in terminal_tools]
                     if terminal_only:
                         payload["tools"] = terminal_only
@@ -763,7 +781,14 @@ class AsyncOpenAIChat(lmms):
                         payload.pop("tool_choice", None)
 
                 payload["messages"] = messages
-                response = await self.client.chat.completions.create(**payload)
+                request_payload = payload
+                response_prefill = ""
+                if force_final_answer_now:
+                    forced_final_answer_requested = True
+                    eval_logger.info(f"Forcing final answer on final allowed assistant turn for request {idx}")
+                    request_payload = self._with_forced_action_extra_body(payload, "<answer>")
+                    request_payload, response_prefill = self._with_final_answer_think_prefill(request_payload)
+                response = await self.client.chat.completions.create(**request_payload)
                 input_tokens = 0
                 output_tokens = 0
                 reasoning_tokens = 0
@@ -785,27 +810,17 @@ class AsyncOpenAIChat(lmms):
                 )
                 last_response = response.choices[0].message.content or ""
                 try:
+                    if response_prefill:
+                        all_response += response_prefill
                     all_response += last_response
                 except Exception as e:
                     all_response += str(e)
 
             if tool_iteration >= self.max_tool_iterations and not terminal_tool_called:
-                eval_logger.warning(f"Max tool iterations ({self.max_tool_iterations}) reached for request {idx}")
-                forced_final_answer_succeeded = False
-                if self.force_answer_after_max_tool_iterations:
-                    try:
-                        eval_logger.info(f"Forcing final answer after max tool iterations for request {idx}")
-                        final_text, input_tokens, output_tokens, reasoning_tokens = await self._force_final_answer_response(
-                            payload, task if "task" in locals() else None
-                        )
-                        total_input_tokens += input_tokens
-                        total_output_tokens += output_tokens
-                        total_reasoning_tokens += reasoning_tokens
-                        all_response += final_text
-                        forced_final_answer_succeeded = True
-                    except Exception as exc:
-                        eval_logger.warning(f"Forced final answer after max tool iterations failed for request {idx}: {exc}")
-                if not forced_final_answer_succeeded:
+                if forced_final_answer_requested and response.choices[0].finish_reason != "tool_calls":
+                    eval_logger.info(f"Final answer was forced on max tool turn for request {idx}")
+                else:
+                    eval_logger.warning(f"Max tool iterations ({self.max_tool_iterations}) reached for request {idx}")
                     all_response += f"\n[MAX_TOOL_ITERATIONS_REACHED]"
             return all_response, idx, TokenCounts(input_tokens=total_input_tokens, output_tokens=total_output_tokens, reasoning_tokens=total_reasoning_tokens)
         finally:

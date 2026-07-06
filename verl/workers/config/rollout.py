@@ -90,6 +90,9 @@ class MultiTurnConfig(BaseConfig):
     force_tool_calls_until_final_turn: bool = False
     force_answer_on_final_turn: bool = False
     final_answer_token_margin: int = 2048
+    # Text appended inside the forced final turn's `<think>` block before generation.
+    # Empty string leaves forced final-answer generation unchanged.
+    force_final_answer_think_prefill: str = ""
     # Text forced immediately after the `<answer>` tag on the forced final turn (e.g. "\n\\boxed{"
     # to start a boxed answer). Empty string forces only the `<answer>` tag, as before.
     force_final_answer_prefix: str = ""

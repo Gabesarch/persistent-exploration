@@ -37,6 +37,7 @@ class _FakeTokenizer:
             "\n<answer>": [2, 20, 21, 22],
             "\n<answer>\n\\boxed{": [2, 20, 21, 22, 2, 60, 61],
             "retry prefill": [70, 71],
+            "This is the final turn, so I need to answer from the evidence gathered so far.": [72],
         }
         self.id_to_text = {
             1: "</think>",
@@ -55,6 +56,7 @@ class _FakeTokenizer:
             61: "{",
             70: "retry ",
             71: "prefill",
+            72: "This is the final turn, so I need to answer from the evidence gathered so far.",
         }
 
     def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
@@ -224,6 +226,7 @@ def _make_loop(tokenizer: _FakeTokenizer, server_manager: _FakeServerManager, to
     loop.force_tool_calls_until_final_turn = True
     loop.force_answer_on_final_turn = False
     loop.final_answer_token_margin = 2048
+    loop.force_final_answer_think_prefill = ""
     loop.force_final_answer_prefix = ""
     loop.max_assistant_turns = 11
     loop.max_user_turns = 10
@@ -234,6 +237,7 @@ def _make_loop(tokenizer: _FakeTokenizer, server_manager: _FakeServerManager, to
     loop.tools = {}
     loop.tool_parser = tool_parser
     loop.interaction_config_file = None
+    loop.response_display_prefix = ""
     loop._debug_enabled_for_agent = lambda agent_data: False
     return loop
 
@@ -248,6 +252,7 @@ def _make_conditional_retry_loop(
     loop.force_tool_calls_until_final_turn = False
     loop.force_answer_on_final_turn = False
     loop.final_answer_token_margin = 4
+    loop.force_final_answer_think_prefill = ""
     loop.force_final_answer_prefix = ""
     loop.max_assistant_turns = 11
     loop.max_user_turns = 10
@@ -334,6 +339,7 @@ def test_tool_agent_loop_init_tolerates_missing_optional_multi_turn_keys(monkeyp
     ToolAgentLoop.__init__(loop)
 
     assert loop.force_final_answer_prefix == ""
+    assert loop.force_final_answer_think_prefill == ""
     assert loop.force_tool_calls_until_final_turn is False
     assert loop.force_answer_on_final_turn is False
     assert loop.conditional_answer_retry_enabled is False
@@ -487,6 +493,105 @@ def test_forced_final_turn_forces_boxed_answer_prefix():
     assert extra_args[FORCE_ACTION_TAG_IDS_KEY] == [2, 20, 21, 22, 2, 60, 61]
     assert state == AgentState.TERMINATED
     assert "forced_structure_error" not in agent_data.extra_fields
+
+
+def test_forced_final_turn_think_prefill_is_masked_and_in_prompt():
+    tokenizer = _FakeTokenizer()
+    server_manager = _SequencedFakeServerManager([[31, 1, 2, 20, 21, 22, 50]])
+    tool_parser = _FakeToolParser([])
+    agent_data = _make_agent_data()
+    agent_data.assistant_turns = 10
+    prefill = "This is the final turn, so I need to answer from the evidence gathered so far."
+
+    async def run_test():
+        loop = _make_loop(tokenizer, server_manager, tool_parser)
+        loop.force_final_answer_think_prefill = prefill
+        return await loop._handle_generating_state(agent_data, {"temperature": 1.0})
+
+    state = asyncio.run(run_test())
+
+    assert state == AgentState.TERMINATED
+    assert server_manager.prompt_ids_by_call[0][-1:] == [72]
+    assert agent_data.response_mask == [0] + [1] * 7
+    assert agent_data.response_logprobs == [0.0] + [0.0] * 7
+    assert agent_data.prompt_ids[-8:] == [72, 31, 1, 2, 20, 21, 22, 50]
+    extra_args = server_manager.sampling_params_by_call[0]["extra_args"]
+    assert extra_args[FORCE_ACTION_REQUIRED_TAG_KEY] == "<answer>"
+    assert extra_args[FORCE_ACTION_TAG_IDS_KEY] == [2, 20, 21, 22]
+    assert "forced_structure_error" not in agent_data.extra_fields
+
+
+def test_forced_final_turn_think_prefill_is_in_debug_text():
+    tokenizer = _FakeTokenizer()
+    server_manager = _FakeServerManager([31, 1, 2, 20, 21, 22, 50])
+    tool_parser = _FakeToolParser([])
+    agent_data = _make_agent_data()
+    agent_data.assistant_turns = 10
+    prefill = "This is the final turn, so I need to answer from the evidence gathered so far."
+
+    async def run_test():
+        loop = _make_loop(tokenizer, server_manager, tool_parser)
+        loop.force_final_answer_think_prefill = prefill
+        loop._debug_enabled_for_agent = lambda agent_data: True
+        loop._debug_append_event = lambda event: None
+        return await loop._handle_generating_state(agent_data, {"temperature": 1.0})
+
+    state = asyncio.run(run_test())
+
+    assert state == AgentState.TERMINATED
+    assert agent_data.debug_events[0]["text"].startswith(f"{prefill}reason")
+
+
+def test_final_answer_think_prefill_is_not_applied_to_forced_tool_turn():
+    tokenizer = _FakeTokenizer()
+    server_manager = _SequencedFakeServerManager([[30, 31, 1, 2, 10, 40, 11]])
+    tool_parser = _FakeToolParser([FunctionCall(name="image_zoom_in_tool", arguments="{}")])
+    agent_data = _make_agent_data()
+
+    async def run_test():
+        loop = _make_loop(tokenizer, server_manager, tool_parser)
+        loop.force_final_answer_think_prefill = (
+            "This is the final turn, so I need to answer from the evidence gathered so far."
+        )
+        return await loop._handle_generating_state(agent_data, {"temperature": 1.0})
+
+    state = asyncio.run(run_test())
+
+    assert state == AgentState.PROCESSING_TOOLS
+    assert server_manager.prompt_ids_by_call[0] == [100]
+    assert agent_data.response_mask == [1] * 7
+
+
+def test_final_answer_think_prefill_is_not_applied_to_retry_forced_tool_call():
+    tokenizer = _FakeTokenizer()
+    server_manager = _SequencedFakeServerManager([[30, 31, 1, 2, 10, 40, 11]])
+    tool_parser = _SequencedFakeToolParser([[FunctionCall(name="image_zoom_in_tool", arguments="{}")]])
+    agent_data = _make_agent_data()
+    agent_data.force_next_tool_call = True
+
+    async def run_test():
+        loop = _make_conditional_retry_loop(
+            tokenizer,
+            server_manager,
+            tool_parser,
+            lambda **kwargs: {"accuracy": 0.0, "score": 0.0},
+        )
+        loop.force_final_answer_think_prefill = (
+            "This is the final turn, so I need to answer from the evidence gathered so far."
+        )
+        return await loop._handle_generating_state(
+            agent_data,
+            {"temperature": 1.0},
+            rollout_kwargs={"data_source": "unit", "reward_model": {"ground_truth": "ok"}, "extra_info": {}},
+        )
+
+    state = asyncio.run(run_test())
+
+    assert state == AgentState.PROCESSING_TOOLS
+    assert server_manager.prompt_ids_by_call[0] == [100]
+    assert agent_data.response_mask == [1] * 7
+    extra_args = server_manager.sampling_params_by_call[0]["extra_args"]
+    assert extra_args[FORCE_ACTION_REQUIRED_TAG_KEY] == "<tool_call>"
 
 
 def test_conditional_answer_retry_keeps_correct_first_answer_without_forcing():

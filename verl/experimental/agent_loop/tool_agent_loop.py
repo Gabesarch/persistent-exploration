@@ -171,6 +171,7 @@ class ToolAgentLoop(AgentLoopBase):
         self.force_tool_calls_until_final_turn = getattr(multi_turn_config, "force_tool_calls_until_final_turn", False)
         self.force_answer_on_final_turn = getattr(multi_turn_config, "force_answer_on_final_turn", False)
         self.final_answer_token_margin = getattr(multi_turn_config, "final_answer_token_margin", 2048)
+        self.force_final_answer_think_prefill = getattr(multi_turn_config, "force_final_answer_think_prefill", "")
         self.force_final_answer_prefix = getattr(multi_turn_config, "force_final_answer_prefix", "")
         self.tool_response_turn_suffix_enabled = getattr(multi_turn_config, "tool_response_turn_suffix_enabled", False)
         self.tool_response_explore_turns = getattr(multi_turn_config, "tool_response_explore_turns", 10)
@@ -485,6 +486,8 @@ class ToolAgentLoop(AgentLoopBase):
             sampling_params = self._with_forced_action_extra_args(sampling_params, forced_required_tag)
             assistant_prefill_ids = self._append_conditional_retry_assistant_prefill(agent_data)
             agent_data.force_next_tool_call = False
+        if forced_required_tag == "<answer>":
+            assistant_prefill_ids = self._append_force_final_answer_think_prefill(agent_data)
 
         with simple_timer("generate_sequences", agent_data.metrics):
             output: TokenOutput = await self.server_manager.generate(
@@ -601,6 +604,13 @@ class ToolAgentLoop(AgentLoopBase):
 
     def _append_conditional_retry_assistant_prefill(self, agent_data: AgentData) -> list[int]:
         prefill = self.conditional_answer_retry_assistant_prefill or ""
+        return self._append_masked_assistant_prefill(agent_data, prefill)
+
+    def _append_force_final_answer_think_prefill(self, agent_data: AgentData) -> list[int]:
+        prefill = self.force_final_answer_think_prefill or ""
+        return self._append_masked_assistant_prefill(agent_data, prefill)
+
+    def _append_masked_assistant_prefill(self, agent_data: AgentData, prefill: str) -> list[int]:
         if not prefill:
             return []
         prefill_ids = self.tokenizer.encode(prefill, add_special_tokens=False)

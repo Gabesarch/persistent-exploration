@@ -56,6 +56,8 @@ export NUM_GPUS="${NUM_GPUS:-1}"   # policy uses 1 GPU; a judge task gets the 2n
 MERGE_BACKEND="${MERGE_BACKEND:-fsdp}"
 export FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS="${FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS:-false}"
 export FORCE_FINAL_ANSWER_PREFIX="${FORCE_FINAL_ANSWER_PREFIX:-}"
+DEFAULT_FORCE_FINAL_ANSWER_THINK_PREFILL="This is the final turn, so I need to answer from the evidence gathered so far."
+export FORCE_FINAL_ANSWER_THINK_PREFILL="${FORCE_FINAL_ANSWER_THINK_PREFILL:-$DEFAULT_FORCE_FINAL_ANSWER_THINK_PREFILL}"
 
 has_hf_weights() {
   local hf_dir="$1"

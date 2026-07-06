@@ -28,6 +28,7 @@ metadata:
   allowed_tools:
     - image_zoom_in_tool
   show_initial_image_index_hint: false
+  restore_assistant_forced_prefill: true
   system_prompt_files:
     - prompts/tools/system_vero_reasoning.txt
   system_prompt_preserve_trailing_newline: true

@@ -224,6 +224,9 @@ multi_turn:
   # drops below this, switch to forcing an answer to avoid an answerless overflow.
   final_answer_token_margin: 2048
 
+  # Prefix inserted inside the `<think>` block before generation on forced final-answer turns.
+  force_final_answer_think_prefill: ""
+
   # Append turn-dependent guidance to tool responses without forcing logits/actions.
   tool_response_turn_suffix_enabled: False
   tool_response_explore_turns: 10

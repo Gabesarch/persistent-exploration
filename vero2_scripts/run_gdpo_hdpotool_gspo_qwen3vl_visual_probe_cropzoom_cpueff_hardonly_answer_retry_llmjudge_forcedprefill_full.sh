@@ -45,6 +45,9 @@ HYDRA_ARGS=("$@")
 DEFAULT_ANSWER_RETRY_ASSISTANT_PREFILL="Let's see, I do not have enough information to answer and need to continue exploring with additional tool calls."
 ANSWER_RETRY_ASSISTANT_PREFILL="${ANSWER_RETRY_ASSISTANT_PREFILL:-$DEFAULT_ANSWER_RETRY_ASSISTANT_PREFILL}"
 export ANSWER_RETRY_ASSISTANT_PREFILL
+DEFAULT_FORCE_FINAL_ANSWER_THINK_PREFILL="This is the final turn, so I need to answer from the evidence gathered so far."
+FORCE_FINAL_ANSWER_THINK_PREFILL="${FORCE_FINAL_ANSWER_THINK_PREFILL:-$DEFAULT_FORCE_FINAL_ANSWER_THINK_PREFILL}"
+export FORCE_FINAL_ANSWER_THINK_PREFILL
 
 CHECKPOINT_DATE_TIME="${CHECKPOINT_DATE_TIME:-20260524_160610}"
 RUN_UNIQUE_ID="${RUN_UNIQUE_ID:-${SLURM_JOB_ID:-pid_$$}}"
@@ -122,6 +125,12 @@ if ! has_hydra_override "actor_rollout_ref.rollout.multi_turn.conditional_answer
     "${HYDRA_ARGS[@]}"
   )
 fi
+if ! has_hydra_override "actor_rollout_ref.rollout.multi_turn.force_final_answer_think_prefill"; then
+  HYDRA_ARGS=(
+    'actor_rollout_ref.rollout.multi_turn.force_final_answer_think_prefill=${oc.env:FORCE_FINAL_ANSWER_THINK_PREFILL}'
+    "${HYDRA_ARGS[@]}"
+  )
+fi
 
 CONFIG_NAME="gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_cropzoom_cpueff_hardonly_answer_retry_llmjudge_forcedprefill"
 
@@ -132,6 +141,7 @@ echo "CHECKPOINT_EXPERIMENT_NAME=$CHECKPOINT_EXPERIMENT_NAME"
 echo "TRAINER_DEFAULT_LOCAL_DIR=$TRAINER_DEFAULT_LOCAL_DIR"
 echo "LEGACY_CHECKPOINT_DIR_LINKED=$LEGACY_CHECKPOINT_DIR_LINKED"
 echo "ANSWER_RETRY_ASSISTANT_PREFILL=$ANSWER_RETRY_ASSISTANT_PREFILL"
+echo "FORCE_FINAL_ANSWER_THINK_PREFILL=$FORCE_FINAL_ANSWER_THINK_PREFILL"
 echo "LLM_JUDGE_PROMPT=${VERL_ROOT}/vero2_scripts/prompts/llm_judge_visual_search_prompt.txt"
 echo "LLM_JUDGE_ASSISTANT_PREFILL={"
 echo "LLM_JUDGE_MAX_TOKENS=48"
