@@ -301,14 +301,24 @@ def _expand_to_min_side(lo: int, hi: int, size: int, min_side: int = ZOOM_MIN_SI
         'Example: image_zoom_in_tool(img_idx=0, bbox_2d=[480, 90, 640, 210], label="street sign").'
     ),
 )
-def image_zoom_in_tool(img_idx: int, bbox_2d: List[int], label: str) -> list:
+def image_zoom_in_tool(img_idx: int, bbox_2d: List[float], label: str) -> list:
     """Crop bbox_2d=[x1,y1,x2,y2] (0-1000 scale) out of image `img_idx` and resize the
-    crop into the training-time pixel budget. PIL-only (works offline)."""
+    crop into the training-time pixel budget. PIL-only (works offline).
+
+    bbox_2d accepts FLOATS (List[float], matching eval-vero-runs): the eval backend's
+    zoom remapping (`_composite_zoom_to_original` in async_openai.py) re-expresses the
+    model's integer 0-1000 bbox in the ORIGINAL image's 0-1000 frame via float math,
+    producing values like 444.99999999999994. With the old List[int] signature pydantic
+    rejected those (int_from_float), silently failing ~47% of ALL zoom calls in every
+    run and turning each doc into a crop lottery."""
     image = Image.open(_resolve_image_path(img_idx)).convert("RGB")
     w, h = image.size
-    coords = [int(v) for v in list(bbox_2d)[:4]]
-    if len(coords) != 4:
+    raw_coords = list(bbox_2d)[:4]
+    if len(raw_coords) != 4:
         raise ValueError(f"bbox_2d must be [x1, y1, x2, y2] on the 0-1000 scale, got {bbox_2d}")
+    if any(isinstance(v, bool) for v in raw_coords):  # training rejects bool bbox values
+        raise ValueError("bbox_2d must contain 4 numeric (non-boolean) values.")
+    coords = [float(v) for v in raw_coords]
     x1, y1, x2, y2 = coords
     px1, py1 = _to_px_clamped(min(x1, x2), w), _to_px_clamped(min(y1, y2), h)
     px2, py2 = _to_px_clamped(max(x1, x2), w), _to_px_clamped(max(y1, y2), h)

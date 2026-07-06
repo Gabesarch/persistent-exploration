@@ -48,11 +48,19 @@ fi
 echo "=== Launching dedicated vLLM judge: $_JUDGE_MODEL_PATH on :$_JUDGE_PORT (CUDA_VISIBLE_DEVICES=${VLLM_JUDGE_CUDA_VISIBLE_DEVICES:-inherit}) ==="
 _cvd=()
 [[ -n "${VLLM_JUDGE_CUDA_VISIBLE_DEVICES:-}" ]] && _cvd=(CUDA_VISIBLE_DEVICES="$VLLM_JUDGE_CUDA_VISIBLE_DEVICES")
+_ATTN_ARGS=()
+if python - <<'PY' 2>/dev/null
+from importlib.metadata import version
+from packaging.version import Version
+raise SystemExit(0 if Version(version("vllm")) >= Version("0.22") else 1)
+PY
+then _ATTN_ARGS=(--attention-config.flash_attn_version 2)
+else echo "vLLM < 0.22 -> judge omitting --attention-config.flash_attn_version (unsupported)"; fi
 nohup env "${_cvd[@]}" VLLM_SERVER_DEV_MODE=1 vllm serve "$_JUDGE_MODEL_PATH" \
   --port "$_JUDGE_PORT" \
   --served-model-name "$_JUDGE_MODEL_NAME" \
   --gpu-memory-utilization "$_JUDGE_MEM" \
-  --attention-config.flash_attn_version 2 \
+  "${_ATTN_ARGS[@]}" \
   --tensor-parallel-size "$_JUDGE_TP" \
   --max-model-len "$_JUDGE_MAXLEN" \
   --enable-sleep-mode \
