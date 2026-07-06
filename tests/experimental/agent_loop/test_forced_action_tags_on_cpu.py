@@ -222,6 +222,7 @@ class _InlineExecutorLoop:
 def _make_loop(tokenizer: _FakeTokenizer, server_manager: _FakeServerManager, tool_parser: _FakeToolParser):
     loop = object.__new__(ToolAgentLoop)
     loop.force_tool_calls_until_final_turn = True
+    loop.force_answer_on_final_turn = False
     loop.final_answer_token_margin = 2048
     loop.force_final_answer_prefix = ""
     loop.max_assistant_turns = 11
@@ -245,6 +246,7 @@ def _make_conditional_retry_loop(
 ):
     loop = object.__new__(ToolAgentLoop)
     loop.force_tool_calls_until_final_turn = False
+    loop.force_answer_on_final_turn = False
     loop.final_answer_token_margin = 4
     loop.force_final_answer_prefix = ""
     loop.max_assistant_turns = 11
@@ -333,6 +335,7 @@ def test_tool_agent_loop_init_tolerates_missing_optional_multi_turn_keys(monkeyp
 
     assert loop.force_final_answer_prefix == ""
     assert loop.force_tool_calls_until_final_turn is False
+    assert loop.force_answer_on_final_turn is False
     assert loop.conditional_answer_retry_enabled is False
     assert loop.conditional_answer_retry_force_next_tool_call is True
     assert loop.conditional_answer_retry_assistant_prefill == ""
@@ -422,6 +425,46 @@ def test_forced_final_turn_requires_answer_tag():
     assert server_manager.last_sampling_params["extra_args"][FORCE_ACTION_TAG_IDS_KEY] == [2, 20, 21, 22]
     assert agent_data.extra_fields["forced_structure_error"] is True
     assert agent_data.extra_fields["forced_structure_error_reason"] == "missing_final_answer"
+
+
+def test_force_answer_on_final_turn_does_not_force_early_turns():
+    tokenizer = _FakeTokenizer()
+    server_manager = _FakeServerManager([30, 31, 1, 2, 20, 21, 22, 50])
+    tool_parser = _FakeToolParser([])
+    agent_data = _make_agent_data()
+
+    async def run_test():
+        loop = _make_loop(tokenizer, server_manager, tool_parser)
+        loop.force_tool_calls_until_final_turn = False
+        loop.force_answer_on_final_turn = True
+        return await loop._handle_generating_state(agent_data, {"temperature": 1.0})
+
+    state = asyncio.run(run_test())
+
+    assert state == AgentState.TERMINATED
+    assert FORCE_ACTION_REQUIRED_TAG_KEY not in server_manager.last_sampling_params.get("extra_args", {})
+    assert "forced_structure_error" not in agent_data.extra_fields
+
+
+def test_force_answer_on_final_turn_forces_only_final_turn_answer():
+    tokenizer = _FakeTokenizer()
+    server_manager = _FakeServerManager([30, 31, 1, 2, 20, 21, 22, 50])
+    tool_parser = _FakeToolParser([])
+    agent_data = _make_agent_data()
+    agent_data.assistant_turns = 10
+
+    async def run_test():
+        loop = _make_loop(tokenizer, server_manager, tool_parser)
+        loop.force_tool_calls_until_final_turn = False
+        loop.force_answer_on_final_turn = True
+        return await loop._handle_generating_state(agent_data, {"temperature": 1.0})
+
+    state = asyncio.run(run_test())
+
+    assert state == AgentState.TERMINATED
+    assert server_manager.last_sampling_params["extra_args"][FORCE_ACTION_REQUIRED_TAG_KEY] == "<answer>"
+    assert server_manager.last_sampling_params["extra_args"][FORCE_ACTION_TAG_IDS_KEY] == [2, 20, 21, 22]
+    assert "forced_structure_error" not in agent_data.extra_fields
 
 
 def test_forced_final_turn_forces_boxed_answer_prefix():

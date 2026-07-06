@@ -110,6 +110,13 @@ def _encode_jpeg_content(image: Image.Image) -> ImageContent:
     return ImageContent(type="image", data=base64.b64encode(buf.getvalue()).decode("utf-8"), mimeType="image/jpeg")
 
 
+def _encode_png_content(image: Image.Image) -> ImageContent:
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    buf.seek(0)
+    return ImageContent(type="image", data=base64.b64encode(buf.getvalue()).decode("utf-8"), mimeType="image/png")
+
+
 def _save_and_emit(image: Image.Image):
     """Bound `image`, persist it to a temp file so a later tool call can address
     it by a fresh img_idx, and return [sentinel-text, bounded-JPEG-image]. The
@@ -120,6 +127,15 @@ def _save_and_emit(image: Image.Image):
     os.close(fd)
     bounded.save(path, format="JPEG", quality=DRAW_JPEG_QUALITY)
     return [_encode_jpeg_content(bounded), TextContent(type="text", text=f"Saved drawn image to: {path}")]
+
+
+def _save_zoom_and_emit(image: Image.Image):
+    """Persist a training-equivalent zoom crop losslessly and emit PNG content."""
+    image = image.convert("RGB")
+    fd, path = tempfile.mkstemp(suffix=".png", prefix="vero2_tool_out_")
+    os.close(fd)
+    image.save(path, format="PNG")
+    return [_encode_png_content(image), TextContent(type="text", text=f"Saved drawn image to: {path}")]
 
 
 def _image_to_content(image: np.ndarray):
@@ -258,11 +274,6 @@ def _pil_to_content(image: Image.Image):
     return _save_and_emit(image)
 
 
-def _to_px_clamped(value: float, size: int) -> int:
-    """0-1000 coordinate -> pixel, clamped to [0, size]."""
-    return max(0, min(size, int((value / COORD_SCALE) * size)))
-
-
 # ========== Offline-safe PIL-only tools (always available) ==========
 
 
@@ -275,20 +286,107 @@ def _to_px_clamped(value: float, size: int) -> int:
 # backend maps img_idx -> the actual file via the LMMS_EVAL_IMAGE_REGISTRY env var.
 ZOOM_MIN_PIXELS = 518400  # = training cropped_min_pixels
 ZOOM_MAX_PIXELS = 1048576  # = training cropped_max_pixels
-ZOOM_MIN_SIDE_PX = 28
+ZOOM_MIN_DIMENSION = 32
+ZOOM_SMART_RESIZE_FACTOR = 32
+ZOOM_MAX_CROPPED_ASPECT_RATIO = 199.0
 
 
-def _expand_to_min_side(lo: int, hi: int, size: int, min_side: int = ZOOM_MIN_SIDE_PX):
-    """Widen [lo, hi] around its center to at least min_side px, staying in [0, size]."""
-    if hi - lo >= min_side:
-        return lo, hi
-    center = (lo + hi) // 2
-    lo, hi = center - min_side // 2, center + (min_side + 1) // 2
-    if lo < 0:
-        lo, hi = 0, min(size, min_side)
-    if hi > size:
-        lo, hi = max(0, size - min_side), size
-    return lo, hi
+def _round_by_factor(number: float, factor: int) -> int:
+    return round(number / factor) * factor
+
+
+def _ceil_by_factor(number: float, factor: int) -> int:
+    return math.ceil(number / factor) * factor
+
+
+def _floor_by_factor(number: float, factor: int) -> int:
+    return math.floor(number / factor) * factor
+
+
+def _smart_resize(height: int, width: int, factor: int, min_pixels: int, max_pixels: int) -> tuple[int, int]:
+    h_bar = max(factor, _round_by_factor(height, factor))
+    w_bar = max(factor, _round_by_factor(width, factor))
+    if h_bar * w_bar > max_pixels:
+        beta = math.sqrt((height * width) / max_pixels)
+        h_bar = _floor_by_factor(height / beta, factor)
+        w_bar = _floor_by_factor(width / beta, factor)
+    elif h_bar * w_bar < min_pixels:
+        beta = math.sqrt(min_pixels / (height * width))
+        h_bar = _ceil_by_factor(height * beta, factor)
+        w_bar = _ceil_by_factor(width * beta, factor)
+    return h_bar, w_bar
+
+
+def _validate_and_clamp_zoom_bbox(bbox_2d: List[float], image_width: int, image_height: int) -> list[float]:
+    if not isinstance(bbox_2d, (list, tuple)) or len(bbox_2d) != 4:
+        raise ValueError(f"bbox_2d must be [x1, y1, x2, y2] on the 0-1000 scale, got {bbox_2d}")
+    try:
+        left, top, right, bottom = [float(value) for value in bbox_2d]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("bbox_2d must contain 4 numeric values.") from exc
+
+    if any(isinstance(value, bool) for value in bbox_2d) or not all(
+        math.isfinite(value) for value in (left, top, right, bottom)
+    ):
+        raise ValueError("bbox_2d must contain 4 finite numeric values.")
+
+    if right <= left or bottom <= top:
+        raise ValueError("bbox_2d must define a positive-area box with left < right and top < bottom.")
+
+    left = max(0.0, left)
+    top = max(0.0, top)
+    right = min(float(image_width), right)
+    bottom = min(float(image_height), bottom)
+
+    if right <= left or bottom <= top:
+        raise ValueError("bbox_2d is outside image bounds or has no positive area after clamping.")
+
+    return [left, top, right, bottom]
+
+
+def _normalized_zoom_bbox_to_pixels(bbox_2d: List[float], image_width: int, image_height: int) -> list[float]:
+    left, top, right, bottom = [float(value) for value in bbox_2d]
+    return [
+        left / float(COORD_SCALE) * image_width,
+        top / float(COORD_SCALE) * image_height,
+        right / float(COORD_SCALE) * image_width,
+        bottom / float(COORD_SCALE) * image_height,
+    ]
+
+
+def _maybe_resize_zoom_bbox(bbox_2d: list[float], image_width: int, image_height: int) -> list[float]:
+    left, top, right, bottom = bbox_2d
+
+    left = max(0, left)
+    top = max(0, top)
+    right = min(image_width, right)
+    bottom = min(image_height, bottom)
+
+    height = bottom - top
+    width = right - left
+    if height < ZOOM_MIN_DIMENSION or width < ZOOM_MIN_DIMENSION:
+        center_x = (left + right) / 2.0
+        center_y = (top + bottom) / 2.0
+        ratio = ZOOM_MIN_DIMENSION / min(height, width)
+        new_half_height = math.ceil(height * ratio * 0.5)
+        new_half_width = math.ceil(width * ratio * 0.5)
+        new_left = math.floor(center_x - new_half_width)
+        new_right = math.ceil(center_x + new_half_width)
+        new_top = math.floor(center_y - new_half_height)
+        new_bottom = math.ceil(center_y + new_half_height)
+
+        new_left = max(0, new_left)
+        new_top = max(0, new_top)
+        new_right = min(image_width, new_right)
+        new_bottom = min(image_height, new_bottom)
+
+        new_height = new_bottom - new_top
+        new_width = new_right - new_left
+
+        if new_height > ZOOM_MIN_DIMENSION and new_width > ZOOM_MIN_DIMENSION:
+            return [new_left, new_top, new_right, new_bottom]
+
+    return [left, top, right, bottom]
 
 
 @app.tool(
@@ -301,30 +399,34 @@ def _expand_to_min_side(lo: int, hi: int, size: int, min_side: int = ZOOM_MIN_SI
         'Example: image_zoom_in_tool(img_idx=0, bbox_2d=[480, 90, 640, 210], label="street sign").'
     ),
 )
-def image_zoom_in_tool(img_idx: int, bbox_2d: List[int], label: str) -> list:
+def image_zoom_in_tool(img_idx: int, bbox_2d: List[float], label: str) -> list:
     """Crop bbox_2d=[x1,y1,x2,y2] (0-1000 scale) out of image `img_idx` and resize the
     crop into the training-time pixel budget. PIL-only (works offline)."""
     image = Image.open(_resolve_image_path(img_idx)).convert("RGB")
     w, h = image.size
-    coords = [int(v) for v in list(bbox_2d)[:4]]
-    if len(coords) != 4:
-        raise ValueError(f"bbox_2d must be [x1, y1, x2, y2] on the 0-1000 scale, got {bbox_2d}")
-    x1, y1, x2, y2 = coords
-    px1, py1 = _to_px_clamped(min(x1, x2), w), _to_px_clamped(min(y1, y2), h)
-    px2, py2 = _to_px_clamped(max(x1, x2), w), _to_px_clamped(max(y1, y2), h)
-    px1, px2 = _expand_to_min_side(px1, px2, w)
-    py1, py2 = _expand_to_min_side(py1, py2, h)
-    crop = image.crop((px1, py1, max(px1 + 1, px2), max(py1 + 1, py2)))
-    pixels = crop.width * crop.height
-    if pixels < ZOOM_MIN_PIXELS:
-        scale = (ZOOM_MIN_PIXELS / pixels) ** 0.5
-    elif pixels > ZOOM_MAX_PIXELS:
-        scale = (ZOOM_MAX_PIXELS / pixels) ** 0.5
-    else:
-        scale = 1.0
-    if scale != 1.0:
-        crop = crop.resize((max(1, round(crop.width * scale)), max(1, round(crop.height * scale))), Image.Resampling.LANCZOS)
-    return _pil_to_content(crop)
+    pixel_bbox = _normalized_zoom_bbox_to_pixels(bbox_2d, w, h)
+    pixel_bbox = _validate_and_clamp_zoom_bbox(pixel_bbox, w, h)
+    pixel_bbox = _maybe_resize_zoom_bbox(pixel_bbox, w, h)
+    left, top, right, bottom = pixel_bbox
+
+    cropped_width = right - left
+    cropped_height = bottom - top
+    aspect_ratio = max(cropped_width / cropped_height, cropped_height / cropped_width)
+    if aspect_ratio > ZOOM_MAX_CROPPED_ASPECT_RATIO:
+        raise ValueError(
+            f"cropped aspect ratio must be <= {ZOOM_MAX_CROPPED_ASPECT_RATIO}, got {aspect_ratio:.2f}."
+        )
+
+    resized_height, resized_width = _smart_resize(
+        int(cropped_height),
+        int(cropped_width),
+        factor=ZOOM_SMART_RESIZE_FACTOR,
+        min_pixels=ZOOM_MIN_PIXELS,
+        max_pixels=ZOOM_MAX_PIXELS,
+    )
+    crop = image.crop((left, top, right, bottom))
+    crop = crop.resize((resized_width, resized_height), Image.BICUBIC)
+    return _save_zoom_and_emit(crop)
 
 # ========== MCP Drawing Tools (adopted from origin/main) ==========
 # The 5 tools below (draw_boxes / draw_points / draw_lines / draw_texts /

@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import os
+import tempfile
+import textwrap
 
 import pytest
 
@@ -61,6 +63,31 @@ def test_load_extern_object_constant():
     assert constant == "test_constant_value"
 
 
+def test_load_extern_object_dataclass():
+    """Test loading a dataclass from an external file."""
+    with tempfile.NamedTemporaryFile(suffix=".py", mode="w+", delete=False) as temp_file:
+        temp_file.write(
+            textwrap.dedent(
+                """
+                from dataclasses import dataclass
+
+                @dataclass(frozen=True)
+                class TestDataclass:
+                    value: str
+                """
+            )
+        )
+        temp_path = temp_file.name
+
+    try:
+        TestDataclass = load_extern_object(temp_path, "TestDataclass")
+        instance = TestDataclass("ok")
+        assert instance.value == "ok"
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
 def test_load_extern_object_nonexistent_file():
     """Test behavior when file doesn't exist"""
     with pytest.raises(FileNotFoundError):
@@ -82,8 +109,6 @@ def test_load_extern_object_none_path():
 def test_load_extern_object_invalid_module():
     """Test behavior when module has syntax errors"""
     # Create a temporary file with syntax errors
-    import tempfile
-
     with tempfile.NamedTemporaryFile(suffix=".py", mode="w+", delete=False) as temp_file:
         temp_file.write("This is not valid Python syntax :")
         temp_path = temp_file.name

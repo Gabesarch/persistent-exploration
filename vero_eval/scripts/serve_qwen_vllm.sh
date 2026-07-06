@@ -28,6 +28,7 @@ PORT="${PORT:-9001}"; MODEL_NAME="${MODEL_NAME:-qwen_vllm}"
 API_KEY="${API_KEY:-qwen}"; NUM_GPUS="${NUM_GPUS:-1}"
 # Set CUSTOM_CHAT_TEMPLATE to use a custom template (e.g., one that doesn't auto-inject tools)
 CUSTOM_CHAT_TEMPLATE="${CUSTOM_CHAT_TEMPLATE:-}"
+FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS="${FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS:-false}"
 
 LOG_DIR="${LOG_DIR:-$VERO_EVAL_DIR/logs/vllm}"
 mkdir -p "$LOG_DIR"
@@ -55,7 +56,21 @@ CHAT_TEMPLATE_ARGS=()
 # canonical full-setting resolution (on the ~8-13MP accuracy plateau, so equivalent to the
 # old 12.96MP within noise and slightly cheaper). Override per run via MM_MAX_PIXELS.
 MM_MAX_PIXELS="${MM_MAX_PIXELS:-10000000}"
-MM_MIN_PIXELS="${MM_MIN_PIXELS:-4096}"
+MM_MIN_PIXELS="${MM_MIN_PIXELS-4096}"
+MM_PROCESSOR_KWARGS="{\"max_pixels\":${MM_MAX_PIXELS}}"
+if [[ -n "$MM_MIN_PIXELS" ]]; then
+  MM_PROCESSOR_KWARGS="{\"max_pixels\":${MM_MAX_PIXELS},\"min_pixels\":${MM_MIN_PIXELS}}"
+fi
+
+LOGITS_PROCESSOR_ARGS=()
+case "${FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS,,}" in
+  1|true|yes|on)
+    VERO2_ROOT="$(cd "$VERO_EVAL_DIR/.." && pwd)"
+    export PYTHONPATH="$VERO2_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+    LOGITS_PROCESSOR_ARGS=(--logits-processors "verl.utils.vllm_forced_action_logits_processor:ForceActionTagAfterThinkLogitsProcessor")
+    echo "Using forced final-answer logits processor: ${LOGITS_PROCESSOR_ARGS[1]}"
+    ;;
+esac
 
 echo "Starting vLLM server (log: $LOGFILE)..."
 CHAT_TEMPLATE_ARG=""
@@ -69,11 +84,12 @@ nohup vllm serve "$CHECKPOINT_PATH" \
   --uvicorn-log-level info \
   --max-model-len "${MAX_MODEL_LEN:-32768}" \
   --no-enable-prefix-caching \
-  --mm-processor-kwargs "{\"max_pixels\":${MM_MAX_PIXELS},\"min_pixels\":${MM_MIN_PIXELS}}" \
+  --mm-processor-kwargs "$MM_PROCESSOR_KWARGS" \
   --api-key "$API_KEY" \
   --enable-auto-tool-choice \
   --tool-call-parser hermes \
   "${CHAT_TEMPLATE_ARGS[@]}" \
+  "${LOGITS_PROCESSOR_ARGS[@]}" \
   --enforce-eager \
   $CHAT_TEMPLATE_ARG \
   > "$LOGFILE" 2>&1 &

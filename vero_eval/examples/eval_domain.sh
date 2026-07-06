@@ -36,6 +36,9 @@ API_KEY="${API_KEY:-qwen}"
 MODEL_VERSION="${MODEL_VERSION:-qwen_vllm}"
 MCP_SERVER_PATH="${MCP_SERVER_PATH-lmms_eval/mcp/vero2_mcp.py}"    # set empty (MCP_SERVER_PATH='') to disable tools
 MAX_TOOL_ITERATIONS="${MAX_TOOL_ITERATIONS:-10}"
+MAX_TOOL_IMAGES="${MAX_TOOL_IMAGES:-10}"
+FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS="${FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS:-false}"
+FORCE_FINAL_ANSWER_PREFIX="${FORCE_FINAL_ANSWER_PREFIX:-}"
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-}"
 LIMIT="${LIMIT:-}"
 
@@ -100,9 +103,15 @@ if [[ "$RUN_HAS_JUDGE" == 1 ]]; then
 fi
 
 # ── build model_args ──────────────────────────────────────────────────
-MODEL_ARGS="model_version=${MODEL_VERSION},base_url=http://localhost:${PORT}/v1,api_key=${API_KEY},max_tool_iterations=${MAX_TOOL_ITERATIONS}"
+MODEL_ARGS="model_version=${MODEL_VERSION},base_url=http://localhost:${PORT}/v1,api_key=${API_KEY},max_tool_iterations=${MAX_TOOL_ITERATIONS},max_tool_images=${MAX_TOOL_IMAGES}"
 [[ -n "$MCP_SERVER_PATH" ]] && MODEL_ARGS="${MODEL_ARGS},mcp_server_path=${MCP_SERVER_PATH}"
 [[ -n "$SYSTEM_PROMPT"   ]] && MODEL_ARGS="${MODEL_ARGS},system_prompt=${SYSTEM_PROMPT}"
+case "${FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS,,}" in
+  1|true|yes|on)
+    MODEL_ARGS="${MODEL_ARGS},force_answer_after_max_tool_iterations=true"
+    [[ -n "$FORCE_FINAL_ANSWER_PREFIX" ]] && MODEL_ARGS="${MODEL_ARGS},force_final_answer_prefix=${FORCE_FINAL_ANSWER_PREFIX}"
+    ;;
+esac
 
 echo "Tasks:      $TASKS"
 echo "Output:     $OUTPUT_PATH"

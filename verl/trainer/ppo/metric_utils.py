@@ -636,16 +636,27 @@ def process_validation_metrics(
             var_dict = uid_dict.setdefault(uid, {})
 
             for var_name, var_vals in var2vals.items():
-                # skip empty or string values
-                if not var_vals or isinstance(var_vals[0], str):
+                metric_pairs = [
+                    (val, pred_vals[i] if has_pred else None)
+                    for i, val in enumerate(var_vals)
+                    if val is not None
+                ]
+                metric_vals = [val for val, _ in metric_pairs]
+
+                # skip empty or non-numeric values
+                if not metric_vals or isinstance(metric_vals[0], str):
+                    continue
+                try:
+                    metric_vals = np.asarray(metric_vals, dtype=float).tolist()
+                except (TypeError, ValueError):
                     continue
 
                 # compute mean and std
-                n_resps = len(var_vals)
-                metric = {f"mean@{n_resps}": float(np_mean(var_vals))}
+                n_resps = len(metric_vals)
+                metric = {f"mean@{n_resps}": float(np_mean(metric_vals))}
 
                 if n_resps > 1:
-                    metric[f"std@{n_resps}"] = float(np_std(var_vals))
+                    metric[f"std@{n_resps}"] = float(np_std(metric_vals))
 
                     # cache ns list
                     if n_resps not in ns_cache:
@@ -656,7 +667,7 @@ def process_validation_metrics(
                     for n in ns:
                         # compute best/worst metrics
                         (bon_mean, bon_std), (won_mean, won_std) = bootstrap_metric(
-                            data=var_vals,
+                            data=metric_vals,
                             subset_size=n,
                             reduce_fns=reduce_fns_best_worst,
                             n_bootstrap=n_bootstrap,
@@ -671,7 +682,7 @@ def process_validation_metrics(
                         if has_pred:
                             # create vote_data
                             vote_data = [
-                                {"val": val, "pred": pred} for val, pred in zip(var_vals, pred_vals, strict=True)
+                                {"val": val, "pred": pred} for val, pred in metric_pairs
                             ]
                             # compute maj metrics
                             [(maj_n_mean, maj_n_std)] = bootstrap_metric(

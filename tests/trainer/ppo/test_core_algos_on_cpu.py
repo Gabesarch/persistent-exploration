@@ -464,7 +464,10 @@ def test_multiturn_tool_reward_returns_tool_efficiency_without_changing_score():
     from verl.utils.reward_score.math_verify_reward_type_multiturn_tool_calling_optional_think import compute_score
 
     response = (
+        "<think>zoom</think>"
         '<tool_call>\n{"name": "image_zoom_in", "arguments": {"bbox": [0, 0, 1, 1]}}\n</tool_call>'
+        "<tool_response>ok</tool_response>"
+        "<think>answer</think>"
         "<answer>\\boxed{red}</answer>"
     )
 
@@ -487,8 +490,13 @@ def test_multiturn_tool_efficiency_score_weight_changes_scalar_score():
     from verl.utils.reward_score.math_verify_reward_type_multiturn_tool_calling_optional_think import compute_score
 
     response = (
+        "<think>first zoom</think>"
         '<tool_call>\n{"name": "image_zoom_in", "arguments": {"bbox": [0, 0, 1, 1]}}\n</tool_call>'
+        "<tool_response>ok</tool_response>"
+        "<think>second zoom</think>"
         '<tool_call>\n{"name": "image_zoom_in", "arguments": {"bbox": [1, 1, 2, 2]}}\n</tool_call>'
+        "<tool_response>ok</tool_response>"
+        "<think>answer</think>"
         "<answer>\\boxed{red}</answer>"
     )
 

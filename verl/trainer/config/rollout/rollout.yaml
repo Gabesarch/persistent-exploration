@@ -216,6 +216,10 @@ multi_turn:
   # then force <answer> on the final turn. Implemented via vLLM bad_words.
   force_tool_calls_until_final_turn: False
 
+  # Allow normal early actions, but force <answer> once the final allowable
+  # assistant turn or final-answer token margin is reached.
+  force_answer_on_final_turn: False
+
   # Token headroom reserved for the final <answer> turn; if remaining response budget
   # drops below this, switch to forcing an answer to avoid an answerless overflow.
   final_answer_token_margin: 2048

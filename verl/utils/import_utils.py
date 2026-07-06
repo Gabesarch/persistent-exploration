@@ -19,6 +19,7 @@ We assume package availability won't change during runtime.
 import importlib
 import importlib.util
 import os
+import sys
 import warnings
 from functools import cache, wraps
 from typing import Optional
@@ -128,21 +129,23 @@ def load_module(module_path: str, module_name: Optional[str] = None) -> object:
         if spec is None or spec.loader is None:
             raise ImportError(f"Could not load module from {module_path=}")
 
+        if module_name is not None and spec_name in sys.modules:
+            raise RuntimeError(f"Module name '{module_name}' already exists in `sys.modules`.")
+
         module = importlib.util.module_from_spec(spec)
+        previous_module = sys.modules.get(spec_name)
+        sys.modules[spec_name] = module
         try:
             spec.loader.exec_module(module)
         except Exception as e:
+            if previous_module is None:
+                sys.modules.pop(spec_name, None)
+            else:
+                sys.modules[spec_name] = previous_module
             raise RuntimeError(f"Error loading module from {module_path=}") from e
 
-        if module_name is not None:
-            import sys
-
-            # Avoid overwriting an existing module with a different object.
-            if module_name in sys.modules and sys.modules[module_name] is not module:
-                raise RuntimeError(
-                    f"Module name '{module_name}' already in `sys.modules` and points to a different module."
-                )
-            sys.modules[module_name] = module
+        if module_name is None:
+            sys.modules.pop(spec_name, None)
 
     return module
 

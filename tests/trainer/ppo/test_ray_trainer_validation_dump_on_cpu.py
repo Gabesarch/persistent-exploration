@@ -66,6 +66,90 @@ class TestRayTrainerValidationDumpOnCPU(unittest.TestCase):
             self.assertEqual(entry["input"], "prompt")
             self.assertEqual(entry["reward"], 1.0)
 
+    def test_validation_reward_extra_infos_pad_sparse_keys_across_batches(self):
+        reward_extra_infos = {"reward": [0.1, 0.2]}
+        self.trainer._extend_validation_reward_extra_infos(
+            reward_extra_infos_dict=reward_extra_infos,
+            reward_extra_info={"llm_judge_used": np.array([True, False], dtype=object)},
+            batch_size=2,
+            current_size=0,
+        )
+        reward_extra_infos["reward"].extend([0.3, 0.4])
+        self.trainer._extend_validation_reward_extra_infos(
+            reward_extra_infos_dict=reward_extra_infos,
+            reward_extra_info={},
+            batch_size=2,
+            current_size=2,
+        )
+
+        self.assertEqual(reward_extra_infos["llm_judge_used"], [True, False, None, None])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.trainer._dump_generations(
+                inputs=["prompt_a", "prompt_b", "prompt_c", "prompt_d"],
+                outputs=["answer_a", "answer_b", "answer_c", "answer_d"],
+                gts=["gt_a", "gt_b", "gt_c", "gt_d"],
+                scores=[0.1, 0.2, 0.3, 0.4],
+                reward_extra_infos_dict=reward_extra_infos,
+                dump_path=tmpdir,
+            )
+
+            entries = self._read_dump(tmpdir)
+            self.assertEqual(
+                [entry["llm_judge_used"] for entry in entries],
+                [True, False, None, None],
+            )
+
+    def test_validation_reward_extra_infos_pad_sparse_keys_that_appear_later(self):
+        reward_extra_infos = {"reward": [0.1, 0.2]}
+        self.trainer._extend_validation_reward_extra_infos(
+            reward_extra_infos_dict=reward_extra_infos,
+            reward_extra_info={},
+            batch_size=2,
+            current_size=0,
+        )
+        reward_extra_infos["reward"].extend([0.3, 0.4])
+        self.trainer._extend_validation_reward_extra_infos(
+            reward_extra_infos_dict=reward_extra_infos,
+            reward_extra_info={"llm_judge_used": np.array([True, False], dtype=object)},
+            batch_size=2,
+            current_size=2,
+        )
+
+        self.assertEqual(reward_extra_infos["llm_judge_used"], [None, None, True, False])
+
+    def test_merge_validation_results_pads_sparse_keys_before_metrics(self):
+        captured = {}
+
+        def fake_val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
+            captured["data_sources"] = data_sources
+            captured["sample_uids"] = sample_uids
+            captured["reward_extra_infos_dict"] = reward_extra_infos_dict
+            captured["sample_turns"] = sample_turns
+            return {"ok": 1.0}
+
+        self.trainer._val_metrics_update = fake_val_metrics_update
+        result = self.trainer._merge_validation_results(
+            {
+                "data_sources": [np.array(["source_a", "source_b"], dtype=object)],
+                "sample_uids": ["uid_a", "uid_b"],
+                "sample_turns": [],
+                "reward_extra_infos_dict": {"reward": [0.1, 0.2], "llm_judge_used": [True, False]},
+            },
+            {
+                "data_sources": [np.array(["source_c"], dtype=object)],
+                "sample_uids": ["uid_c"],
+                "sample_turns": [],
+                "reward_extra_infos_dict": {"reward": [0.3]},
+            },
+        )
+
+        self.assertEqual(result, {"ok": 1.0})
+        self.assertEqual(captured["reward_extra_infos_dict"]["reward"], [0.1, 0.2, 0.3])
+        self.assertEqual(
+            captured["reward_extra_infos_dict"]["llm_judge_used"], [True, False, None]
+        )
+
     def test_dump_generations_with_valid_image_refs_includes_paths(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             self.trainer._dump_generations(

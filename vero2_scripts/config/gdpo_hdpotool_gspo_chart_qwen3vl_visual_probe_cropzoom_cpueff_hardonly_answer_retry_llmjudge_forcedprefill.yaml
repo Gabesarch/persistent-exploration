@@ -9,9 +9,9 @@ hydra:
 algorithm:
   adv_estimator: gdpo
   # Conditional retry changes tool-call counts only after incorrect answers, so
-  # keep rewards focused on task accuracy and format.
-  gdpo_reward_keys: [accuracy, format]
-  gdpo_reward_weights: [0.9, 0.1]
+  # use task/format rewards plus an explicit repeat-overlap penalty.
+  gdpo_reward_keys: [accuracy, format, tool_repeat_overlap]
+  gdpo_reward_weights: [0.9, 0.1, 0.3]
   use_kl_in_reward: false
   kl_ctrl:
     kl_coef: 0
@@ -229,6 +229,7 @@ actor_rollout_ref:
       format: hermes
       # Normal rollout first; incorrect answers are removed and followed by a forced tool-call retry.
       force_tool_calls_until_final_turn: false
+      force_answer_on_final_turn: true
       final_answer_token_margin: 2048
       conditional_answer_retry_enabled: true
       conditional_answer_retry_force_next_tool_call: true
@@ -305,6 +306,12 @@ reward:
       tool_efficiency_free_calls: 1
       tool_efficiency_concave_k: 10.0
       tool_efficiency_concave_q: 0.95
+      tool_repeat_overlap_iou_threshold: 0.9
+      tool_repeat_overlap_penalty_per_repeat: -0.5
+      tool_repeat_overlap_max_penalty: -1.0
+      allow_unboxed_answer_for_accuracy: true
+      require_boxed_answer_for_full_format: true
+      unboxed_answer_format_score: 0.5
   reward_kwargs:
     overlong_buffer_cfg:
       enable: true

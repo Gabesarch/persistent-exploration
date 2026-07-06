@@ -6,6 +6,7 @@ import pytest
 from verl.utils.reward_score.math_verify_reward_type_multiturn_tool_calling_optional_think import (
     async_compute_score_from_data_source,
     compute_score_from_data_source,
+    extract_answer_for_accuracy,
     format_reward,
 )
 
@@ -27,6 +28,7 @@ def test_mandatory_think_accepts_think_wrapped_answer():
         "format": 1.0,
         "tool_call_count": 0,
         "tool_efficiency": 1.0,
+        "tool_repeat_overlap": 0.0,
         "tool_call_bonus": 0.0,
     }
 
@@ -58,6 +60,7 @@ The crop shows the legend labels.
         "format": 1.0,
         "tool_call_count": 1,
         "tool_efficiency": 0.5,
+        "tool_repeat_overlap": 0.0,
         "tool_call_bonus": 0.0,
     }
 
@@ -94,6 +97,7 @@ BALL CLUB
         "format": 1.0,
         "tool_call_count": 1,
         "tool_efficiency": 0.5,
+        "tool_repeat_overlap": 0.0,
         "tool_call_bonus": 0.05,
     }
 
@@ -136,7 +140,116 @@ The crop shows GRAND.
         "format": 1.0,
         "tool_call_count": 2,
         "tool_efficiency": pytest.approx(1.0 / 3.0),
+        "tool_repeat_overlap": 0.0,
         "tool_call_bonus": 0.05,
+    }
+
+
+def test_strict_boxed_format_gives_unboxed_correct_answer_partial_format_credit():
+    solution = "<think>The sign text is readable.</think><answer>GRAND</answer>"
+
+    result = compute_score_from_data_source(
+        data_source="qwen3vl_filtering",
+        solution_str=solution,
+        ground_truth="GRAND",
+        extra_info={"reward_type": "search"},
+        format_score=0.2,
+        allow_unboxed_answer_for_accuracy=True,
+        require_boxed_answer_for_full_format=True,
+        unboxed_answer_format_score=0.5,
+    )
+
+    assert result == {
+        "score": pytest.approx(0.9),
+        "accuracy": 1.0,
+        "format": 0.5,
+        "tool_call_count": 0,
+        "tool_efficiency": 1.0,
+        "tool_repeat_overlap": 0.0,
+        "tool_call_bonus": 0.0,
+        "answer_has_boxed": False,
+        "answer_used_unboxed_fallback": True,
+    }
+
+
+def test_strict_boxed_format_gives_boxed_correct_answer_full_format_credit():
+    solution = "<think>The sign text is readable.</think><answer>It says \\boxed{GRAND}.</answer>"
+
+    result = compute_score_from_data_source(
+        data_source="qwen3vl_filtering",
+        solution_str=solution,
+        ground_truth="GRAND",
+        extra_info={"reward_type": "search"},
+        format_score=0.2,
+        allow_unboxed_answer_for_accuracy=True,
+        require_boxed_answer_for_full_format=True,
+        unboxed_answer_format_score=0.5,
+    )
+
+    assert result == {
+        "score": pytest.approx(1.0),
+        "accuracy": 1.0,
+        "format": 1.0,
+        "tool_call_count": 0,
+        "tool_efficiency": 1.0,
+        "tool_repeat_overlap": 0.0,
+        "tool_call_bonus": 0.0,
+        "answer_has_boxed": True,
+        "answer_used_unboxed_fallback": False,
+    }
+
+
+def test_strict_boxed_format_gives_unboxed_wrong_answer_partial_format_only():
+    solution = "<think>The sign text is readable.</think><answer>SMALL</answer>"
+
+    result = compute_score_from_data_source(
+        data_source="qwen3vl_filtering",
+        solution_str=solution,
+        ground_truth="GRAND",
+        extra_info={"reward_type": "search"},
+        format_score=0.2,
+        allow_unboxed_answer_for_accuracy=True,
+        require_boxed_answer_for_full_format=True,
+        unboxed_answer_format_score=0.5,
+    )
+
+    assert result == {
+        "score": pytest.approx(0.1),
+        "accuracy": 0.0,
+        "format": 0.5,
+        "tool_call_count": 0,
+        "tool_efficiency": 1.0,
+        "tool_repeat_overlap": 0.0,
+        "tool_call_bonus": 0.0,
+        "answer_has_boxed": False,
+        "answer_used_unboxed_fallback": True,
+    }
+
+
+def test_strict_boxed_format_keeps_invalid_structure_zero():
+    solution = "plain answer GRAND"
+
+    result = compute_score_from_data_source(
+        data_source="qwen3vl_filtering",
+        solution_str=solution,
+        ground_truth="GRAND",
+        extra_info={"reward_type": "search"},
+        format_score=0.2,
+        allow_unboxed_answer_for_accuracy=True,
+        require_boxed_answer_for_full_format=True,
+        unboxed_answer_format_score=0.5,
+    )
+
+    assert result == {
+        "score": 0.0,
+        "accuracy": 0.0,
+        "format": 0.0,
+        "tool_call_count": 0,
+        "tool_efficiency": 1.0,
+        "tool_repeat_overlap": 0.0,
+        "tool_call_bonus": 0.0,
+        "answer_has_boxed": False,
+        "answer_used_unboxed_fallback": False,
     }
 
 
@@ -161,8 +274,54 @@ def test_mandatory_think_async_entrypoint_matches_sync_reward():
         "format": 1.0,
         "tool_call_count": 0,
         "tool_efficiency": 1.0,
+        "tool_repeat_overlap": 0.0,
         "tool_call_bonus": 0.0,
     }
+
+
+def test_strict_boxed_format_async_entrypoint_matches_sync_reward():
+    kwargs = {
+        "data_source": "qwen3vl_filtering",
+        "solution_str": "<think>The sign text is readable.</think><answer>GRAND</answer>",
+        "ground_truth": "GRAND",
+        "extra_info": {"reward_type": "search"},
+        "format_score": 0.2,
+        "allow_unboxed_answer_for_accuracy": True,
+        "require_boxed_answer_for_full_format": True,
+        "unboxed_answer_format_score": 0.5,
+    }
+
+    sync_result = compute_score_from_data_source(**kwargs)
+    async_result = asyncio.run(async_compute_score_from_data_source(**kwargs))
+
+    assert async_result == sync_result
+    assert async_result["accuracy"] == 1.0
+    assert async_result["format"] == 0.5
+    assert async_result["answer_used_unboxed_fallback"] is True
+
+
+def test_shared_answer_extraction_uses_unboxed_content_for_judge_prediction():
+    result = extract_answer_for_accuracy("GRAND", "search", allow_unboxed_answer_for_accuracy=True)
+
+    assert result.prediction == "GRAND"
+    assert result.has_boxed is False
+    assert result.used_unboxed_fallback is True
+
+
+def test_shared_answer_extraction_uses_boxed_payload_for_judge_prediction():
+    result = extract_answer_for_accuracy("The sign says \\boxed{GRAND}.", "search", allow_unboxed_answer_for_accuracy=True)
+
+    assert result.prediction == "GRAND"
+    assert result.has_boxed is True
+    assert result.used_unboxed_fallback is False
+
+
+def test_shared_answer_extraction_rejects_empty_answer():
+    result = extract_answer_for_accuracy("", "search", allow_unboxed_answer_for_accuracy=True)
+
+    assert result.prediction is None
+    assert result.has_boxed is False
+    assert result.used_unboxed_fallback is False
 
 
 @pytest.mark.parametrize(
@@ -218,6 +377,7 @@ def test_mandatory_think_invalid_formats_score_zero(solution, expected_tool_call
         "format": 0.0,
         "tool_call_count": expected_tool_calls,
         "tool_efficiency": 1.0,
+        "tool_repeat_overlap": 0.0,
         "tool_call_bonus": 0.0,
     }
 
@@ -242,6 +402,7 @@ def test_mandatory_think_decoded_role_markers_without_answer_remain_invalid():
         "format": 0.0,
         "tool_call_count": 1,
         "tool_efficiency": 0.5,
+        "tool_repeat_overlap": 0.0,
         "tool_call_bonus": 0.0,
     }
 
@@ -271,8 +432,101 @@ Error processing image zoom-in: cropped image aspect ratio 300.0 exceeds max_cro
         "format": 0.0,
         "tool_call_count": 1,
         "tool_efficiency": 0.5,
+        "tool_repeat_overlap": 0.0,
         "tool_call_bonus": 0.0,
     }
+
+
+def test_tool_repeat_overlap_penalizes_same_img_idx_high_iou_repeat():
+    solution = """
+<think>Zoom into the legend.</think>
+<tool_call>
+{"name": "image_zoom_in_tool", "arguments": {"bbox_2d": [100, 100, 400, 400], "label": "legend", "img_idx": 0}}
+</tool_call>
+<tool_response>ok</tool_response>
+<think>The crop was unclear, zoom nearly the same place again.</think>
+<tool_call>
+{"name": "image_zoom_in_tool", "arguments": {"bbox_2d": [105, 105, 395, 395], "label": "legend", "img_idx": 0}}
+</tool_call>
+<tool_response>ok</tool_response>
+<think>The answer is clear.</think>
+<answer>Memory Care</answer>
+""".strip()
+
+    result = compute_score_from_data_source(
+        data_source="qwen3vl_filtering",
+        solution_str=solution,
+        ground_truth="memory care",
+        extra_info={"reward_type": "string_match"},
+        format_score=0.2,
+    )
+
+    assert result["format"] == 1.0
+    assert result["tool_call_count"] == 2
+    assert result["tool_repeat_overlap"] == pytest.approx(-0.5)
+
+
+def test_tool_repeat_overlap_clamps_multiple_same_img_idx_repeats():
+    solution = """
+<think>Zoom into the legend.</think>
+<tool_call>
+{"name": "image_zoom_in_tool", "arguments": {"bbox_2d": [100, 100, 400, 400], "label": "legend", "img_idx": 0}}
+</tool_call>
+<tool_response>ok</tool_response>
+<think>Repeat once.</think>
+<tool_call>
+{"name": "image_zoom_in_tool", "arguments": {"bbox_2d": [101, 101, 399, 399], "label": "legend", "img_idx": 0}}
+</tool_call>
+<tool_response>ok</tool_response>
+<think>Repeat twice.</think>
+<tool_call>
+{"name": "image_zoom_in_tool", "arguments": {"bbox_2d": [102, 102, 398, 398], "label": "legend", "img_idx": 0}}
+</tool_call>
+<tool_response>ok</tool_response>
+<think>The answer is clear.</think>
+<answer>Memory Care</answer>
+""".strip()
+
+    result = compute_score_from_data_source(
+        data_source="qwen3vl_filtering",
+        solution_str=solution,
+        ground_truth="memory care",
+        extra_info={"reward_type": "string_match"},
+        format_score=0.2,
+    )
+
+    assert result["format"] == 1.0
+    assert result["tool_call_count"] == 3
+    assert result["tool_repeat_overlap"] == pytest.approx(-1.0)
+
+
+def test_tool_repeat_overlap_ignores_high_iou_across_different_img_idx():
+    solution = """
+<think>Zoom into the full image.</think>
+<tool_call>
+{"name": "image_zoom_in_tool", "arguments": {"bbox_2d": [100, 100, 400, 400], "label": "legend", "img_idx": 0}}
+</tool_call>
+<tool_response>ok</tool_response>
+<think>Zoom into the same normalized region of a different crop.</think>
+<tool_call>
+{"name": "image_zoom_in_tool", "arguments": {"bbox_2d": [100, 100, 400, 400], "label": "legend", "img_idx": 1}}
+</tool_call>
+<tool_response>ok</tool_response>
+<think>The answer is clear.</think>
+<answer>Memory Care</answer>
+""".strip()
+
+    result = compute_score_from_data_source(
+        data_source="qwen3vl_filtering",
+        solution_str=solution,
+        ground_truth="memory care",
+        extra_info={"reward_type": "string_match"},
+        format_score=0.2,
+    )
+
+    assert result["format"] == 1.0
+    assert result["tool_call_count"] == 2
+    assert result["tool_repeat_overlap"] == 0.0
 
 
 def test_mandatory_think_tool_call_bonus_applies_at_threshold():
@@ -304,6 +558,7 @@ The crop shows the legend labels.
         "format": 1.0,
         "tool_call_count": 1,
         "tool_efficiency": 0.5,
+        "tool_repeat_overlap": 0.0,
         "tool_call_bonus": 0.05,
     }
 
@@ -393,5 +648,6 @@ def test_mandatory_think_tool_call_bonus_requires_valid_format():
         "format": 0.0,
         "tool_call_count": 1,
         "tool_efficiency": 0.5,
+        "tool_repeat_overlap": 0.0,
         "tool_call_bonus": 0.0,
     }

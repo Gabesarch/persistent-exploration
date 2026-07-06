@@ -27,6 +27,7 @@
 metadata:
   allowed_tools:
     - image_zoom_in_tool
+  show_initial_image_index_hint: false
   system_prompt_files:
     - prompts/tools/system_vero_reasoning.txt
   system_prompt_preserve_trailing_newline: true
@@ -38,6 +39,10 @@ metadata:
         properties:
           bbox_2d:
             type: array
+            items:
+              type: number
+            minItems: 4
+            maxItems: 4
             description: "The bounding box of the region to zoom in, as [x1, y1, x2, y2], where (x1, y1) is the top-left corner and (x2, y2) is the bottom-right corner"
           label:
             type: string

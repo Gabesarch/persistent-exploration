@@ -66,7 +66,8 @@ class MCPClient:
                 results.append(self.convert_result_to_openai_format(item))
             return results
         if isinstance(result, ImageContent):
-            return [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{result.data}"}}]
+            mime_type = result.mimeType or "image/png"
+            return [{"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{result.data}"}}]
         elif isinstance(result, TextContent):
             return [{"type": "text", "text": result.text}]
         elif isinstance(result, AudioContent):

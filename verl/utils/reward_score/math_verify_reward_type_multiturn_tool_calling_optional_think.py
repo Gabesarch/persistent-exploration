@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from dataclasses import dataclass
 from typing import Any
 
 from verl.utils.reward_score.math_verify_reward_type_boxed import _counting_reward
@@ -22,6 +23,8 @@ from verl.utils.reward_score.text_normalization import search_string_reward
 __all__ = [
     "format_reward",
     "acc_reward",
+    "extract_answer_for_accuracy",
+    "tool_repeat_overlap_reward",
     "compute_score",
     "compute_score_from_data_source",
     "async_compute_score_from_data_source",
@@ -50,6 +53,13 @@ _TOOL_CALL_TO_RESPONSE_ROLE_RE = re.compile(
     rf"({re.escape(_TOOL_CALL_CLOSE)})\s*user\s*({re.escape(_TOOL_RESPONSE_OPEN)})"
 )
 _TOOL_RESPONSE_TO_ASSISTANT_RE = re.compile(rf"({re.escape(_TOOL_RESPONSE_CLOSE)})\s*assistant\s*")
+
+
+@dataclass(frozen=True)
+class AnswerExtraction:
+    prediction: str | None
+    has_boxed: bool
+    used_unboxed_fallback: bool
 
 
 def _normalize_chat_template_role_markers(text: str) -> str:
@@ -91,40 +101,45 @@ def _consume_think_block(text: str, pos: int) -> int | None:
     return _skip_ws(text, next_pos)
 
 
-def _validate_tool_call_payload(payload: str) -> bool:
+def _parse_tool_call_payload(payload: str) -> dict[str, Any] | None:
     try:
         tool_call = json.loads(payload.strip())
     except json.JSONDecodeError:
-        return False
+        return None
 
     if not isinstance(tool_call, dict):
-        return False
+        return None
 
     name = tool_call.get("name")
     arguments = tool_call.get("arguments")
-    return isinstance(name, str) and bool(name.strip()) and isinstance(arguments, dict)
+    if not (isinstance(name, str) and bool(name.strip()) and isinstance(arguments, dict)):
+        return None
+    return tool_call
 
 
-def _parse_multiturn_tool_calling_output(predict_str: str) -> tuple[bool, str | None, int]:
+def _parse_multiturn_tool_calling_output(predict_str: str) -> tuple[bool, str | None, int, list[dict[str, Any]]]:
     text = _normalize_chat_template_role_markers(str(predict_str)).strip()
     if not text:
-        return False, None, 0
+        return False, None, 0, []
 
     pos = 0
     final_answer: str | None = None
     tool_call_count = 0
+    tool_calls: list[dict[str, Any]] = []
 
     while pos < len(text):
         pos = _skip_ws(text, pos)
         pos = _consume_think_block(text, pos)
         if pos is None:
-            return False, None, 0
+            return False, None, 0, []
 
         tool_call, next_pos = _consume_tagged_block(text, pos, _TOOL_CALL_OPEN, _TOOL_CALL_CLOSE)
         if tool_call is not None:
-            if not _validate_tool_call_payload(tool_call):
-                return False, None, 0
+            parsed_tool_call = _parse_tool_call_payload(tool_call)
+            if parsed_tool_call is None:
+                return False, None, 0, []
             tool_call_count += 1
+            tool_calls.append(parsed_tool_call)
             pos = _skip_ws(text, next_pos)
             while text.startswith(_TOOL_RESPONSE_OPEN, pos):
                 tool_response, next_pos = _consume_tagged_block(
@@ -134,39 +149,151 @@ def _parse_multiturn_tool_calling_output(predict_str: str) -> tuple[bool, str | 
                     _TOOL_RESPONSE_CLOSE,
                 )
                 if tool_response is None:
-                    return False, None, 0
+                    return False, None, 0, []
                 pos = _skip_ws(text, next_pos)
             continue
 
         answer, next_pos = _consume_tagged_block(text, pos, _ANSWER_OPEN, _ANSWER_CLOSE)
         if answer is None:
-            return False, None, 0
+            return False, None, 0, []
 
         pos = _skip_ws(text, next_pos)
         if pos != len(text):
-            return False, None, 0
+            return False, None, 0, []
         final_answer = answer.strip()
         break
 
-    return final_answer is not None, final_answer, tool_call_count
+    return final_answer is not None, final_answer, tool_call_count, tool_calls
 
 
-def format_reward(predict_str: str, extra_info: Any | None = None) -> float:  # noqa: ARG001
-    is_valid, _, _ = _parse_multiturn_tool_calling_output(predict_str)
-    return 1.0 if is_valid else 0.0
+def _extract_last_valid_boxed_content(text: str) -> str | None:
+    if not text:
+        return None
+
+    idx = 0
+    last_content: str | None = None
+    while True:
+        start = text.find(r"\boxed", idx)
+        if start == -1:
+            break
+        cursor = start + len(r"\boxed")
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        if cursor >= len(text) or text[cursor] != "{":
+            idx = cursor + 1
+            continue
+        cursor += 1
+        depth = 1
+        content_start = cursor
+        while cursor < len(text) and depth > 0:
+            ch = text[cursor]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+            cursor += 1
+        if depth == 0:
+            last_content = text[content_start : cursor - 1].strip()
+            idx = cursor
+        else:
+            break
+    return last_content or None
 
 
-def acc_reward(predict_str: str, ground_truth: str, use_boxed: bool = False, extra_info=None) -> float:  # noqa: ARG001
+def extract_answer_for_accuracy(
+    answer_text: str,
+    reward_type: str | None,
+    allow_unboxed_answer_for_accuracy: bool = True,
+) -> AnswerExtraction:
+    candidate = str(answer_text).strip()
+    if not candidate:
+        return AnswerExtraction(prediction=None, has_boxed=False, used_unboxed_fallback=False)
+
+    has_boxed = _extract_last_valid_boxed_content(candidate) is not None
+    if reward_type is None:
+        return AnswerExtraction(prediction=None, has_boxed=has_boxed, used_unboxed_fallback=False)
+
+    if has_boxed:
+        prediction = _extract_reward_answer(candidate, reward_type)
+        return AnswerExtraction(
+            prediction=prediction,
+            has_boxed=True,
+            used_unboxed_fallback=False,
+        )
+
+    if not allow_unboxed_answer_for_accuracy:
+        return AnswerExtraction(prediction=None, has_boxed=False, used_unboxed_fallback=False)
+
+    return AnswerExtraction(
+        prediction=candidate,
+        has_boxed=False,
+        used_unboxed_fallback=True,
+    )
+
+
+def _compute_formatting_score(
+    is_valid: bool,
+    answer_info: AnswerExtraction,
+    require_boxed_answer_for_full_format: bool = False,
+    unboxed_answer_format_score: float = 0.0,
+) -> float:
+    if not is_valid:
+        return 0.0
+    if not require_boxed_answer_for_full_format:
+        return 1.0
+    if answer_info.has_boxed:
+        return 1.0
+    if answer_info.used_unboxed_fallback and answer_info.prediction:
+        return float(unboxed_answer_format_score)
+    return 0.0
+
+
+def format_reward(
+    predict_str: str,
+    extra_info: Any | None = None,
+    allow_unboxed_answer_for_accuracy: bool = True,
+    require_boxed_answer_for_full_format: bool = False,
+    unboxed_answer_format_score: float = 0.0,
+) -> float:
+    is_valid, _, _, _ = _parse_multiturn_tool_calling_output(predict_str)
+    if not is_valid or not require_boxed_answer_for_full_format:
+        return 1.0 if is_valid else 0.0
+    reward_type = _extract_reward_type(extra_info)
+    _, final_answer_text, _, _ = _parse_multiturn_tool_calling_output(predict_str)
+    answer_info = extract_answer_for_accuracy(
+        final_answer_text or "",
+        reward_type,
+        allow_unboxed_answer_for_accuracy=allow_unboxed_answer_for_accuracy,
+    )
+    return _compute_formatting_score(
+        is_valid,
+        answer_info,
+        require_boxed_answer_for_full_format=require_boxed_answer_for_full_format,
+        unboxed_answer_format_score=unboxed_answer_format_score,
+    )
+
+
+def acc_reward(
+    predict_str: str,
+    ground_truth: str,
+    use_boxed: bool = False,  # noqa: ARG001
+    extra_info=None,
+    allow_unboxed_answer_for_accuracy: bool = True,
+) -> float:
     reward_type = _extract_reward_type(extra_info)
     if reward_type is None:
         return 0.0
 
-    is_valid, final_answer_text, _ = _parse_multiturn_tool_calling_output(predict_str)
+    is_valid, final_answer_text, _, _ = _parse_multiturn_tool_calling_output(predict_str)
     if not is_valid or not final_answer_text:
         return 0.0
 
-    final_answer = _extract_reward_answer(final_answer_text, reward_type)
-    if final_answer is None:
+    answer_info = extract_answer_for_accuracy(
+        final_answer_text,
+        reward_type,
+        allow_unboxed_answer_for_accuracy=allow_unboxed_answer_for_accuracy,
+    )
+    if answer_info.prediction is None:
         return 0.0
 
     truth = str(ground_truth).strip()
@@ -183,7 +310,7 @@ def acc_reward(predict_str: str, ground_truth: str, use_boxed: bool = False, ext
     handler = reward_handlers.get(reward_type)
     if handler is None:
         return 0.0
-    return handler(final_answer, truth, extra_info=extra_info)
+    return handler(answer_info.prediction, truth, extra_info=extra_info)
 
 
 def tool_efficiency_reward(
@@ -207,6 +334,62 @@ def tool_efficiency_reward(
     raise ValueError(f"Unsupported tool_efficiency_reward_mode: {mode}")
 
 
+def _extract_zoom_call_box(tool_call: dict[str, Any]) -> tuple[int, tuple[float, float, float, float]] | None:
+    if tool_call.get("name") != "image_zoom_in_tool":
+        return None
+    arguments = tool_call.get("arguments")
+    if not isinstance(arguments, dict):
+        return None
+    bbox = arguments.get("bbox_2d")
+    if not isinstance(bbox, list) or len(bbox) != 4 or any(isinstance(value, bool) for value in bbox):
+        return None
+    try:
+        x1, y1, x2, y2 = (float(value) for value in bbox)
+        img_idx = int(arguments.get("img_idx"))
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in (x1, y1, x2, y2)) or not x1 < x2 or not y1 < y2:
+        return None
+    return img_idx, (x1, y1, x2, y2)
+
+
+def _bbox_iou(box_a: tuple[float, float, float, float], box_b: tuple[float, float, float, float]) -> float:
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+    inter_w = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+    inter_h = max(0.0, min(ay2, by2) - max(ay1, by1))
+    inter = inter_w * inter_h
+    if inter <= 0.0:
+        return 0.0
+    area_a = (ax2 - ax1) * (ay2 - ay1)
+    area_b = (bx2 - bx1) * (by2 - by1)
+    union = area_a + area_b - inter
+    if union <= 0.0:
+        return 0.0
+    return inter / union
+
+
+def tool_repeat_overlap_reward(
+    tool_calls: list[dict[str, Any]],
+    iou_threshold: float = 0.9,
+    penalty_per_repeat: float = -0.5,
+    max_penalty: float = -1.0,
+) -> float:
+    threshold = float(iou_threshold)
+    repeat_count = 0
+    previous_by_img_idx: dict[int, list[tuple[float, float, float, float]]] = {}
+    for tool_call in tool_calls:
+        parsed = _extract_zoom_call_box(tool_call)
+        if parsed is None:
+            continue
+        img_idx, box = parsed
+        previous_boxes = previous_by_img_idx.setdefault(img_idx, [])
+        if any(_bbox_iou(box, previous_box) >= threshold for previous_box in previous_boxes):
+            repeat_count += 1
+        previous_boxes.append(box)
+    return max(float(max_penalty), repeat_count * float(penalty_per_repeat))
+
+
 def compute_score(
     predict_str: str,
     ground_truth: str,
@@ -219,17 +402,40 @@ def compute_score(
     tool_efficiency_concave_k: float = 10.0,
     tool_efficiency_concave_q: float = 0.95,
     tool_efficiency_score_weight: float = 0.0,
+    tool_repeat_overlap_iou_threshold: float = 0.9,
+    tool_repeat_overlap_penalty_per_repeat: float = -0.5,
+    tool_repeat_overlap_max_penalty: float = -1.0,
+    allow_unboxed_answer_for_accuracy: bool = True,
+    require_boxed_answer_for_full_format: bool = False,
+    unboxed_answer_format_score: float = 0.0,
     extra_info=None,
-) -> dict[str, float]:
+) -> dict[str, Any]:
     predict_str = str(predict_str)
     ground_truth = str(ground_truth)
 
-    is_valid, _, tool_call_count = _parse_multiturn_tool_calling_output(predict_str)
-    formatting = 1.0 if is_valid else 0.0
-    if formatting == 0.0:
+    is_valid, final_answer_text, tool_call_count, tool_calls = _parse_multiturn_tool_calling_output(predict_str)
+    reward_type = _extract_reward_type(extra_info)
+    answer_info = extract_answer_for_accuracy(
+        final_answer_text or "",
+        reward_type,
+        allow_unboxed_answer_for_accuracy=allow_unboxed_answer_for_accuracy,
+    )
+    formatting = _compute_formatting_score(
+        is_valid,
+        answer_info,
+        require_boxed_answer_for_full_format=require_boxed_answer_for_full_format,
+        unboxed_answer_format_score=unboxed_answer_format_score,
+    )
+    if not is_valid:
         accuracy = 0.0
     else:
-        accuracy = acc_reward(predict_str, ground_truth, use_boxed=use_boxed, extra_info=extra_info)
+        accuracy = acc_reward(
+            predict_str,
+            ground_truth,
+            use_boxed=use_boxed,
+            extra_info=extra_info,
+            allow_unboxed_answer_for_accuracy=allow_unboxed_answer_for_accuracy,
+        )
 
     tool_call_bonus_score = 0.0
     if (
@@ -247,20 +453,31 @@ def compute_score(
         concave_k=tool_efficiency_concave_k,
         concave_q=tool_efficiency_concave_q,
     )
+    tool_repeat_overlap_score = tool_repeat_overlap_reward(
+        tool_calls,
+        iou_threshold=tool_repeat_overlap_iou_threshold,
+        penalty_per_repeat=tool_repeat_overlap_penalty_per_repeat,
+        max_penalty=tool_repeat_overlap_max_penalty,
+    )
     score = (
         (1.0 - format_score - float(tool_efficiency_score_weight)) * accuracy
         + format_score * formatting
         + float(tool_efficiency_score_weight) * tool_efficiency_score
         + tool_call_bonus_score
     )
-    return {
+    result = {
         "score": score,
         "accuracy": accuracy,
         "format": formatting,
         "tool_call_count": tool_call_count,
         "tool_efficiency": tool_efficiency_score,
+        "tool_repeat_overlap": tool_repeat_overlap_score,
         "tool_call_bonus": tool_call_bonus_score,
     }
+    if require_boxed_answer_for_full_format:
+        result["answer_has_boxed"] = answer_info.has_boxed
+        result["answer_used_unboxed_fallback"] = answer_info.used_unboxed_fallback
+    return result
 
 
 def compute_score_from_data_source(
@@ -277,8 +494,14 @@ def compute_score_from_data_source(
     tool_efficiency_concave_k: float = 10.0,
     tool_efficiency_concave_q: float = 0.95,
     tool_efficiency_score_weight: float = 0.0,
+    tool_repeat_overlap_iou_threshold: float = 0.9,
+    tool_repeat_overlap_penalty_per_repeat: float = -0.5,
+    tool_repeat_overlap_max_penalty: float = -1.0,
+    allow_unboxed_answer_for_accuracy: bool = True,
+    require_boxed_answer_for_full_format: bool = False,
+    unboxed_answer_format_score: float = 0.0,
     **_: dict,
-) -> dict[str, float]:
+) -> dict[str, Any]:
     """Adapter for custom_reward_function configs that expect default signature."""
     return compute_score(
         solution_str,
@@ -292,6 +515,12 @@ def compute_score_from_data_source(
         tool_efficiency_concave_k=tool_efficiency_concave_k,
         tool_efficiency_concave_q=tool_efficiency_concave_q,
         tool_efficiency_score_weight=tool_efficiency_score_weight,
+        tool_repeat_overlap_iou_threshold=tool_repeat_overlap_iou_threshold,
+        tool_repeat_overlap_penalty_per_repeat=tool_repeat_overlap_penalty_per_repeat,
+        tool_repeat_overlap_max_penalty=tool_repeat_overlap_max_penalty,
+        allow_unboxed_answer_for_accuracy=allow_unboxed_answer_for_accuracy,
+        require_boxed_answer_for_full_format=require_boxed_answer_for_full_format,
+        unboxed_answer_format_score=unboxed_answer_format_score,
         extra_info=extra_info,
     )
 
@@ -310,8 +539,14 @@ async def async_compute_score_from_data_source(
     tool_efficiency_concave_k: float = 10.0,
     tool_efficiency_concave_q: float = 0.95,
     tool_efficiency_score_weight: float = 0.0,
+    tool_repeat_overlap_iou_threshold: float = 0.9,
+    tool_repeat_overlap_penalty_per_repeat: float = -0.5,
+    tool_repeat_overlap_max_penalty: float = -1.0,
+    allow_unboxed_answer_for_accuracy: bool = True,
+    require_boxed_answer_for_full_format: bool = False,
+    unboxed_answer_format_score: float = 0.0,
     **_: dict,
-) -> dict[str, float]:
+) -> dict[str, Any]:
     """Async adapter for reward loops."""
 
     return compute_score(
@@ -326,5 +561,11 @@ async def async_compute_score_from_data_source(
         tool_efficiency_concave_k=tool_efficiency_concave_k,
         tool_efficiency_concave_q=tool_efficiency_concave_q,
         tool_efficiency_score_weight=tool_efficiency_score_weight,
+        tool_repeat_overlap_iou_threshold=tool_repeat_overlap_iou_threshold,
+        tool_repeat_overlap_penalty_per_repeat=tool_repeat_overlap_penalty_per_repeat,
+        tool_repeat_overlap_max_penalty=tool_repeat_overlap_max_penalty,
+        allow_unboxed_answer_for_accuracy=allow_unboxed_answer_for_accuracy,
+        require_boxed_answer_for_full_format=require_boxed_answer_for_full_format,
+        unboxed_answer_format_score=unboxed_answer_format_score,
         extra_info=extra_info,
     )

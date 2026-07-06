@@ -7,6 +7,7 @@ import shutil
 import tempfile
 import time
 import uuid
+from functools import lru_cache
 from multiprocessing import cpu_count
 from typing import Dict, List, Optional, Tuple
 
@@ -15,6 +16,7 @@ from dotenv import load_dotenv
 from loguru import logger as eval_logger
 from openai import AsyncOpenAI
 from tqdm import tqdm
+from transformers import AutoTokenizer
 
 from lmms_eval.api.instance import GenerationResult, Instance, TokenCounts
 from lmms_eval.api.model import lmms
@@ -44,6 +46,9 @@ cpu, _ = optional_import("decord", "cpu")
 _TOOL_SAVED_IMAGE_RE = re.compile(r"Saved drawn image to:\s*(\S+)")
 _HIDDEN_TOOL_ARGS = {"image_path"}
 _IMAGE_REGISTRY_ENV = "LMMS_EVAL_IMAGE_REGISTRY"
+_FORCE_ACTION_REQUIRED_TAG_KEY = "verl_force_action_tag_after_think_required_tag"
+_FORCE_ACTION_TAG_IDS_KEY = "verl_force_action_tag_after_think_tag_ids"
+_FORCE_ACTION_AFTER_THINK_IDS_OPTIONS_KEY = "verl_force_action_tag_after_think_after_think_ids_options"
 
 # Env var carrying the per-call image registry (img_idx -> file path) to the MCP
 # tool subprocess, so tools resolve img_idx the way training does. Keep in sync
@@ -53,6 +58,39 @@ _IMAGE_REGISTRY_ENV = "LMMS_EVAL_IMAGE_REGISTRY"
 # vero_eval package root (parent of lmms_eval), used to resolve the relative
 # system_prompt_files paths declared in task yamls (e.g. prompts/tools/*.txt).
 _VERO_EVAL_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+
+def _hf_tokenizer_local_files_only() -> bool:
+    override = os.getenv("LMMS_EVAL_HF_TOKENIZER_LOCAL_ONLY")
+    if override is not None:
+        return override.lower() not in {"0", "false", "no", "off"}
+    return os.getenv("HF_HUB_OFFLINE", "").lower() in {"1", "true", "yes", "on"} or os.getenv(
+        "TRANSFORMERS_OFFLINE", ""
+    ).lower() in {"1", "true", "yes", "on"}
+
+
+def _resolve_hf_tokenizer_path(name: str) -> str:
+    if os.path.isabs(name) or os.path.isdir(name):
+        return name
+    if not _hf_tokenizer_local_files_only():
+        return name
+    hf_home = os.path.expanduser(os.getenv("HF_HOME", ""))
+    local = os.path.join(hf_home, name) if hf_home else ""
+    if local and os.path.isdir(local):
+        return local
+    return name
+
+
+@lru_cache(maxsize=4)
+def _get_forced_action_tokenizer(name: str):
+    use_fast = os.getenv("LMMS_EVAL_HF_TOKENIZER_USE_FAST", "1").lower() not in {"0", "false", "no", "off"}
+    trust_remote_code = os.getenv("LMMS_EVAL_HF_TRUST_REMOTE_CODE", "0").lower() in {"1", "true", "yes", "on"}
+    return AutoTokenizer.from_pretrained(
+        _resolve_hf_tokenizer_path(name),
+        use_fast=use_fast,
+        trust_remote_code=trust_remote_code,
+        local_files_only=_hf_tokenizer_local_files_only(),
+    )
 
 
 def _composite_zoom_to_original(image_provenance, img_idx, bbox):
@@ -122,8 +160,10 @@ class AsyncOpenAIChat(lmms):
         prefix_hash_chars: int = 256,
         system_prompt: Optional[str] = None,
         max_tool_iterations: int = 10,
-        max_tool_images: int = 8,
+        max_tool_images: int = 10,
         tool_image_as_user_turn: bool = False,
+        force_answer_after_max_tool_iterations: bool = False,
+        force_final_answer_prefix: str = "",
         **kwargs,
     ) -> None:
         super().__init__()
@@ -177,6 +217,9 @@ class AsyncOpenAIChat(lmms):
         self.max_tool_iterations = int(max_tool_iterations)
         self.max_tool_images = int(max_tool_images)
         self.tool_image_as_user_turn = parse_bool(tool_image_as_user_turn)
+        self.force_answer_after_max_tool_iterations = parse_bool(force_answer_after_max_tool_iterations)
+        self.force_final_answer_prefix = force_final_answer_prefix or ""
+        self._forced_action_tokenizer = None
         self._tool_functions = None
         self._task_tools_cache = {}
         self._task_system_prompt_cache = {}
@@ -235,6 +278,57 @@ class AsyncOpenAIChat(lmms):
     @property
     def batch_size(self):
         return self.batch_size_per_gpu
+
+    def _forced_action_extra_body(self, required_tag: str) -> dict:
+        tokenizer_name = os.getenv("LMMS_EVAL_HF_TOKENIZER", "Qwen/Qwen3-8B")
+        if self._forced_action_tokenizer is None:
+            self._forced_action_tokenizer = _get_forced_action_tokenizer(tokenizer_name)
+
+        forced_text = f"\n{required_tag}"
+        if required_tag == "<answer>" and self.force_final_answer_prefix:
+            forced_text += self.force_final_answer_prefix
+        tag_ids = self._forced_action_tokenizer.encode(forced_text, add_special_tokens=False)
+        after_think_ids = self._forced_action_tokenizer.encode("</think>", add_special_tokens=False)
+        if not tag_ids:
+            raise ValueError(f"required action tag encoded to no tokens: {required_tag}")
+        if not after_think_ids:
+            raise ValueError("forced action after-think marker encoded to no tokens: </think>")
+
+        return {
+            "extra_args": {
+                _FORCE_ACTION_REQUIRED_TAG_KEY: required_tag,
+                _FORCE_ACTION_TAG_IDS_KEY: tag_ids,
+                _FORCE_ACTION_AFTER_THINK_IDS_OPTIONS_KEY: [after_think_ids],
+            }
+        }
+
+    async def _force_final_answer_response(self, payload: dict, task: Optional[str]) -> Tuple[str, int, int, int]:
+        final_payload = dict(payload)
+        final_payload.pop("tools", None)
+        final_payload.pop("tool_choice", None)
+        extra_body = dict(final_payload.get("extra_body") or {})
+        extra_body.update(self._forced_action_extra_body("<answer>"))
+        final_payload["extra_body"] = extra_body
+
+        response = await self.client.chat.completions.create(**final_payload)
+        content = response.choices[0].message.content or ""
+        input_tokens = 0
+        output_tokens = 0
+        reasoning_tokens = 0
+        if hasattr(response, "usage") and response.usage:
+            input_tokens = getattr(response.usage, "prompt_tokens", 0) or 0
+            output_tokens = getattr(response.usage, "completion_tokens", 0) or 0
+            if hasattr(response.usage, "completion_tokens_details") and response.usage.completion_tokens_details:
+                reasoning_tokens = getattr(response.usage.completion_tokens_details, "reasoning_tokens", 0) or 0
+        log_usage(
+            model_name=self.model_version,
+            task_name=task,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            reasoning_tokens=reasoning_tokens,
+            source="model",
+        )
+        return content, input_tokens, output_tokens, reasoning_tokens
 
     def _rewrite_tool_schemas_for_model(self, tool_list):
         rewritten = []
@@ -456,6 +550,9 @@ class AsyncOpenAIChat(lmms):
         # _composite_zoom_to_original) so chained / multi-index zooms keep full detail.
         image_provenance: Dict[int, tuple] = {}
         next_img_idx = 0
+        task_metadata = self.task_metadata.get(task) or {}
+        show_initial_image_index_hint = parse_bool(task_metadata.get("show_initial_image_index_hint", True))
+
         if self.mcp_client is not None:
             for image_idx, image in enumerate(images):
                 # Save losslessly at ORIGINAL resolution (PNG), matching training's
@@ -466,12 +563,13 @@ class AsyncOpenAIChat(lmms):
                 image_registry[next_img_idx] = image_path
                 image_provenance[next_img_idx] = (next_img_idx, [0.0, 0.0, float(image.width), float(image.height)])
                 next_img_idx += 1
-                messages[-1]["content"].append(
-                    {
-                        "type": "text",
-                        "text": f"\nImage {image_idx} is available as img_idx={image_idx}.",
-                    }
-                )
+                if show_initial_image_index_hint:
+                    messages[-1]["content"].append(
+                        {
+                            "type": "text",
+                            "text": f"\nImage {image_idx} is available as img_idx={image_idx}.",
+                        }
+                    )
             for video_idx, video in enumerate(videos):
                 messages[-1]["content"].append(
                     {
@@ -515,7 +613,7 @@ class AsyncOpenAIChat(lmms):
                 payload["tool_choice"] = "auto"
             # Per-task image-indexing mode controls the model-visible tool_response wording
             # (training_faithful | multi_index | None=default). See _tool_image_registered_text.
-            image_indexing_mode = (self.task_metadata.get(task) or {}).get("image_indexing")
+            image_indexing_mode = task_metadata.get("image_indexing")
 
             response = await self.client.chat.completions.create(**payload)
             last_response = response.choices[0].message.content or ""
@@ -693,7 +791,22 @@ class AsyncOpenAIChat(lmms):
 
             if tool_iteration >= self.max_tool_iterations and not terminal_tool_called:
                 eval_logger.warning(f"Max tool iterations ({self.max_tool_iterations}) reached for request {idx}")
-                all_response += f"\n[MAX_TOOL_ITERATIONS_REACHED]"
+                forced_final_answer_succeeded = False
+                if self.force_answer_after_max_tool_iterations:
+                    try:
+                        eval_logger.info(f"Forcing final answer after max tool iterations for request {idx}")
+                        final_text, input_tokens, output_tokens, reasoning_tokens = await self._force_final_answer_response(
+                            payload, task if "task" in locals() else None
+                        )
+                        total_input_tokens += input_tokens
+                        total_output_tokens += output_tokens
+                        total_reasoning_tokens += reasoning_tokens
+                        all_response += final_text
+                        forced_final_answer_succeeded = True
+                    except Exception as exc:
+                        eval_logger.warning(f"Forced final answer after max tool iterations failed for request {idx}: {exc}")
+                if not forced_final_answer_succeeded:
+                    all_response += f"\n[MAX_TOOL_ITERATIONS_REACHED]"
             return all_response, idx, TokenCounts(input_tokens=total_input_tokens, output_tokens=total_output_tokens, reasoning_tokens=total_reasoning_tokens)
         finally:
             _cleanup_request_images()

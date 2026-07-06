@@ -47,9 +47,9 @@ from verl.utils.debug.comprehensive_logging import (
 from verl.utils.profiler import simple_timer
 from verl.utils.response_display import apply_response_display_prefix, get_response_display_prefix
 from verl.utils.reward_score.math_verify_reward_type_multiturn_tool_calling_optional_think import (
-    _extract_reward_answer,
     _extract_reward_type,
     _parse_multiturn_tool_calling_output,
+    extract_answer_for_accuracy,
 )
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.utils.forced_action_tags import (
@@ -169,6 +169,7 @@ class ToolAgentLoop(AgentLoopBase):
         self.max_tool_response_length = multi_turn_config.max_tool_response_length
         self.tool_response_truncate_side = multi_turn_config.tool_response_truncate_side
         self.force_tool_calls_until_final_turn = getattr(multi_turn_config, "force_tool_calls_until_final_turn", False)
+        self.force_answer_on_final_turn = getattr(multi_turn_config, "force_answer_on_final_turn", False)
         self.final_answer_token_margin = getattr(multi_turn_config, "final_answer_token_margin", 2048)
         self.force_final_answer_prefix = getattr(multi_turn_config, "force_final_answer_prefix", "")
         self.tool_response_turn_suffix_enabled = getattr(multi_turn_config, "tool_response_turn_suffix_enabled", False)
@@ -224,6 +225,7 @@ class ToolAgentLoop(AgentLoopBase):
         reward_kwargs = dict(reward_config.get("custom_reward_function", {}).get("reward_kwargs", {}))
         self.llm_judge_format_score = float(reward_kwargs.get("format_score", 0.5))
         self.llm_judge_tool_efficiency_score_weight = float(reward_kwargs.get("tool_efficiency_score_weight", 0.0))
+        self.allow_unboxed_answer_for_accuracy = bool(reward_kwargs.get("allow_unboxed_answer_for_accuracy", True))
         tool_config_path = multi_turn_config.tool_config_path
         tool_list = initialize_tools_from_config(tool_config_path) if tool_config_path else []
         self.tools = {tool.name: tool for tool in tool_list}
@@ -474,6 +476,9 @@ class ToolAgentLoop(AgentLoopBase):
 
         if self.force_tool_calls_until_final_turn:
             forced_required_tag = "<answer>" if self._must_answer_now(agent_data) else "<tool_call>"
+            sampling_params = self._with_forced_action_extra_args(sampling_params, forced_required_tag)
+        elif self.force_answer_on_final_turn and self._must_answer_now(agent_data):
+            forced_required_tag = "<answer>"
             sampling_params = self._with_forced_action_extra_args(sampling_params, forced_required_tag)
         elif getattr(self, "conditional_answer_retry_enabled", False) and agent_data.force_next_tool_call:
             forced_required_tag = "<tool_call>"
@@ -783,13 +788,19 @@ class ToolAgentLoop(AgentLoopBase):
         if not getattr(self, "llm_judge_prompt_template", None):
             return {"llm_judge_used": False, "llm_judge_error": "missing_prompt_template"}
 
-        is_valid, final_answer_text, _ = _parse_multiturn_tool_calling_output(solution_str)
+        is_valid, final_answer_text, _, _ = _parse_multiturn_tool_calling_output(solution_str)
         if not is_valid or not final_answer_text:
+            if "<answer>" in str(solution_str) and "</answer>" in str(solution_str):
+                return {"llm_judge_used": False, "llm_judge_error": "missing_final_answer"}
             return {"llm_judge_used": False, "llm_judge_error": "invalid_trajectory_format"}
 
         reward_type = _extract_reward_type(extra_info)
-        final_answer = _extract_reward_answer(final_answer_text, reward_type)
-        if final_answer is None:
+        answer_info = extract_answer_for_accuracy(
+            final_answer_text,
+            reward_type,
+            allow_unboxed_answer_for_accuracy=getattr(self, "allow_unboxed_answer_for_accuracy", True),
+        )
+        if answer_info.prediction is None:
             return {"llm_judge_used": False, "llm_judge_error": "missing_final_answer"}
 
         question = self._extract_llm_judge_question(agent_data, extra_info)
@@ -799,7 +810,7 @@ class ToolAgentLoop(AgentLoopBase):
         judge_prompt = self._format_llm_judge_prompt(
             question=question,
             reference=str(ground_truth).strip(),
-            prediction=str(final_answer).strip(),
+            prediction=str(answer_info.prediction).strip(),
         )
         prompt_ids = self._encode_llm_judge_prompt(judge_prompt)
         sampling_params = {
@@ -843,6 +854,8 @@ class ToolAgentLoop(AgentLoopBase):
             "llm_judge_partial_credit": partial_credit,
             "llm_judge_accuracy": accuracy,
             "llm_judge_error": None,
+            "answer_has_boxed": answer_info.has_boxed,
+            "answer_used_unboxed_fallback": answer_info.used_unboxed_fallback,
         }
 
     def _format_llm_judge_prompt(self, question: str, reference: str, prediction: str) -> str:

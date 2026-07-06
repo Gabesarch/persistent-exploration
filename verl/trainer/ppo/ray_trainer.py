@@ -777,6 +777,66 @@ class RayPPOTrainer:
             batch.pop(non_tensor_batch_keys=["teacher_multi_modal_data"])
         return teacher_batch
 
+    @staticmethod
+    def _reward_extra_values_to_list(key: str, values, expected_len: int) -> list:
+        if isinstance(values, np.ndarray):
+            values_list = values.tolist()
+        elif isinstance(values, list):
+            values_list = values
+        else:
+            values_list = [values]
+
+        if len(values_list) != expected_len:
+            raise ValueError(
+                f"{key}: len(values)={len(values_list)}, expected_len={expected_len}"
+            )
+        return values_list
+
+    @classmethod
+    def _extend_validation_reward_extra_infos(
+        cls,
+        reward_extra_infos_dict: dict[str, list],
+        reward_extra_info: Mapping[str, Any],
+        batch_size: int,
+        current_size: int,
+    ) -> None:
+        """Append one validation batch of reward metadata while preserving sample alignment."""
+        for key, values in reward_extra_infos_dict.items():
+            if key == "reward":
+                continue
+            if len(values) != current_size:
+                raise ValueError(
+                    f"{key}: len(accumulated_values)={len(values)}, expected_len={current_size}"
+                )
+
+        for key, values in list(reward_extra_infos_dict.items()):
+            if key != "reward" and key not in reward_extra_info:
+                values.extend([None] * batch_size)
+
+        for key, values in reward_extra_info.items():
+            if key == "reward":
+                continue
+            values_list = cls._reward_extra_values_to_list(key, values, batch_size)
+            if key not in reward_extra_infos_dict:
+                reward_extra_infos_dict[key] = [None] * current_size
+            reward_extra_infos_dict[key].extend(values_list)
+
+    @staticmethod
+    def _pad_validation_reward_extra_result(
+        reward_extra_infos_dict: Mapping[str, list],
+        keys: set[str],
+        sample_count: int,
+    ) -> dict[str, list]:
+        padded = {}
+        for key in keys:
+            values = list(reward_extra_infos_dict.get(key, []))
+            if values and len(values) != sample_count:
+                raise ValueError(
+                    f"{key}: len(values)={len(values)}, expected_len={sample_count}"
+                )
+            padded[key] = values if values else [None] * sample_count
+        return padded
+
     def _validate(self, merged: bool = False):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
@@ -884,13 +944,12 @@ class RayPPOTrainer:
                 )
 
             reward_extra_infos_dict["reward"].extend(scores)
-            for key, values in reward_extra_info.items():
-                if key not in reward_extra_infos_dict:
-                    reward_extra_infos_dict[key] = []
-                if isinstance(values, np.ndarray):
-                    reward_extra_infos_dict[key].extend(values.tolist())
-                else:
-                    reward_extra_infos_dict[key].extend(values if isinstance(values, list) else [values])
+            self._extend_validation_reward_extra_infos(
+                reward_extra_infos_dict=reward_extra_infos_dict,
+                reward_extra_info=reward_extra_info,
+                batch_size=len(scores),
+                current_size=len(sample_scores) - len(scores),
+            )
 
             # collect num_turns of each prompt
             if "__num_turns__" in test_batch.non_tensor_batch:
@@ -974,10 +1033,14 @@ class RayPPOTrainer:
 
         reward_extra_infos_dict = {}
         all_keys = set(result_a["reward_extra_infos_dict"].keys()) | set(result_b["reward_extra_infos_dict"].keys())
+        padded_a = self._pad_validation_reward_extra_result(
+            result_a["reward_extra_infos_dict"], all_keys, len(result_a["sample_uids"])
+        )
+        padded_b = self._pad_validation_reward_extra_result(
+            result_b["reward_extra_infos_dict"], all_keys, len(result_b["sample_uids"])
+        )
         for key in all_keys:
-            list_a = result_a["reward_extra_infos_dict"].get(key, [])
-            list_b = result_b["reward_extra_infos_dict"].get(key, [])
-            reward_extra_infos_dict[key] = list_a + list_b
+            reward_extra_infos_dict[key] = padded_a[key] + padded_b[key]
 
         return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
 

@@ -88,6 +88,7 @@ class MultiTurnConfig(BaseConfig):
     format: str = "hermes"
     num_repeat_rollouts: Optional[int] = None
     force_tool_calls_until_final_turn: bool = False
+    force_answer_on_final_turn: bool = False
     final_answer_token_margin: int = 2048
     # Text forced immediately after the `<answer>` tag on the forced final turn (e.g. "\n\\boxed{"
     # to start a boxed answer). Empty string forces only the `<answer>` tag, as before.
