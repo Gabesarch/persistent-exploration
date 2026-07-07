@@ -1,4 +1,4 @@
-include: hstarbench_hos.yaml
+include: ../hstarbench_hos.yaml
 dataset_kwargs:
   data_files:
     test: /scratch/gpfs/ZHUANGL/shared/Hstarbench/data/hstarbench_hos_rl.jsonl

@@ -1,7 +1,7 @@
 include:
-  - hstarbench_hps.yaml
-  - hstarbench_hps_reasoning.yaml
-  - ../_tool_templates/_toolset_zoom_vero_yaml
+  - ../hstarbench_hps.yaml
+  - ../hstarbench_hps_reasoning.yaml
+  - ../../_tool_templates/_toolset_zoom_vero_yaml
 dataset_kwargs:
   data_files:
     test: /scratch/gpfs/ZHUANGL/shared/Hstarbench/data/hstarbench_hps_rl.jsonl
