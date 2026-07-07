@@ -507,7 +507,9 @@ class VLLMServerJudge:
     _WAKE_TAGS = ["kv_cache", "weights"]
     _MAX_CONCURRENT_REQUESTS = 256
 
-    _TEMPERATURE = 0.7
+    # temp 0 = deterministic judging (finalized eval protocol): removes the measured
+    # +/-2-4 pt run-to-run judge flip-noise that made single-run scores incomparable.
+    _TEMPERATURE = 0.0
     _TOP_P = 0.8
     _TOP_K = 20
     _MIN_P = 0.0
