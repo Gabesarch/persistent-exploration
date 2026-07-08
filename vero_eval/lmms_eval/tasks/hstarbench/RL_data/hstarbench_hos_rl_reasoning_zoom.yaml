@@ -1,7 +1,7 @@
 include:
-  - hstarbench_hos.yaml
-  - hstarbench_hos_reasoning.yaml
-  - ../_tool_templates/_toolset_zoom_vero_yaml
+  - ../hstarbench_hos.yaml
+  - ../hstarbench_hos_reasoning.yaml
+  - ../../_tool_templates/_toolset_zoom_vero_yaml
 dataset_kwargs:
   data_files:
     test: /scratch/gpfs/ZHUANGL/shared/Hstarbench/data/hstarbench_hos_rl.jsonl

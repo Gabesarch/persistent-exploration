@@ -1,7 +1,7 @@
 # Monitor RL training distribution with the same Vero zoom schema used at checkpoint eval.
 include:
-  - hstarbench_mixed_reasoning.yaml
-  - ../_tool_templates/_toolset_zoom_vero_yaml
+  - ../hstarbench_mixed_reasoning.yaml
+  - ../../_tool_templates/_toolset_zoom_vero_yaml
 dataset_kwargs:
   data_files:
     test: /scratch/gpfs/ZHUANGL/shared/Hstarbench/data/hstarbench_mixed_rl.jsonl
