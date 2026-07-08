@@ -14,7 +14,16 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 from openai import DefaultHttpxClient, OpenAI
 
-from vllm import LLM, SamplingParams
+def _vllm():
+    """Lazy vLLM import — only the in-process engine backends need it. Keeping it out
+    of module import spares every importer of this module (10+ task utils, the task
+    registry scan, offline yaml validation, and the default SERVER-judge path) the
+    full vllm/torch/triton load. (`from __future__ import annotations` keeps the
+    SamplingParams annotations string-only, so no runtime import is needed there.)"""
+    from vllm import LLM, SamplingParams
+    return LLM, SamplingParams
+
+
 
 _DEFAULT_SYSTEM_PROMPT = ""
 
@@ -137,6 +146,8 @@ class VLLMJudgeEngine:
     """Thin wrapper around vLLM for JSON generation with batched prompts."""
 
     def __init__(self, config: JudgeConfig) -> None:
+        LLM, SamplingParams = _vllm()
+        self._SamplingParams = SamplingParams
         self._config = config
         self._llm = LLM(
             model=config.model_path,
@@ -158,7 +169,7 @@ class VLLMJudgeEngine:
         if config.presence_penalty != 0.0:
             sampling_kwargs["presence_penalty"] = config.presence_penalty
         self._base_sampling_kwargs = dict(sampling_kwargs)
-        self._sampling_params = SamplingParams(**self._base_sampling_kwargs)
+        self._sampling_params = self._SamplingParams(**self._base_sampling_kwargs)
         raw_prompt = config.system_prompt or _DEFAULT_SYSTEM_PROMPT
         self._system_prompt = raw_prompt.strip()
 
@@ -178,7 +189,7 @@ class VLLMJudgeEngine:
             return self._sampling_params
         override_kwargs = dict(self._base_sampling_kwargs)
         override_kwargs["max_tokens"] = max_tokens
-        return SamplingParams(**override_kwargs)
+        return self._SamplingParams(**override_kwargs)
 
     def generate_json_batch(
         self,
@@ -275,6 +286,8 @@ class VLLMJudgeEngineQwen3:
         if os.path.isfile(template_path):
             with open(template_path, "r", encoding="utf-8") as handle:
                 self._chat_template = handle.read()
+        LLM, SamplingParams = _vllm()
+        self._SamplingParams = SamplingParams
         self._llm = LLM(
             model=config.model_path,
             tensor_parallel_size=config.tensor_parallel_size,
@@ -295,7 +308,7 @@ class VLLMJudgeEngineQwen3:
             "min_p": 0.0,
         }
         self._base_sampling_kwargs = dict(sampling_kwargs)
-        self._sampling_params = SamplingParams(**self._base_sampling_kwargs)
+        self._sampling_params = self._SamplingParams(**self._base_sampling_kwargs)
         # raw_prompt = config.system_prompt or _DEFAULT_SYSTEM_PROMPT
         # self._system_prompt = raw_prompt.strip()
 
@@ -315,7 +328,7 @@ class VLLMJudgeEngineQwen3:
             return self._sampling_params
         override_kwargs = dict(self._base_sampling_kwargs)
         override_kwargs["max_tokens"] = max_tokens
-        return SamplingParams(**override_kwargs)
+        return self._SamplingParams(**override_kwargs)
 
     def generate_json_batch(
         self,
@@ -507,7 +520,9 @@ class VLLMServerJudge:
     _WAKE_TAGS = ["kv_cache", "weights"]
     _MAX_CONCURRENT_REQUESTS = 256
 
-    _TEMPERATURE = 0.7
+    # temp 0 = deterministic judging (finalized eval protocol): removes the measured
+    # +/-2-4 pt run-to-run judge flip-noise that made single-run scores incomparable.
+    _TEMPERATURE = 0.0
     _TOP_P = 0.8
     _TOP_K = 20
     _MIN_P = 0.0
