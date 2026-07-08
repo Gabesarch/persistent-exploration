@@ -1,5 +1,6 @@
 # CANONICAL Vero zoom eval on VisualProbe-Hard — the trustworthy cross-checkpoint config.
-# (Finalized 2026-07: qwen3 generation-config sampling + strict deterministic judge.)
+# (Finalized 2026-07: qwen3 generation-config sampling + deterministic judge; strict-judge
+#  twin task: visual_probe_hard_reasoning_zoom_strict.)
 #
 # Reproduces the RL training INPUT word-by-word for image_zoom_in_tool (verified
 # byte-identical to training rollout inputs, validation_data/*.jsonl turn-1):
@@ -20,10 +21,12 @@
 #
 # PROTOCOL for checkpoint comparison (do not deviate silently):
 #   - serve at MM_MAX_PIXELS=10000000 (the 8-13MP accuracy plateau; the default);
-#   - dedicated Qwen3-32B judge (gpu:2) with the STRICT training-reward judge prompt
-#     (prompts/judge_prompt.txt = verbatim vero2_scripts/prompts/llm_judge_visual_search_prompt.txt;
-#     scored on is_equivalent), decoded at temperature 0 — strict scores read LOWER than
-#     the old lenient prompt, do not compare across the prompt change;
+#   - dedicated Qwen3-32B judge (gpu:2), decoded at temperature 0 (deterministic).
+#     THIS task uses the historical LENIENT rubric (prompts/judge_prompt.txt) —
+#     comparable with all previously reported visual_probe numbers. For the strict
+#     metric use visual_probe_hard_reasoning_zoom_strict (lenient rubric + the
+#     absence-claim rule, prompts/judge_prompt_strict.txt) — strict scores read
+#     LOWER; never compare across the two variants;
 #   - n=106 single runs still carry ~±3-5 pts from multi-turn trajectory chaos
 #     (batching nondeterminism) — ALWAYS compare means of >=3 runs, never single runs.
 # Also measured (step152): the "origcfg" family (no Layer-A + generic/multi-index toolset,
