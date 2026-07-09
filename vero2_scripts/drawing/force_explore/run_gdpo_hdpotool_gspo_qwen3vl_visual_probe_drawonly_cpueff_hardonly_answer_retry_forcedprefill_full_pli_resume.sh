@@ -9,7 +9,7 @@
 # pli-lc array task. Race rule: the instant EITHER this or the pli-lc array enters RUNNING, cancel
 # the other (monitor does this). First checkpoint write is >= ~15 min in (well after vLLM init),
 # so a <=2 min race-cancel window cannot produce a concurrent checkpoint write.
-#   sbatch vero2_scripts/run_..._drawonly_..._forcedprefill_full_pli_resume.sh
+#   sbatch vero2_scripts/drawing/force_explore/run_..._drawonly_..._forcedprefill_full_pli_resume.sh
 #SBATCH --job-name=drawonly_pli_rsm
 #SBATCH --partition=pli
 #SBATCH --account=vlmrl
@@ -35,5 +35,5 @@ export TRAINER_EXPERIMENT_SUFFIX="qwen3vl_visual_probe_drawonly_gdpo_hdpotool_ha
 # Validated fast config (same as the pli-lc run this continues).
 export CONFIG_NAME="gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill"
 
-exec bash vero2_scripts/counting/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill_full.sh \
+exec bash vero2_scripts/drawing/force_explore/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill_full.sh \
   vllm trainer.save_freq=5 trainer.max_actor_ckpt_to_keep=3

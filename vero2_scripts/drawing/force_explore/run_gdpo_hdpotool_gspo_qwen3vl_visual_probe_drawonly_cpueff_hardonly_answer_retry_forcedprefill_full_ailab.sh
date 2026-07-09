@@ -4,7 +4,7 @@
 # pli_xl/vlmrl give "Invalid qos" here). Thin wrapper over the full launcher with a
 # partition-tagged experiment name so its checkpoint dir can't collide with the
 # pli / pli-lc parallel jobs of the same config.
-#   sbatch vero2_scripts/run_..._drawonly_..._answer_retry_forcedprefill_full_ailab.sh
+#   sbatch vero2_scripts/drawing/force_explore/run_..._drawonly_..._answer_retry_forcedprefill_full_ailab.sh
 #SBATCH --job-name=drawonly_ailab
 #SBATCH --partition=ailab
 #SBATCH --nodes=1
@@ -38,5 +38,5 @@ export CONFIG_NAME="gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_drawonly_cpuef
 # (every step) means a reap costs at most one step, and the %1 resume chain resumes from the
 # last checkpoint. keep=3 bounds disk (FS ~full). Walltime kept at 24h so the job actually gets
 # scheduled (longer walltimes never allocate here).
-exec bash vero2_scripts/counting/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill_full.sh \
+exec bash vero2_scripts/drawing/force_explore/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill_full.sh \
   vllm trainer.save_freq=1 trainer.max_actor_ckpt_to_keep=3

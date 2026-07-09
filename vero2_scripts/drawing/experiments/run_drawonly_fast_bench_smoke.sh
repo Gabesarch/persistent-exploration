@@ -2,7 +2,7 @@
 # Speed/START smoke for the FAST drawing config (friend's speed levers + our answer-retry).
 # Validates the ported per-turn cap (max_assistant_response_length) + bounded retries START
 # and times a step. gpu-test, 4x A100, small batch, 2 steps. Extrapolate to full (8x H100 / bs256).
-#   sbatch vero2_scripts/run_drawonly_fast_bench_smoke.sh
+#   sbatch vero2_scripts/drawing/experiments/run_drawonly_fast_bench_smoke.sh
 #SBATCH --job-name=draw_fast
 #SBATCH --qos=gpu-test
 #SBATCH --nodes=1
@@ -31,7 +31,7 @@ export TRAINER_DEFAULT_LOCAL_DIR="${SAVE_PATH}/checkpoints/vero2_verl/draw_fast_
 export ANSWER_RETRY_ASSISTANT_PREFILL="Let's see, I do not have enough information to answer yet. My current annotations may be inaccurate or incomplete — let me use the drawing tools to correct and complete my markings, then re-examine the image before answering."
 
 # FAST config carries all the speed settings; just shrink batch + steps for the smoke.
-exec bash vero2_scripts/counting/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill_full.sh vllm \
+exec bash vero2_scripts/drawing/force_explore/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill_full.sh vllm \
   data.train_batch_size=16 \
   actor_rollout_ref.actor.ppo_mini_batch_size=16 \
   actor_rollout_ref.rollout.n=8 \

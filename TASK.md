@@ -9,7 +9,7 @@ Two phases, **sequential** (Chris's decision): Phase A first; Phase B after Phas
 ### Context
 
 PR #43 merged the forced-explore / conditional answer-retry machinery for the zoom tool (read `docs/vero2/forced-explore.md` first — it's accurate). The reference launcher is
-`vero2_scripts/zoom/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_cropzoom_cpueff_hardonly_answer_retry_forcedprefill_full.sh` → config `vero2_scripts/config/gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_cropzoom_cpueff_hardonly_answer_retry_forcedprefill.yaml` (retry block at `:221-237`; assistant-prefill text injected by the launcher at `:44-46`, `:118-123`). We want the same conditional answer-retry behavior in a run where the model uses **drawing tools** (annotate the image, get the annotated image back) instead of / alongside zoom.
+`vero2_scripts/zoom/force_explore/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_cropzoom_cpueff_hardonly_answer_retry_forcedprefill_full.sh` → config `vero2_scripts/config/gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_cropzoom_cpueff_hardonly_answer_retry_forcedprefill.yaml` (retry block at `:221-237`; assistant-prefill text injected by the launcher at `:44-46`, `:118-123`). We want the same conditional answer-retry behavior in a run where the model uses **drawing tools** (annotate the image, get the annotated image back) instead of / alongside zoom.
 
 ### Pre-investigated facts
 

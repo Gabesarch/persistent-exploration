@@ -6,7 +6,7 @@
 #
 # Delegates to the CONFIG_NAME-overridable full launcher (a generic main_ppo runner).
 # Debug traces + crops land in ${TRAINER_DEFAULT_LOCAL_DIR}/debug_logs.
-#   sbatch vero2_scripts/run_..._drawonly_..._answer_retry_forcedprefill_smoke.sh
+#   sbatch vero2_scripts/drawing/force_explore/run_..._drawonly_..._answer_retry_forcedprefill_smoke.sh
 #SBATCH --job-name=drawonly_arf_smoke
 #SBATCH --qos=gpu-test
 #SBATCH --nodes=1
@@ -38,7 +38,7 @@ export ANSWER_RETRY_ASSISTANT_PREFILL="Let's see, I do not have enough informati
 export TRAINER_EXPERIMENT_NAME="drawonly_arf_smoke_${SMOKE_ID}"
 export TRAINER_DEFAULT_LOCAL_DIR="${SAVE_PATH}/checkpoints/vero2_verl/drawonly_arf_smoke_${SMOKE_ID}"
 
-exec bash vero2_scripts/counting/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill_full.sh vllm \
+exec bash vero2_scripts/drawing/force_explore/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill_full.sh vllm \
   data.train_batch_size=8 \
   actor_rollout_ref.actor.ppo_mini_batch_size=8 \
   actor_rollout_ref.rollout.n=8 \

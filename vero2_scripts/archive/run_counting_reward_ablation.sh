@@ -11,9 +11,9 @@
 # (no reward override) is bit-identical to current training.
 #
 # Usage (from THIS worktree root, after `source ./set_paths.sh` — verify $VERL_ROOT):
-#   ARM=graded sbatch vero2_scripts/run_counting_reward_ablation.sh
-#   ARM=exact  sbatch vero2_scripts/run_counting_reward_ablation.sh
-#   ARM=wide_sigma sbatch vero2_scripts/run_counting_reward_ablation.sh
+#   ARM=graded sbatch vero2_scripts/archive/run_counting_reward_ablation.sh
+#   ARM=exact  sbatch vero2_scripts/archive/run_counting_reward_ablation.sh
+#   ARM=wide_sigma sbatch vero2_scripts/archive/run_counting_reward_ablation.sh
 # Smoke first on gpu-test (<1h) — flip to the commented gpu-test header below.
 # ---------------------------------------------------------------------------
 #SBATCH --job-name=count_ablate

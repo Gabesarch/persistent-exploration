@@ -8,7 +8,7 @@
 # It just sets the smoke env + overrides and delegates to the full launcher
 # (which is CONFIG_NAME-overridable). Debug traces + crops land in
 # ${TRAINER_DEFAULT_LOCAL_DIR}/debug_logs. Submit from the repo root:
-#   sbatch vero2_scripts/run_..._zoomdraw_..._answer_retry_forcedprefill_smoke.sh
+#   sbatch vero2_scripts/drawing/experiments/run_..._zoomdraw_..._answer_retry_forcedprefill_smoke.sh
 #SBATCH --job-name=zoomdraw_arf_smoke
 #SBATCH --qos=gpu-test
 #SBATCH --nodes=1
@@ -37,7 +37,7 @@ export CONFIG_NAME="gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_zoomdraw_debug
 export TRAINER_EXPERIMENT_NAME="zoomdraw_arf_smoke_${SMOKE_ID}"
 export TRAINER_DEFAULT_LOCAL_DIR="${SAVE_PATH}/checkpoints/vero2_verl/zoomdraw_arf_smoke_${SMOKE_ID}"
 
-exec bash vero2_scripts/counting/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_zoomdraw_cpueff_hardonly_answer_retry_forcedprefill_full.sh vllm \
+exec bash vero2_scripts/drawing/experiments/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_zoomdraw_cpueff_hardonly_answer_retry_forcedprefill_full.sh vllm \
   data.train_batch_size=8 \
   actor_rollout_ref.actor.ppo_mini_batch_size=8 \
   actor_rollout_ref.rollout.n=8 \

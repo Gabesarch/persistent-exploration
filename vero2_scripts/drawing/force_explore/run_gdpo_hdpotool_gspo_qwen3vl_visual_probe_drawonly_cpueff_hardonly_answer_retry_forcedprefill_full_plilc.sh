@@ -3,7 +3,7 @@
 # (9 nodes, --account=pli_xl, PreemptMode=OFF -- the primary training target per CLAUDE.md).
 # Thin wrapper over the full launcher with a partition-tagged experiment name so its
 # checkpoint dir can't collide with the pli parallel job of the same config.
-#   sbatch vero2_scripts/run_..._drawonly_..._answer_retry_forcedprefill_full_plilc.sh
+#   sbatch vero2_scripts/drawing/force_explore/run_..._drawonly_..._answer_retry_forcedprefill_full_plilc.sh
 #SBATCH --job-name=drawonly_plilc
 #SBATCH --partition=pli-lc
 #SBATCH --account=pli_xl
@@ -36,5 +36,5 @@ export CONFIG_NAME="gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_drawonly_cpuef
 
 # save_freq=5 (not 20): at this step cost a 24h task can't reach step 20, so with save_freq=20
 # every resume restarts from scratch. Checkpoint by ~step 5 instead; keep only 3 (disk is ~full).
-exec bash vero2_scripts/counting/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill_full.sh \
+exec bash vero2_scripts/drawing/force_explore/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill_full.sh \
   vllm trainer.save_freq=5 trainer.max_actor_ckpt_to_keep=3
