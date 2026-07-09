@@ -24,14 +24,14 @@ prompts. Everything here drives `python -m verl.trainer.main_ppo` on Della Slurm
 `run_<algo>_<model>_visual_probe_<tool>_..._<variant>_<size>.sh`
 
 - **tool**: `cropzoom` → `zoom/`; `drawonly` / `zoomdraw` / `countqa` → `counting/`.
-- **variant**: `answer_retry_forcedprefill`, `forced_explore`, `text_explore`, `llmjudge`, `hardonly`, `multiidx`, `fast` (rollout-caching speedups), …
+- **variant**: `answer_retry_forcedprefill`, `forced_explore`, `text_explore`, `llmjudge`, `hardonly`, `multiidx`, …
 - **size / role**: `full` = real training · `debug` = small subset · `smoke`/`bench_smoke` = quick start+timing check.
 
 Many launchers are **thin wrappers** that `exec bash` a base `..._full.sh` launcher with a different
 `#SBATCH` header + a `CONFIG_NAME` override. Example chain (`counting/`):
 
 ```
-run_..._drawonly_..._full_plilc.sh   # pli-lc H100 header + CONFIG_NAME=..._fast
+run_..._drawonly_..._full_plilc.sh   # pli-lc H100 header + CONFIG_NAME override
   └─ exec bash counting/run_..._drawonly_..._full.sh   # the base: builds args, calls main_ppo
        └─ --config-path=$VERL_ROOT/vero2_scripts/config  --config-name=$CONFIG_NAME
 ```
@@ -46,7 +46,7 @@ out: `debug256` in a *name* does **not** reliably mean small — there are two g
 
 | Kind | How to recognize | batch / steps |
 |---|---|---|
-| **Full** (real training) | no `debug`, or `_fast` | `train_batch_size` 128–256, `total_training_steps` 400–1000 |
+| **Full** (real training) | no `debug` in the name | `train_batch_size` 128–256, `total_training_steps` 400–1000 |
 | **Debug — new-style** | `debug256` config with baked-in small values | batch **32**, steps **3** |
 | **Debug — old-style** | `debug256` config keeps full batch/steps in the yaml, but the paired `run_..._debug256_*.sh` launcher overrides `data.train_files=$DEBUG_DATA` (the 256-sample subset `..._train_debug256.verl.jsonl`) | full batch in yaml, small data via launcher |
 | **Smoke** | any config + a `_smoke` / `_bench_smoke` wrapper | wrapper additionally overrides `data.train_batch_size=8/16 trainer.total_training_steps=2` on the CLI |
