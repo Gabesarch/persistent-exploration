@@ -44,11 +44,11 @@ These 8 launchers (7 distinct configs) are the whole training surface. **Everyth
 | 1 | **drawing · vanilla · FULL** | `drawing/vanilla/run_gdpo_hdpotool_gspo_countqa_qwen3vl_drawing_debug256_cpueff.sh` ⚠️name-trap: IS the full run | `gdpo_hdpotool_gspo_countqa_qwen3vl_drawing_debug256_cpueff.yaml` | batch 256, 1000 steps, cap 4096 |
 | 2 | **drawing · vanilla · debug** | `drawing/vanilla/run_gdpo_hdpotool_gspo_countqa_qwen3vl_drawing_smoke.sh` | **same config as #1** + CLI overrides | batch 8, 2 steps (gpu-test) |
 | 3 | **drawing · force_explore · FULL** | `drawing/force_explore/run_..._drawonly_cpueff_hardonly_answer_retry_forcedprefill_full.sh` — submit via `drawing/force_explore/submit.sh [plilc\|pli\|ailab]` | `gdpo_..._drawonly_cpueff_hardonly_answer_retry_forcedprefill.yaml` | batch 256, 1000 steps, cap 4096 |
-| 4 | **drawing · force_explore · debug** | `drawing/force_explore/run_..._answer_retry_forcedprefill_smoke.sh` | `gdpo_..._drawonly_debug256_cpueff_answer_retry_forcedprefill.yaml` | batch 32→8, 2 steps (gpu-test) |
+| 4 | **drawing · force_explore · debug** | `drawing/force_explore/run_..._answer_retry_forcedprefill_smoke.sh` | `gdpo_..._drawonly_debug256_cpueff_answer_retry_forcedprefill.yaml` | yaml says batch 32/3 steps; the wrapper shrinks it on the CLI to **batch 8, 2 steps** (gpu-test) |
 | 5 | **zoom · vanilla · FULL** | `zoom/vanilla/run_..._cropzoom_cpueff_hardonly.sh` | `gdpo_..._cropzoom_cpueff_hardonly.yaml` | batch 256, 400 steps, no cap |
 | 6 | **zoom · vanilla · debug** | `zoom/vanilla/run_..._cropzoom_debug256_cpueff.sh` | `gdpo_..._cropzoom_debug256_cpueff.yaml` | full batch, 256-row data |
 | 7 | **zoom · force_explore · FULL** | `zoom/force_explore/run_..._cropzoom_..._answer_retry_forcedprefill_full.sh` | `gdpo_..._cropzoom_cpueff_hardonly_answer_retry_forcedprefill.yaml` | batch 128, 400 steps, no cap |
-| 8 | **zoom · force_explore · debug** | `zoom/force_explore/run_..._answer_retry_forcedprefill_debug.sh` | `gdpo_..._cropzoom_debug256_cpueff_answer_retry_forcedprefill.yaml` | batch 32, 3 steps |
+| 8 | **zoom · force_explore · debug** | `zoom/force_explore/run_..._answer_retry_forcedprefill_debug.sh` | `gdpo_..._cropzoom_debug256_cpueff_answer_retry_forcedprefill.yaml` | batch 32, 3 steps — runs its debug yaml **as-is**, no CLI shrink |
 
 (`vanilla` = plain multi-turn tool training; `force_explore` = + answer-retry interruption.
 cap = `max_assistant_response_length` per-turn output cap. `rollout.n=8` everywhere →
