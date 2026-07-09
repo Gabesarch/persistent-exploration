@@ -3,7 +3,7 @@
 Multi-turn **tool-use RL for vision-language models** (Qwen3-VL-8B), built on a fork of
 [verl](https://github.com/volcengine/verl). The model reasons in `<think>`, calls a visual tool —
 **zoom** (`image_zoom_in_tool` crops a bbox and feeds the crop back) or **drawing**
-(annotate the image with points/boxes/lines) — and answers in `<answer>`, trained with GDPO
+(mark the image with points as a visual checklist) — and answers in `<answer>`, trained with GDPO
 advantage + GSPO loss on chart / search / counting data. Runs on Princeton Della (Slurm).
 
 | Where | What |

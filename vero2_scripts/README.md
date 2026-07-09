@@ -34,20 +34,40 @@ that one directory, so moving a yaml into a subfolder silently breaks every laun
 Only `config/archive/` is an exception — those yamls are referenced by nothing live. **To revive an
 archived launcher, copy its yaml from `config/archive/` back into `config/` first.**
 
-## The 4 canonical experiments
+## THE 8 FILES THAT MATTER — (drawing | zoom) × (vanilla | force_explore) × (full | debug)
 
-| Family | Variant | Launcher | Config (in `config/`) | batch | mini | steps | per-turn cap | force-explore |
-|---|---|---|---|---|---|---|---|---|
-| drawing | vanilla | `drawing/vanilla/run_gdpo_hdpotool_gspo_countqa_qwen3vl_drawing_debug256_cpueff.sh` | `gdpo_hdpotool_gspo_countqa_qwen3vl_drawing_debug256_cpueff.yaml` | 256 | 128 | 1000 | 4096 | OFF |
-| drawing | force_explore | `drawing/force_explore/run_..._drawonly_cpueff_hardonly_answer_retry_forcedprefill_full.sh` | `gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill.yaml` | 256 | 128 | 1000 | 4096 | ON |
-| zoom | vanilla | `zoom/vanilla/run_..._cropzoom_cpueff_hardonly.sh` | `gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_cropzoom_cpueff_hardonly.yaml` | 256 | 128 | 400 | **none** | OFF |
-| zoom | force_explore | `zoom/force_explore/run_..._cropzoom_cpueff_hardonly_answer_retry_forcedprefill_full.sh` | `gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_cropzoom_cpueff_hardonly_answer_retry_forcedprefill.yaml` | 128 | 64 | 400 | **none** | ON |
+These 8 launchers (7 distinct configs) are the whole training surface. **Everything else is
+`experiments/` or `archive/` — ignore it unless you're digging into a one-off.**
 
-(batch = `data.train_batch_size`, mini = `ppo_mini_batch_size`, steps = `total_training_steps`,
-per-turn cap = `max_assistant_response_length`. `rollout.n=8` everywhere → trajectories/step = batch×8.)
+| # | Cell | Launcher | Config | Size |
+|---|---|---|---|---|
+| 1 | **drawing · vanilla · FULL** | `drawing/vanilla/run_gdpo_hdpotool_gspo_countqa_qwen3vl_drawing_debug256_cpueff.sh` ⚠️name-trap: IS the full run | `gdpo_hdpotool_gspo_countqa_qwen3vl_drawing_debug256_cpueff.yaml` | batch 256, 1000 steps, cap 4096 |
+| 2 | **drawing · vanilla · debug** | `drawing/vanilla/run_gdpo_hdpotool_gspo_countqa_qwen3vl_drawing_smoke.sh` | **same config as #1** + CLI overrides | batch 8, 2 steps (gpu-test) |
+| 3 | **drawing · force_explore · FULL** | `drawing/force_explore/run_..._drawonly_cpueff_hardonly_answer_retry_forcedprefill_full.sh` — submit via `drawing/force_explore/submit.sh [plilc\|pli\|ailab]` | `gdpo_..._drawonly_cpueff_hardonly_answer_retry_forcedprefill.yaml` | batch 256, 1000 steps, cap 4096 |
+| 4 | **drawing · force_explore · debug** | `drawing/force_explore/run_..._answer_retry_forcedprefill_smoke.sh` | `gdpo_..._drawonly_debug256_cpueff_answer_retry_forcedprefill.yaml` | batch 32→8, 2 steps (gpu-test) |
+| 5 | **zoom · vanilla · FULL** | `zoom/vanilla/run_..._cropzoom_cpueff_hardonly.sh` | `gdpo_..._cropzoom_cpueff_hardonly.yaml` | batch 256, 400 steps, no cap |
+| 6 | **zoom · vanilla · debug** | `zoom/vanilla/run_..._cropzoom_debug256_cpueff.sh` | `gdpo_..._cropzoom_debug256_cpueff.yaml` | full batch, 256-row data |
+| 7 | **zoom · force_explore · FULL** | `zoom/force_explore/run_..._cropzoom_..._answer_retry_forcedprefill_full.sh` | `gdpo_..._cropzoom_cpueff_hardonly_answer_retry_forcedprefill.yaml` | batch 128, 400 steps, no cap |
+| 8 | **zoom · force_explore · debug** | `zoom/force_explore/run_..._answer_retry_forcedprefill_debug.sh` | `gdpo_..._cropzoom_debug256_cpueff_answer_retry_forcedprefill.yaml` | batch 32, 3 steps |
 
-Note the drawing-vanilla launcher/config are named `debug256` but are the **full** run — see
-[Name traps](#name-traps).
+(`vanilla` = plain multi-turn tool training; `force_explore` = + answer-retry interruption.
+cap = `max_assistant_response_length` per-turn output cap. `rollout.n=8` everywhere →
+trajectories/step = batch×8. `ppo_mini_batch_size` = batch/2 in every full config.)
+
+### Every other live config belongs to one experiment (12 yamls, all owned)
+
+| Config (`gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_` prefix dropped) | Owner |
+|---|---|
+| `cropzoom_..._text_explore` (+ `debug256` twin) | `zoom/experiments/` text_explore |
+| `cropzoom_..._forced_explore` (+ `debug256` twin) | `zoom/experiments/` forced_explore (older ban-answer mechanism) |
+| `cropzoom_..._answer_retry_explore` (+ `debug256` twin) | `zoom/experiments/` answer_retry_explore (earlier retry flavor) |
+| `cropzoom_..._answer_retry_llmjudge_forcedprefill` | `zoom/experiments/` llmjudge |
+| `cropzoom_cpueff_hardonly_multiidx` | `zoom/experiments/` multiidx |
+| `cropzoom_cpueff` (non-hardonly) | `zoom/experiments/` full-data variant |
+| `valonly_hstar_qwen3vl_cropzoom` | `zoom/experiments/` hstarbench eval-only |
+| `zoomdraw_..._answer_retry_forcedprefill` (+ `debug256` twin) | `drawing/experiments/` zoomdraw |
+
+Anything in `config/archive/` belongs to `archive/` launchers only.
 
 ## Force-explore = conditional answer-retry (terminology!)
 
