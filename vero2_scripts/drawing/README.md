@@ -1,14 +1,17 @@
 # `vero2_scripts/drawing/` — drawing-tool experiments (counting data)
 
 Multi-turn **drawing-tool** RL on Qwen3-VL-8B over counting data: the model reasons in
-`<think>`, annotates the image with drawing tools (`draw_points` / `draw_lines` / `draw_boxes` /
-`draw_texts` / `draw_polygons`, 0–1000 normalized coordinates), gets each annotated image fed
-back as a new `img_idx`, and answers in `<answer>`. The draw-only toolset is
-[`config/tool_config/image_drawing_tools.yaml`](../config/tool_config/image_drawing_tools.yaml)
-(tool classes `verl.tools.image_drawing_tools.*`); the `experiments/` zoomdraw variant uses the
-combined [`config/tool_config/image_zoom_in_draw_tool.yaml`](../config/tool_config/image_zoom_in_draw_tool.yaml)
-(zoom + the five draw tools). Trained with GDPO advantage
-(`accuracy/format/tool_efficiency` = 0.8/0.1/0.1) + GSPO loss via `python -m verl.trainer.main_ppo`.
+`<think>`, marks the image with **`draw_points`** (0–1000 normalized coordinates), gets each
+annotated image fed back as a new `img_idx`, and answers in `<answer>`. The canonical toolset is
+[`config/tool_config/image_drawing_tools.yaml`](../config/tool_config/image_drawing_tools.yaml) —
+**Haoyang's draw_points-only yaml, adopted verbatim** (one tool, with a counting-checklist
+protocol baked into the tool description: mark candidates, don't redraw, continue on the latest
+`img_idx`, scan by region). Both vanilla and force_explore use it, so the A/B differs only by the
+interruption. The `experiments/` zoomdraw variant uses the combined
+[`config/tool_config/image_zoom_in_draw_tool.yaml`](../config/tool_config/image_zoom_in_draw_tool.yaml)
+(zoom + all five draw tools — draw_lines/boxes/texts/polygons live on there and in git history).
+Trained with GDPO advantage (`accuracy/format/tool_efficiency` = 0.8/0.1/0.1) + GSPO loss via
+`python -m verl.trainer.main_ppo`.
 
 All configs live **flat** in [`../config/`](../config/) (launchers pass
 `--config-path=$VERL_ROOT/vero2_scripts/config`). Always launch from the **repo root**
@@ -240,6 +243,6 @@ lr 1e-6, same reward stack, save_freq 20 / test_freq 40). The only differences:
 3. **Debug logging detail** — vanilla saves tool images (`save_cropped_images: true`),
    force_explore doesn't (`false`).
 
-Same tool config (`image_drawing_tools.yaml`), same system prompt
+Same tool config (`image_drawing_tools.yaml`, draw_points-only), same system prompt
 (`prompts/system_prompt_chatting_tool_calling.txt`), same model
 (`$HF_HOME/Qwen/Qwen3-VL-8B-Instruct`).
