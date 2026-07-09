@@ -131,26 +131,40 @@ Data (baked into the config, no symlink needed): the Gemini-filtered **correct-o
 
 (val: `combined_counting_val.correct.partial.verl.jsonl` in the same dir).
 
-### Launcher chain: base + cluster wrappers
+### Launching: base launcher + `submit.sh` (partition = a runtime decision)
 
 `run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill_full.sh`
 is the **base launcher** (a generic `main_ppo` runner): `CONFIG_NAME`-overridable, exports the
 default `ANSWER_RETRY_ASSISTANT_PREFILL`, builds the checkpoint dir from
 `CHECKPOINT_DATE_TIME` (default `20260524_160610` — new run → new value) and
-`TRAINER_EXPERIMENT_SUFFIX`, and forwards all extra Hydra args. Its own header targets pli-lc
-(H100 x8, 96 CPUs, 960G, 24 h, `--array=1-5%1`), but normally you submit one of the thin
-**cluster wrappers**, which differ only in the `#SBATCH` header, a partition-tagged
-`TRAINER_EXPERIMENT_SUFFIX` (so parallel runs of the same config never share a checkpoint dir),
-and save-frequency overrides:
+`TRAINER_EXPERIMENT_SUFFIX`, and forwards all extra Hydra args. Its header is a pli-lc profile
+(H100 x8, 96 CPUs, 960G, 24 h, `--array=1-5%1`), but you normally submit through **`submit.sh`**,
+which picks the cluster at submit time (sbatch CLI flags override the `#SBATCH` header — no
+per-partition files needed):
 
-| wrapper | partition / account / GPUs | extra overrides | notes |
+```bash
+bash vero2_scripts/drawing/force_explore/submit.sh              # pli-lc (default, primary)
+bash vero2_scripts/drawing/force_explore/submit.sh pli          # pli (vlmrl) — best allocation odds
+bash vero2_scripts/drawing/force_explore/submit.sh ailab        # ailab H200 — reap-safe save_freq=1
+bash vero2_scripts/drawing/force_explore/submit.sh plilc data.train_files=/abs/train.jsonl   # + overrides
+```
+
+| target | partition / account / GPUs | save_freq | notes |
 |---|---|---|---|
-| `..._full_plilc.sh` | `pli-lc` / `pli_xl` / h100:8, 96 CPU, 960G | `trainer.save_freq=5 trainer.max_actor_ckpt_to_keep=3` | primary target (stable, PreemptMode=OFF); save_freq=5 because a 24 h task can't reach step 20, so save_freq=20 would make every resume restart from scratch |
-| `..._full_pli.sh` | `pli` / `vlmrl` / h100:8, 96 CPU, 960G | save_freq=5, keep=3, `enable_prefix_caching=true`, `mm_processor_cache_gb=4`, `max_num_batched_tokens=16384` | 38-node partition, better allocation odds; adds rollout-only caching speedups (no effect on the objective) |
-| `..._full_ailab.sh` | `ailab` / **no `--account`** / h200:8, 64 CPU, 1450G | `trainer.save_freq=1`, keep=3 | guest jobs get **reaped** (one run killed at ~5.75 h) → checkpoint **every step** so a reap costs at most one step; the `%1` chain resumes |
-| `..._full_pli_resume.sh` | `pli` / `vlmrl` / h100:8 | save_freq=5, keep=3 | **backup resume** for a stalled pli-lc run: reuses the `_plilc` suffix → same checkpoint dir → `resume_mode:auto` continues it. **Clobber hazard:** must never run concurrently with a pli-lc array task — cancel one the instant the other starts |
+| `plilc` | `pli-lc` / `pli_xl` / h100:8, 96 CPU, 960G | 5 | primary target (stable, PreemptMode=OFF); save_freq=5 because a 24 h task can't reach step 20, so save_freq=20 would make every resume restart from scratch |
+| `pli` | `pli` / `vlmrl` / h100:8, 96 CPU, 960G | 5 | 38-node partition, better allocation odds |
+| `ailab` | `ailab` / `zhuangl` (default acct) / h200:8, 64 CPU, 1450G | **1** | guest jobs get **reaped** (one run killed at ~5.75 h) → checkpoint **every step**; the `%1` chain resumes |
 
-All wrappers: 24 h wall + `--array=1-5%1` self-resume chain.
+`submit.sh` extras (see its header for examples):
+- **Fresh run:** `CHECKPOINT_DATE_TIME=<new> bash submit.sh …` (else it resumes the old checkpoint dir).
+- **Resume a plilc run on pli** (the old `_pli_resume` behavior): set `TRAINER_EXPERIMENT_SUFFIX`
+  to the plilc-tagged suffix before submitting to `pli` — same checkpoint dir → `resume_mode:auto`
+  continues it. **Clobber hazard:** never run concurrently with a pli-lc array task on the same dir.
+- **Rollout caching speedups** (inference-only; the old `_pli` wrapper had them baked in):
+  `ROLLOUT_CACHING=1 bash submit.sh <target>` adds `enable_prefix_caching=true`,
+  `mm_processor_cache_gb=4`, `max_num_batched_tokens=16384`.
+
+All targets: 24 h wall + `--array=1-5%1` self-resume chain (from the base header).
 
 ### Smoke
 
