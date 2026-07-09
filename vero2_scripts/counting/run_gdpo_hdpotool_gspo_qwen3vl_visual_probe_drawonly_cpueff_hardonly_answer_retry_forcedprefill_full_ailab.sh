@@ -32,7 +32,7 @@ export TRAINER_EXPERIMENT_SUFFIX="qwen3vl_visual_probe_drawonly_gdpo_hdpotool_ha
 # lengths, bounded answer-retry max_retries=2) + our answer-retry interruption. Validated on the
 # 4xA100/bs16 smoke (10707390): ~8-10 min/step, no schema/advantage errors. Reproduce it exactly
 # here (no extra rollout CLI overrides -- that prefix/mm-cache push was a red herring).
-export CONFIG_NAME="gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill_fast"
+export CONFIG_NAME="gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill"
 
 # ailab reaped our last run at ~5.75h (guest job). So checkpoint AGGRESSIVELY: save_freq=1
 # (every step) means a reap costs at most one step, and the %1 resume chain resumes from the

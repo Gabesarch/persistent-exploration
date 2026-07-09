@@ -32,7 +32,7 @@ export TRAINER_EXPERIMENT_SUFFIX="qwen3vl_visual_probe_drawonly_gdpo_hdpotool_ha
 # lengths, bounded answer-retry max_retries=2) + our answer-retry interruption. Validated end-to-end
 # on the 4xA100/bs16 smoke (10707390): ~8-10 min/step, no schema/advantage errors. Repointed here so
 # the full run reproduces exactly what the smoke validated (no extra CLI overrides on rollout).
-export CONFIG_NAME="gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill_fast"
+export CONFIG_NAME="gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill"
 
 # save_freq=5 (not 20): at this step cost a 24h task can't reach step 20, so with save_freq=20
 # every resume restarts from scratch. Checkpoint by ~step 5 instead; keep only 3 (disk is ~full).

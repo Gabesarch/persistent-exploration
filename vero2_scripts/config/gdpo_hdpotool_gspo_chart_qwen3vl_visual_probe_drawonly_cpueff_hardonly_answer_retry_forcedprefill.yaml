@@ -8,26 +8,31 @@ hydra:
 
 algorithm:
   adv_estimator: gdpo
-  # Conditional retry changes tool-call counts only after incorrect answers, so
-  # keep rewards focused on task accuracy and format.
-  gdpo_reward_keys: [accuracy, format]
-  gdpo_reward_weights: [0.9, 0.1]
+  gdpo_reward_keys: [accuracy, format, tool_efficiency]
+  gdpo_reward_weights: [0.8, 0.1, 0.1]
+  gdpo_reward_eligibility:
+    tool_efficiency:
+      key: accuracy
+      threshold: 1.0
+      min_group_size: 2
   use_kl_in_reward: false
   kl_ctrl:
     kl_coef: 0
 
 data:
+  # Our counting-correct-only filtered set (deviation from the friend's config: his data path does not
+  # exist in this tree; this is the Gemini-filtered correct-only counting data this task trains on).
   train_files: /scratch/gpfs/ZHUANGL/lc1556/vero2/dataset_filter_runs/full_sync/filtered_correct_only/combined_counting_train.correct.partial.verl.jsonl
   val_files: /scratch/gpfs/ZHUANGL/lc1556/vero2/dataset_filter_runs/full_sync/filtered_correct_only/combined_counting_val.correct.partial.verl.jsonl
   filter_overlong_prompts_workers: 64
   image_root: ${oc.env:IMAGE_ROOT}
   system_prompt: ${oc.env:VERL_ROOT}/vero2_scripts/prompts/system_prompt_chatting_tool_calling.txt
   shuffle: true
-  train_batch_size: 128
-  val_batch_size: 128
+  train_batch_size: 256
+  val_batch_size: 256
   max_prompt_length: 16384
-  max_response_length: 24576
-  max_pixels: 10000000
+  max_response_length: 16384
+  max_pixels: 4194304
   filter_overlong_prompts: false
   truncation: error
   image_key: images
@@ -166,7 +171,7 @@ actor_rollout_ref:
       {%- endif %}
     use_remove_padding: true
     enable_gradient_checkpointing: true
-    enable_activation_offload: false
+    enable_activation_offload: true
     use_fused_kernels: false
     use_liger: true
 
@@ -174,11 +179,11 @@ actor_rollout_ref:
     optim:
       lr: 1e-6
       lr_warmup_steps: 10
-    ppo_mini_batch_size: 64
+    ppo_mini_batch_size: 128
     ppo_micro_batch_size_per_gpu: 1
     ulysses_sequence_parallel_size: 1
     use_dynamic_bsz: true
-    ppo_max_token_len_per_gpu: 49296
+    ppo_max_token_len_per_gpu: 61440
     loss_agg_mode: seq-mean-token-mean
     policy_loss:
       loss_mode: gspo
@@ -223,28 +228,35 @@ actor_rollout_ref:
       max_user_turns: 10
       max_parallel_calls: 1
       max_tool_response_length: 256
+      # Per-turn OUTPUT cap (from the friend's tested config): each assistant turn is limited to
+      # 4096 generated tokens (clamped in tool_agent_loop), so no single turn runs to max_response_length.
+      max_assistant_response_length: 4096
       tool_response_truncate_side: middle
       format: hermes
-      # Normal rollout first; incorrect answers are removed and followed by a forced tool-call retry.
+      # Force-explore / answer-retry interruption — our one behavioral deviation from the friend's config:
+      # normal rollout first; an incorrect <answer> is removed and followed by a forced tool-call retry.
       force_tool_calls_until_final_turn: false
       final_answer_token_margin: 2048
       conditional_answer_retry_enabled: true
       conditional_answer_retry_force_next_tool_call: true
       conditional_answer_retry_suffix: ""
       conditional_answer_retry_correct_accuracy_threshold: 0.0
-      conditional_answer_retry_max_retries: null
+      conditional_answer_retry_max_retries: 2
     tensor_model_parallel_size: 1
     ignore_eos: false
     disable_log_stats: false
     dtype: bfloat16
     engine_kwargs:
       vllm:
+        attention_config:
+          backend: FLASH_ATTN
+          flash_attn_version: 2
         mm_processor_cache_gb: 0
-    gpu_memory_utilization: 0.6
+    gpu_memory_utilization: 0.7
     enable_prefix_caching: false
-    max_model_len: 40960
+    max_model_len: 32768
     max_num_batched_tokens: 8192
-    max_num_seqs: 728
+    max_num_seqs: 1024
     enable_chunked_prefill: true
     enforce_eager: false
     free_cache_engine: true
@@ -260,16 +272,16 @@ actor_rollout_ref:
       n: 1
     log_prob_use_dynamic_bsz: true
     log_prob_micro_batch_size_per_gpu: 1
-    log_prob_max_token_len_per_gpu: 49296
+    log_prob_max_token_len_per_gpu: 61440
     checkpoint_engine:
-      update_weights_bucket_megabytes: 2048
+      update_weights_bucket_megabytes: 6144
 
   ref:
     strategy: fsdp2
     ulysses_sequence_parallel_size: 2
     log_prob_micro_batch_size_per_gpu: 1
     log_prob_use_dynamic_bsz: true
-    log_prob_max_token_len_per_gpu: 49296
+    log_prob_max_token_len_per_gpu: 61440
     entropy_from_logits_with_chunking: true
     use_torch_compile: false
     fsdp_config:
@@ -295,32 +307,35 @@ reward:
       tool_efficiency_concave_q: 0.95
   reward_kwargs:
     overlong_buffer_cfg:
-      enable: true
+      enable: false
       len: 2048
       penalty_factor: 1.0
       log: false
     max_resp_len: ${data.max_response_length}
+    clipped_response_len: null
+    clipped_response_penalty: 0.0
+    assistant_turn_clipped_penalty: 1.0
     reward_response_prefix: "<think>\n"
 
 critic:
   ulysses_sequence_parallel_size: 1
   use_dynamic_bsz: true
-  ppo_max_token_len_per_gpu: 49296
-  forward_max_token_len_per_gpu: 49296
+  ppo_max_token_len_per_gpu: 61440
+  forward_max_token_len_per_gpu: 61440
   forward_micro_batch_size_per_gpu: 16
 
 trainer:
   critic_warmup: 0
   logger: ["console", "wandb"]
   save_freq: 20
-  test_freq: 10
+  test_freq: 40
   nnodes: 1
   n_gpus_per_node: 8
   project_name: vero2_verl
   total_epochs: 1000
-  total_training_steps: 400
+  total_training_steps: 1000
   log_val_generations: 0
-  esi_redundant_time: 1800
+  esi_redundant_time: 1500
   resume_mode: auto
   val_before_train: false
   use_legacy_worker_impl: auto
