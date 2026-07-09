@@ -30,7 +30,7 @@ export TRAINER_DEFAULT_LOCAL_DIR="${SAVE_PATH}/checkpoints/vero2_verl/draw_bench
 export ANSWER_RETRY_ASSISTANT_PREFILL="Let's see, I do not have enough information to answer yet. My current annotations may be inaccurate or incomplete — let me use the drawing tools to correct and complete my markings, then re-examine the image before answering."
 
 # Real full config (CONFIG_NAME unset -> the launcher default) + caching speedups, small batch, 2 steps.
-exec bash vero2_scripts/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill_full.sh vllm \
+exec bash vero2_scripts/counting/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill_full.sh vllm \
   data.train_batch_size=16 \
   actor_rollout_ref.actor.ppo_mini_batch_size=16 \
   actor_rollout_ref.rollout.n=8 \

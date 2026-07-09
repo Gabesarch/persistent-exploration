@@ -34,7 +34,7 @@ export TRAINER_EXPERIMENT_SUFFIX="qwen3vl_visual_probe_drawonly_gdpo_hdpotool_ha
 # Rollout throughput (inference-only, does NOT change the objective): prefix + mm caching so the
 # 11-turn drawing trajectories don't re-prefill the growing context / re-embed the annotated image
 # every turn, plus a bigger prefill batch. Biggest lever for multi-turn rollout speed.
-exec bash vero2_scripts/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill_full.sh \
+exec bash vero2_scripts/counting/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill_full.sh \
   vllm trainer.save_freq=5 trainer.max_actor_ckpt_to_keep=3 \
   actor_rollout_ref.rollout.enable_prefix_caching=true \
   actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb=4 \
