@@ -104,6 +104,12 @@ CLI override works.
 6. `conditional_answer_retry_max_retries: 2` bounds retries per trajectory (full config;
    the debug256 smoke config leaves it `null` = unbounded).
 
+   **Deliberate asymmetry vs zoom:** the zoom force_explore config runs retries **uncapped**
+   (`max_retries: null`, limited only by turn/token budget) while drawing is bounded at **2**.
+   Current plan: test drawing with the bounded setting first; switching to uncapped later is a
+   one-line change (`...conditional_answer_retry_max_retries=null` on the CLI after `vllm`, or
+   edit the yaml).
+
 Base-launcher default prefill (drawing-worded, override by exporting the env var):
 
 > "Let's see, I do not have enough information to answer yet. My current annotations may be

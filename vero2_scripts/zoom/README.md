@@ -114,16 +114,22 @@ new-style debug256 configs (batch 32/mini 32, 3 steps, resp 24576).
 | `..._forced_explore_full.sh` (+debug) | **Older ban-answer-token forcing** — `force_tool_calls_until_final_turn: true` + `force_final_answer_prefix: "\n\boxed{"`: tool calls are forced every turn, answering only allowed on the final turn. **NOT the same as `force_explore/`.** Batch 128/64, resp 24576. |
 | `..._answer_retry_explore_full.sh` (+debug) | **Earlier retry flavor**: same conditional answer-retry, but with a long "keep exploring, test alternative hypotheses" `conditional_answer_retry_suffix` message in addition to the prefill. Batch 128/64, save_freq 40. |
 | `..._answer_retry_llmjudge_forcedprefill_full.sh` | **LLM-judge-graded retry**: forcedprefill retry + `llm_judge_enabled: true` — an LLM judge (prompt `prompts/llm_judge_visual_search_prompt.txt`) grades `search`-type answers with partial credit 0.5, falling back to string reward. Batch 128/64. |
-| `..._multiidx.sh` | **Multi-image-index zoom tool**: uses `config/tool_config/image_zoom_in_tool_multiidx.yaml` (`image_indexing: multi_index` — each crop is registered as a new addressable `img_idx`, so the model can zoom into previous crops). Batch 256/128, **1000 steps**, resp 16384. |
+| `..._multiidx.sh` | **Multi-image-index zoom variant** — *intended* to let the model address previous crops as new `img_idx` values via `image_indexing: multi_index` in `image_zoom_in_tool_multiidx.yaml`. ⚠️ That key is currently **unwired in the training tool** (see box below), and the yaml is byte-identical to the base one, so in practice this differs from vanilla only by **1000 steps** (vs 400). Batch 256/128, resp 16384. |
 | `run_..._cropzoom_cpueff.sh` | **Full-data (non-hardonly) vanilla**: identical shape to vanilla full (256/128, 400 steps, resp 16384) but trains on the unfiltered `…visual_probe_train.verl.jsonl`. |
 | `run_valonly_hstar_qwen3vl_cropzoom.sh` | **Eval-only hstarbench validation**: `trainer.val_only=true`, 1 step, rollout `n: 1`, data `/scratch/gpfs/ZHUANGL/shared/Hstarbench/data/verl/hstarbench_mixed_rl.verl.jsonl`. No training. |
 
-> **Multi-index is currently baked into the base tool config too:**
+> **The `image_indexing: multi_index` key is currently INERT in training.**
 > `config/tool_config/image_zoom_in_tool.yaml` is byte-identical to
-> `image_zoom_in_tool_multiidx.yaml` (`image_indexing: multi_index` was added to the base
-> file in commit `a436672`). So *every* zoom launcher currently gets multi-index crop
-> addressing; the code default without that key is `training_faithful`. If you need the
-> original single-index behavior, edit the key in `image_zoom_in_tool.yaml`.
+> `image_zoom_in_tool_multiidx.yaml` (the key was added to the base file in `a436672`), but the
+> training-side `ImageZoomInTool` only validates `image_indexing` in `__init__` and **never reads
+> it again** — the tool response wording is always the training-faithful *"Zoomed in on the image
+> to the region …"* with no new-index announcement. Training behavior is unchanged either way:
+> **crops are always cut from the original-resolution source image**
+> (`use_original_resolution_source: true` + a provenance store maps every crop back to
+> root-original coordinates, so even a zoom into a prior crop re-composites from the original —
+> no compounding resolution loss). The knob is only meaningful in `vero_eval`'s `*_multiidx`
+> eval tasks. Net: the "multiidx experiment" below currently differs from vanilla only by its
+> step count, since its tool yaml is identical and the key is unwired.
 
 ## Changing the training data
 

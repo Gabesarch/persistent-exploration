@@ -88,10 +88,12 @@ sbatch vero2_scripts/<family>/<variant>/run_....sh vllm \
   data.train_files=/abs/path/train.jsonl data.val_files=/abs/path/val.jsonl
 ```
 
-⚠️ The leading **`vllm` is required whenever you pass overrides**: training launchers consume the
-first argument that doesn't start with `-` as the inference engine. Without it, your first override
-(`data.train_files=...`) is silently eaten as the engine name — the run then trains on the default
-data or crashes on an unknown engine.
+⚠️ The leading **`vllm` is required only when you pass overrides directly to a launcher**: training
+launchers consume the first argument that doesn't start with `-` as the inference engine. Without
+it, your first override (`data.train_files=...`) is eaten as the engine name and folded into a
+bogus `actor_rollout_ref.rollout.name=…`, and the run **crashes at startup** (fail-loud, but your
+override never took effect). Submitting a launcher **with no arguments** defaults to `vllm` — no
+arg needed — and all shipped cluster/smoke wrappers already pass it correctly.
 
 Current defaults:
 
