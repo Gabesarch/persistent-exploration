@@ -38,5 +38,5 @@ export CONFIG_NAME="gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_drawonly_cpuef
 # (every step) means a reap costs at most one step, and the %1 resume chain resumes from the
 # last checkpoint. keep=3 bounds disk (FS ~full). Walltime kept at 24h so the job actually gets
 # scheduled (longer walltimes never allocate here).
-exec bash vero2_scripts/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill_full.sh \
+exec bash vero2_scripts/counting/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill_full.sh \
   vllm trainer.save_freq=1 trainer.max_actor_ckpt_to_keep=3
