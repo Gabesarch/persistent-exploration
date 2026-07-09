@@ -120,7 +120,7 @@ Current defaults:
 | Experiment | train_files |
 |---|---|
 | drawing vanilla | `$VERL_ROOT/datasets/combined_counting_hq/train_hard_answer_lt10.verl.jsonl` — **not in git**, materialize once per checkout (below) |
-| drawing force_explore | `/scratch/gpfs/ZHUANGL/lc1556/vero2/dataset_filter_runs/full_sync/filtered_correct_only/combined_counting_train.correct.partial.verl.jsonl` (Gemini-filtered correct-only) |
+| drawing force_explore | **same as vanilla** — `$VERL_ROOT/datasets/combined_counting_hq/train_hard_answer_lt10.verl.jsonl` (so the A/B differs only by the interruption; symlink below) |
 | zoom (both) | `/scratch/gpfs/ZHUANGL/gs1693/vero2_datasets/train_rl_datasets/chart_search_counting_visual_probe_train_rollout_score_leq05_all.verl.jsonl` |
 
 Materialize the drawing-vanilla dataset symlink (per checkout/worktree):
