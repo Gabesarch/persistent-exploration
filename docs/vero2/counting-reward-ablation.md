@@ -235,7 +235,7 @@ Two things change per arm relative to a normal vero2 run:
    - train: `/scratch/gpfs/ZHUANGL/lc1556/vero2/dataset_filter_runs/full_sync/filtered/combined_counting_train.filtered.partial.verl.jsonl`
    - val: `…/combined_counting_val.filtered.partial.verl.jsonl`
 
-A prepared launcher — `vero2_scripts/run_counting_reward_ablation.sh` — wires both plus a
+A prepared launcher — `vero2_scripts/archive/run_counting_reward_ablation.sh` — wires both plus a
 distinct `trainer.experiment_name` per arm. Pick the arm with `ARM=` (`graded` | `exact`
 | `wide_sigma` | `band_only` | `reltol0` | `laplacian`) and the data policy with
 `DATA_MODE=` (`counting_only`, default — cleanest for a reward ablation — or `mix` to
@@ -243,10 +243,10 @@ append counting to the existing blend):
 
 ```bash
 # smoke each arm on gpu-test first (<1h; uncomment the gpu-test header in the script)
-ARM=graded     sbatch vero2_scripts/run_counting_reward_ablation.sh   # arm 1 (reference)
-ARM=exact      sbatch vero2_scripts/run_counting_reward_ablation.sh   # arm 2 (baseline)
-ARM=wide_sigma sbatch vero2_scripts/run_counting_reward_ablation.sh   # arm 3 (treatment)
-ARM=band_only  sbatch vero2_scripts/run_counting_reward_ablation.sh   # arm 4 (control)
+ARM=graded     sbatch vero2_scripts/archive/run_counting_reward_ablation.sh   # arm 1 (reference)
+ARM=exact      sbatch vero2_scripts/archive/run_counting_reward_ablation.sh   # arm 2 (baseline)
+ARM=wide_sigma sbatch vero2_scripts/archive/run_counting_reward_ablation.sh   # arm 3 (treatment)
+ARM=band_only  sbatch vero2_scripts/archive/run_counting_reward_ablation.sh   # arm 4 (control)
 ```
 
 The launcher's Hydra args (the `counting_*` overrides and the list-form

@@ -71,7 +71,7 @@ python vero_eval/lmms_eval/tasks/hstarbench/build_hstarbench_verl_jsonl.py --sou
 # or: --source rl | --source sft
 
 # In-loop val-only smoke (8 GPU)
-bash vero2_scripts/run_valonly_hstar_qwen3vl_cropzoom.sh
+bash vero2_scripts/zoom/experiments/run_valonly_hstar_qwen3vl_cropzoom.sh
 
 # Post-training checkpoint sweep: RL distribution + benchmark generalization
 source vero_eval/examples/_domain_map.sh
