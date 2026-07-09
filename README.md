@@ -124,8 +124,8 @@ print(f"Successfully cached to {os.environ.get('HF_HOME')}/{model_id}")
 ```bash
 # smoke on gpu-test first (small batch, 2 steps, <1 h):
 sbatch vero2_scripts/drawing/force_explore/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill_smoke.sh
-# then the full run on pli-lc (batch 256, 24 h self-resuming array):
-sbatch vero2_scripts/drawing/force_explore/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill_full_plilc.sh
+# then the full run — partition picked at submit time (plilc default | pli | ailab):
+bash vero2_scripts/drawing/force_explore/submit.sh
 ```
 
 Full training needs a whole GPU node (8× H100 / A100-80GB) and ~700–900 GB CPU RAM.

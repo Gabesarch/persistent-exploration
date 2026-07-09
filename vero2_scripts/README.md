@@ -13,7 +13,7 @@ prompts. Everything drives `python -m verl.trainer.main_ppo` on Della.
 vero2_scripts/
 ├── drawing/            draw-tool experiments (counting data)
 │   ├── vanilla/        plain GDPO/GSPO training, no interruption
-│   ├── force_explore/  answer-retry interruption ON (base + cluster wrappers + smoke)
+│   ├── force_explore/  answer-retry interruption ON (base + submit.sh + smoke)
 │   └── experiments/    zoomdraw (combined zoom+draw toolset) + perf benches
 ├── zoom/               image_zoom_in_tool experiments (chart/search/counting visual-probe data)
 │   ├── vanilla/        plain training (full + old-style debug256)
@@ -125,7 +125,7 @@ paths are absolute into hw0171 — for long-term runs consider making a local co
 | `data.max_response_length` | TOTAL response budget per trajectory (drawing 16384; zoom vanilla 16384; zoom force_explore 24576) |
 | `...rollout.multi_turn.max_assistant_turns` | max assistant turns (11 in all four) |
 | `conditional_answer_retry_*` | the force-explore block (see above) |
-| `trainer.total_training_steps` / `trainer.save_freq` | run length / checkpoint cadence (cluster wrappers override save_freq) |
+| `trainer.total_training_steps` / `trainer.save_freq` | run length / checkpoint cadence (`submit.sh` sets save_freq per target) |
 | `CHECKPOINT_DATE_TIME` (env) | pins the checkpoint dir name → enables the `%1` resume chain. **A new run needs a NEW `CHECKPOINT_DATE_TIME`**, or it resumes an old run's checkpoints. |
 
 When in doubt about any number, grep the yaml:
@@ -143,13 +143,18 @@ grep -nE 'train_batch_size|total_training_steps|max_assistant_response_length|ma
 - `drawing/force_explore/run_..._answer_retry_forcedprefill_smoke.sh` — points the base at the bs-32/3-step debug256 retry config, plus the same bs-8/2-step CLI shrink
 - `zoom/force_explore/run_..._answer_retry_forcedprefill_debug.sh` — runs the bs-32/3-step debug256 retry config **as-is** (no CLI shrink); its `#SBATCH` header is a historical pli-c one — adapt it to gpu-test before submitting (see `zoom/README.md`)
 
-**2. Full run** — pick the cluster wrapper (drawing/force_explore; all `exec bash` the same base launcher):
+**2. Full run** — the partition is a **runtime decision** via `drawing/force_explore/submit.sh`
+(sbatch CLI flags override the base launcher's `#SBATCH` header; no per-partition files):
 
-| Wrapper | Cluster | Notes |
+```bash
+bash vero2_scripts/drawing/force_explore/submit.sh [plilc|pli|ailab] [hydra overrides...]
+```
+
+| Target | Cluster | Notes |
 |---|---|---|
-| `..._full_plilc.sh` | pli-lc H100, `--account=pli_xl` | **primary training target**; `save_freq=5` |
-| `..._full_pli.sh` (+ `_pli_resume.sh`) | pli H100, `--account=vlmrl` | `save_freq=5` |
-| `..._full_ailab.sh` | ailab H200, default account | guest jobs get **reaped** → `save_freq=1` |
+| `plilc` (default) | pli-lc H100, `--account=pli_xl` | **primary training target**; `save_freq=5` |
+| `pli` | pli H100, `--account=vlmrl` | `save_freq=5`; `ROLLOUT_CACHING=1` opts into rollout speedups |
+| `ailab` | ailab H200, default account | guest jobs get **reaped** → `save_freq=1` |
 
 All full wrappers/launchers use `--time=24:00:00` + a `%1` **self-resume chain**: one array task at
 a time, each auto-resumes the latest checkpoint from the `CHECKPOINT_DATE_TIME`-pinned dir. Chain
