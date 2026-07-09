@@ -20,10 +20,12 @@ algorithm:
     kl_coef: 0
 
 data:
-  # Our counting-correct-only filtered set (deviation from the friend's config: his data path does not
-  # exist in this tree; this is the Gemini-filtered correct-only counting data this task trains on).
-  train_files: /scratch/gpfs/ZHUANGL/lc1556/vero2/dataset_filter_runs/full_sync/filtered_correct_only/combined_counting_train.correct.partial.verl.jsonl
-  val_files: /scratch/gpfs/ZHUANGL/lc1556/vero2/dataset_filter_runs/full_sync/filtered_correct_only/combined_counting_val.correct.partial.verl.jsonl
+  # Same dataset as drawing/vanilla (Haoyang's hard-counting set, all answers < 10) so the
+  # vanilla-vs-force_explore A/B differs ONLY by the interruption. Also ~2x-faster steps than the
+  # big-count filtered set (counts >10 blow up draw-turn length). Materialize once per checkout:
+  #   mkdir -p "$VERL_ROOT/datasets" && ln -sfn /scratch/gpfs/ZHUANGL/hw0171/vero2/datasets/combined_counting_hq "$VERL_ROOT/datasets/combined_counting_hq"
+  train_files: ${oc.env:VERL_ROOT}/datasets/combined_counting_hq/train_hard_answer_lt10.verl.jsonl
+  val_files: ${oc.env:VERL_ROOT}/datasets/combined_counting_hq/combined_counting_val_answer_lt10.verl.jsonl
   filter_overlong_prompts_workers: 64
   image_root: ${oc.env:IMAGE_ROOT}
   system_prompt: ${oc.env:VERL_ROOT}/vero2_scripts/prompts/system_prompt_chatting_tool_calling.txt

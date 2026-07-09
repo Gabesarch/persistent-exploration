@@ -126,13 +126,13 @@ Base-launcher default prefill (drawing-worded, override by exporting the env var
 
 Full config: `gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill.yaml`
 — batch 256 / mini 128 / 1000 steps / per-turn cap 4096, same profile as vanilla (see section 5).
-Data (baked into the config, no symlink needed): the Gemini-filtered **correct-only** counting set
-
-```
-/scratch/gpfs/ZHUANGL/lc1556/vero2/dataset_filter_runs/full_sync/filtered_correct_only/combined_counting_train.correct.partial.verl.jsonl
-```
-
-(val: `combined_counting_val.correct.partial.verl.jsonl` in the same dir).
+Data: **the SAME dataset as vanilla** (Haoyang's hard-counting set, all answers < 10 —
+`$VERL_ROOT/datasets/combined_counting_hq/train_hard_answer_lt10.verl.jsonl`; needs the same
+one-time symlink, section 1), so the vanilla ↔ force_explore comparison differs **only by the
+interruption**. It also keeps steps fast: the previously-used Gemini-filtered correct-only set
+(`.../filtered_correct_only/combined_counting_train.correct.partial.verl.jsonl`) has 50% of
+answers ≥ 10 (8% > 50) and measured **~40 min/step** at batch 256 — big counts blow up
+draw-turn length.
 
 ### Launching: base launcher + `submit.sh` (partition = a runtime decision)
 
@@ -233,10 +233,7 @@ shows the two canonical configs are **identical in training math and batch profi
 (GDPO/GSPO, batch 256 / mini 128 / 1000 steps, per-turn cap 4096, response 16384, 11 turns,
 lr 1e-6, same reward stack, save_freq 20 / test_freq 40). The only differences:
 
-1. **Dataset** — vanilla: `$VERL_ROOT/datasets/combined_counting_hq/train_hard_answer_lt10.verl.jsonl`
-   (symlink, section 1); force_explore: the Gemini-filtered correct-only set in lc1556 scratch
-   (section 2).
-2. **Retry block** — force_explore adds `force_tool_calls_until_final_turn: false`,
+1. **Retry block** — force_explore adds `force_tool_calls_until_final_turn: false`,
    `final_answer_token_margin: 2048`, and the `conditional_answer_retry_*` block
    (`enabled: true`, `force_next_tool_call: true`, `suffix: ""`,
    `correct_accuracy_threshold: 0.0`, `max_retries: 2`); vanilla has none of it.
