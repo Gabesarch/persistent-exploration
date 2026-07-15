@@ -39,13 +39,13 @@ for STEP in $STEPS; do
     DEP="--dependency=afterok:$MJOB"
   fi
   EJOB=$(sbatch --parsable $DEP \
-         --export=ALL,CHECKPOINT_PATH="$OUT",LIMIT="$LIMIT",PORT=$((9401+i)) \
+         --export=ALL,MODEL=vero,CHECKPOINT_PATH="$OUT",LIMIT="$LIMIT",PORT=$((9401+i)) \
          vero_eval/scripts/eval_countqa_drawing.sbatch)
   echo "$STEP | $MJOB | $EJOB | $OUT"
 done
 if [[ "$WITH_BASE" == 1 ]]; then
-  BJOB=$(sbatch --parsable --export=ALL,MODEL=base,LIMIT="$LIMIT",PORT=9400 \
+  BJOB=$(sbatch --parsable --export=ALL,MODEL=qwen3vl,LIMIT="$LIMIT",PORT=9400 \
          vero_eval/scripts/eval_countqa_drawing.sbatch)
-  echo "base | - | $BJOB | (Qwen3-VL-8B-Instruct under vero template)"
+  echo "base | - | $BJOB | countqa_qwen3_drawing (native base twin)"
 fi
 echo "Watch: squeue -u \$USER | grep -E 'merge_hf|cqa_draw'"

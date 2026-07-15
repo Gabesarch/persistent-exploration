@@ -12,55 +12,45 @@
 #SBATCH --error=vero_eval/logs/cqa_draw_eval_%j.err
 #
 # ============================================================================
-# CountQA DRAWING eval — the training-faithful counting benchmark for the
-# drawing (draw_points) experiments. Counterpart of scripts/eval_visual_probe_full.sbatch
-# for the zoom side. Submit from the REPO ROOT.
+# CountQA DRAWING eval — the drawing counterpart of scripts/eval_visual_probe_full.sbatch,
+# same MODEL->task convention:
 #
-#   # a trained checkpoint (merged HF dir — see scripts/merge_ckpt_to_hf.sbatch):
-#   sbatch --export=ALL,CHECKPOINT_PATH=/scratch/.../vero2_merged_hf/<run>_step_140 \
+#   MODEL=vero    -> countqa_reasoning_drawing   (TRAINING-FAITHFUL: draw_points-only
+#                    toolset, forced-think template from the checkpoint, sampling 0.7/1.0/-1,
+#                    per-turn generation cap 4096)   [requires CHECKPOINT_PATH = merged HF dir]
+#   MODEL=qwen3vl -> countqa_qwen3_drawing        (base Qwen3-VL-Instruct: instruct draw
+#                    toolset, native generation_config sampling 0.7/0.8/20, cap 4096)
+#
+# Submit from the REPO ROOT:
+#   sbatch --export=ALL,MODEL=vero,CHECKPOINT_PATH=/scratch/.../vero2_merged_hf/<RUN>_step_140 \
 #          vero_eval/scripts/eval_countqa_drawing.sbatch
+#   sbatch --export=ALL,MODEL=qwen3vl vero_eval/scripts/eval_countqa_drawing.sbatch
 #
-#   # the BASE model, served under the same forced-think drawing template
-#   # (fair base-vs-trained: same template, same task, same sampling — only weights differ):
-#   sbatch --export=ALL,MODEL=base vero_eval/scripts/eval_countqa_drawing.sbatch
+# (FSDP checkpoints must be merged to HF first: scripts/merge_ckpt_to_hf.sbatch.)
 #
-# Knobs (--export):
-#   MODEL            base | vero (default vero; base = Qwen3-VL-8B-Instruct + committed template)
-#   CHECKPOINT_PATH  merged HF dir (required unless MODEL=base)
-#   TASKS            default countqa_drawing_vero_cap4k (per-turn gen cap 4096 — matches
-#                    training's max_assistant_response_length AND avoids 32k-context overflow
-#                    on CountQA's 10 MP images; do NOT use the uncapped variant for full runs)
-#   LIMIT            default 400 (first 400 of 1528 flattened QA, deterministic; unset = full)
-#   PORT             default AUTO from the job id (9100 + jobid%800) — prevents the
-#                    same-node vLLM port collision that invalidated a past run
-#   OUTPUT_ROOT      default vero_eval/results/cqa_drawing/<label>_<jobid>
-#
-# Metric: exact_match (integer count) — no judge needed, 1 GPU suffices.
-# ~35 min at LIMIT=400 (vision prefill dominates). Results: <OUTPUT_ROOT>/**/*results*.json.
+# Knobs: LIMIT (default 400; the first 400 of 1528 flattened QA — unset for the full set),
+#        PORT (default AUTO = 9100 + jobid%800 — prevents the same-node vLLM port collision
+#              that invalidated a past run), TASKS (override the MODEL->task mapping),
+#        OUTPUT_ROOT (default vero_eval/results/cqa_drawing/<label>_<jobid>).
+# Metric: exact_match (integer count) — no judge, 1 GPU, ~35 min at LIMIT=400.
 # ============================================================================
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
 [[ -f vero_eval/set_paths.sh.example ]] || { echo "ERROR: submit from the repo root" >&2; exit 2; }
 
-export TASKS="${TASKS:-countqa_drawing_vero_cap4k}"
+export MODEL="${MODEL:-qwen3vl}"
+case "$MODEL" in
+  vero)    export TASKS="${TASKS:-countqa_reasoning_drawing}"
+           : "${CHECKPOINT_PATH:?MODEL=vero needs CHECKPOINT_PATH=<merged HF dir>}"
+           LABEL="$(basename "$CHECKPOINT_PATH")";;
+  qwen3vl) export TASKS="${TASKS:-countqa_qwen3_drawing}"
+           LABEL="qwen3vl_base";;
+  *) echo "ERROR: MODEL must be vero|qwen3vl (got '$MODEL')" >&2; exit 2;;
+esac
 export TOOLS="${TOOLS:-on}"
 export LIMIT="${LIMIT:-400}"
 export PORT="${PORT:-$(( 9100 + ${SLURM_JOB_ID:-0} % 800 ))}"
-
-if [[ "${MODEL:-vero}" == "base" ]]; then
-  # Base model under the checkpoint-identical forced-think drawing template.
-  # (The template is byte-stable across our drawing runs; committed copy below.)
-  set +u; source vero_eval/set_paths.sh 2>/dev/null || source vero_eval/set_paths.sh.example; set -u
-  export CHECKPOINT_PATH="${CHECKPOINT_PATH:-$HF_HOME/Qwen/Qwen3-VL-8B-Instruct}"
-  export CHAT_TEMPLATE="${CHAT_TEMPLATE:-$PWD/vero_eval/chat_templates/vero_forcedthink_draw.jinja}"
-  LABEL="base"
-else
-  : "${CHECKPOINT_PATH:?set CHECKPOINT_PATH=<merged HF dir> (or MODEL=base)}"
-  LABEL="$(basename "$CHECKPOINT_PATH")"
-fi
-export MODEL=vero   # both sides use the vero serving path (forced-think template, no extra system prompt)
 export OUTPUT_ROOT="${OUTPUT_ROOT:-$PWD/vero_eval/results/cqa_drawing/${LABEL}_${SLURM_JOB_ID:-manual}}"
 
-echo "eval_countqa_drawing: LABEL=$LABEL PORT=$PORT LIMIT=$LIMIT TASKS=$TASKS"
-echo "  CHECKPOINT_PATH=$CHECKPOINT_PATH"
+echo "eval_countqa_drawing: MODEL=$MODEL TASKS=$TASKS LABEL=$LABEL PORT=$PORT LIMIT=$LIMIT"
 exec bash vero_eval/run_eval.sbatch
