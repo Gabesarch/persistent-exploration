@@ -1,0 +1,17 @@
+include:
+- ../countqa.yaml
+- ../../_tool_templates/_vero/_toolset_draw_vero_yaml
+task: "countqa_drawing_vero_cap4k"
+# Same as countqa_drawing_vero but per-turn generation capped at 4096 tokens — matches the
+# training per-turn cap (max_assistant_response_length: 4096) and avoids the 16384-output +
+# large-image prompt overflowing the 32768 context (which 400-errored requests at max_new_tokens=16384).
+generation_kwargs:
+  max_new_tokens: 4096
+  temperature: 0.7
+  top_p: 1.0
+  top_k: -1
+  do_sample: true
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: ""
+    post_prompt: "\n\nUse the available drawing tools if needed. After your analysis, give the final answer only."
