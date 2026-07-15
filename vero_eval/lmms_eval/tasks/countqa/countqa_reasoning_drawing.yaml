@@ -1,0 +1,27 @@
+# Training-faithful Vero DRAWING variant of countqa — mirrors countqa_reasoning_zoom.
+#
+# Vero RL drawing checkpoint + draw_points-only toolset (the exact training toolset:
+# ../_tool_templates/_vero/_toolset_draw_vero_yaml) + training sampling (0.7 / 1.0 / -1)
+# + per-turn generation cap 4096 = training's max_assistant_response_length (also prevents
+# 32k-context overflow on CountQA's 10 MP images — max_new_tokens 16384 silently drops requests).
+#
+# Content-identical to the ad-hoc "countqa_drawing_vero_cap4k" task used for the July 2026
+# learning curves (base 0.260 under matched-template serving; pilot & dponly curves) — scores
+# remain directly comparable. Run with MODEL=vero TOOLS=on.
+include:
+- countqa.yaml
+- ../_tool_templates/_vero/_toolset_draw_vero_yaml
+task: "countqa_reasoning_drawing"
+# Same as countqa_drawing_vero but per-turn generation capped at 4096 tokens — matches the
+# training per-turn cap (max_assistant_response_length: 4096) and avoids the 16384-output +
+# large-image prompt overflowing the 32768 context (which 400-errored requests at max_new_tokens=16384).
+generation_kwargs:
+  max_new_tokens: 4096
+  temperature: 0.7
+  top_p: 1.0
+  top_k: -1
+  do_sample: true
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: ""
+    post_prompt: "\n\nUse the available drawing tools if needed. After your analysis, give the final answer only."

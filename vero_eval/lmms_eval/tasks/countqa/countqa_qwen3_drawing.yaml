@@ -1,12 +1,26 @@
-include: countqa.yaml
+# Base Qwen3-VL-Instruct multi-turn DRAWING variant of countqa — mirrors countqa_qwen3_zoom.
+#
+# Baseline counterpart to the Vero countqa_reasoning_drawing checkpoint eval. Reuses the
+# instruct draw toolset (../_tool_templates/_instruct/_toolset_draw_instruct_yaml):
+# contributes metadata.allowed_tools (the draw tools) + instruct system prompts. No forced
+# <think>, no Layer-A. (Previously this yaml had NO toolset include, so with TOOLS=on the
+# backend offered every MCP tool with zero usage guidance — rewired 2026-07-15.)
+#
+# Sampling: the base model's own generation_config defaults (temp 0.7 / top_p 0.8 / top_k 20),
+# following the base-eval convention set for the zoom side in c42abfe — native for the base,
+# and inherited unchanged by RL checkpoints. Per-turn generation cap 4096 for the same reason
+# as the reasoning twin (32k-context overflow on CountQA's 10 MP images). Run with TOOLS=on.
+include:
+  - countqa.yaml
+  - ../_tool_templates/_instruct/_toolset_draw_instruct_yaml
 task: "countqa_qwen3_drawing"
 generation_kwargs:
-  max_new_tokens: 16384
-  temperature: 0.6
-  top_p: 0.95
+  max_new_tokens: 4096
+  temperature: 0.7
+  top_p: 0.8
+  top_k: 20
   do_sample: True
-process_results: !function utils.countqa_drawing_process_results
 lmms_eval_specific_kwargs:
   default:
     pre_prompt: ""
-    post_prompt: " Use the available tools to help count if needed. After your analysis, state your answer as: Final count: NUMBER"
+    post_prompt: " Use the available drawing tools if needed. After your analysis, give the final answer only."

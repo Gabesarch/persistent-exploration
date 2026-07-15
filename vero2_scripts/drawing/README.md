@@ -247,6 +247,6 @@ Same tool config (`image_drawing_tools.yaml`, draw_points-only), same system pro
 ## Evaluating a drawing run
 
 The eval foundation lives in `vero_eval/` — see its README's **“Quickstart — CountQA drawing
-eval”**: one command per checkpoint (merge → matched `countqa_drawing_vero_cap4k` eval), a
-`MODEL=base` twin under the identical forced-think template, and a learning-curve driver
-(`vero_eval/scripts/eval_countqa_drawing_curve.sh`).
+eval”**. Same MODEL→task fashion as visual_probe: `MODEL=vero` → `countqa_reasoning_drawing`
+(training-faithful), `MODEL=qwen3vl` → `countqa_qwen3_drawing` (base-native twin), plus a
+learning-curve driver (`vero_eval/scripts/eval_countqa_drawing_curve.sh`).

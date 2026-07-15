@@ -50,23 +50,24 @@ tools-on/off, turns, and how the zoom tool crops at native resolution → **§3�
 
 ## Quickstart — CountQA drawing eval (counting / draw_points)
 
-The training-faithful counting benchmark for the **drawing** experiments — the drawing
-counterpart of the zoom quickstart above. One shared task
-(`countqa_drawing_vero_cap4k`: draw_points-only toolset, forced-think template, per-turn
-generation cap 4096 = training's `max_assistant_response_length`), served identically for
-the base model and any trained checkpoint, so **base-vs-trained differs only in weights**.
+The drawing counterpart of the zoom quickstart above, with the same MODEL→task convention:
+
+| MODEL | task | serving |
+|---|---|---|
+| `vero` | `countqa_reasoning_drawing` | training-faithful: draw_points-only toolset, forced-think template from the checkpoint, sampling 0.7/1.0/-1, per-turn cap 4096 |
+| `qwen3vl` | `countqa_qwen3_drawing` | base-native: instruct draw toolset, generation_config sampling 0.7/0.8/20 (the c42abfe base-eval convention), cap 4096 |
+
 Metric = `exact_match` (integer count) — **no judge, 1 GPU**, ~35 min at `LIMIT=400`.
 
 ```bash
 # a trained checkpoint (FSDP ckpt -> HF first, ~3 min):
 sbatch --export=ALL,CKPT_ROOT=/scratch/.../checkpoints/vero2_verl/<RUN>,STEP=140 \
        vero_eval/scripts/merge_ckpt_to_hf.sbatch
-sbatch --export=ALL,CHECKPOINT_PATH=$ROOT_PATH/vero2_merged_hf/<RUN>_step_140 \
+sbatch --export=ALL,MODEL=vero,CHECKPOINT_PATH=$ROOT_PATH/vero2_merged_hf/<RUN>_step_140 \
        vero_eval/scripts/eval_countqa_drawing.sbatch
 
-# the BASE model under the same forced-think drawing template (committed at
-# vero_eval/chat_templates/vero_forcedthink_draw.jinja):
-sbatch --export=ALL,MODEL=base vero_eval/scripts/eval_countqa_drawing.sbatch
+# the base model:
+sbatch --export=ALL,MODEL=qwen3vl vero_eval/scripts/eval_countqa_drawing.sbatch
 
 # a whole run's LEARNING CURVE (merge+eval chained per step, + base):
 bash vero_eval/scripts/eval_countqa_drawing_curve.sh \
@@ -76,13 +77,16 @@ bash vero_eval/scripts/eval_countqa_drawing_curve.sh \
 Safeguards baked into the runner (each cost a wasted eval to learn):
 - **distinct vLLM port per job** (auto: `9100 + jobid%800`) — two evals on one gpu-test
   node with the default port kill each other's server and silently score the same model;
-- **`_cap4k` task, not the uncapped one** — `max_new_tokens 16384` + CountQA's 10 MP
-  images overflows the 32k context and silently drops requests;
+- **per-turn generation cap 4096** in both tasks — `max_new_tokens 16384` + CountQA's
+  10 MP images overflows the 32k context and silently drops requests;
 - `LIMIT=400` = the first 400 of 1528 flattened QA (deterministic subset; unset for full).
 
 Results: `vero_eval/results/cqa_drawing/<label>_<jobid>/**/*results*.json` →
-`results.countqa_drawing_vero_cap4k."exact_match,none"`. Reference numbers (n=400):
-base Qwen3-VL-8B-Instruct = **0.260**; sanity range for early checkpoints 0.20–0.28.
+`results.<task>."exact_match,none"`. Baseline note: the July 2026 curves used the
+*matched-template* method (base served under the checkpoint template on the shared task;
+base = **0.260**, n=400) — `countqa_reasoning_drawing` scores stay comparable to those
+curves, but the native `countqa_qwen3_drawing` baseline is a different method: re-measure
+it rather than comparing against 0.260.
 
 ---
 
@@ -390,6 +394,8 @@ extract from the checkpoint's `chat_template.jinja` if you need exact parity for
 | **Vero + zoom** (training-faithful) | `_reasoning_zoom` |
 | **Qwen3-VL-8B Instruct** (baseline) | `_qwen3_zs` |
 | **Qwen3-VL-8B Instruct + zoom** | `_qwen3_zoom` |
+| **Vero + drawing** (training-faithful, countqa) | `_reasoning_drawing` |
+| **Qwen3-VL-8B Instruct + drawing** (countqa) | `_qwen3_drawing` |
 | **Qwen3-VL-8B Thinking** (baseline) | `_qwen3_thinking_zs` |
 | Qwen2.5-VL-7B Instruct | `_qwen25_zs` |
 | MiMo-VL | `_mimo_zs` |
