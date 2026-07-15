@@ -8,11 +8,13 @@ include:
   - ../_tool_templates/_toolset_zoom_yaml
 task: "visual_probe_hard_qwen3_zoom"
 generation_kwargs:
+  # The base model's own generation_config defaults (temp 0.7 / top_p 0.8 / top_k 20)
+  # — which the RL checkpoint inherited, so base-vs-trained comparisons are sampling-
+  # matched AND native for both. (Replaces the earlier ad-hoc 1.0/1.0/40/presence 2.0.)
   max_new_tokens: 16384
-  temperature: 1.0
-  top_p: 1.0
-  top_k: 40
-  presence_penalty: 2.0
+  temperature: 0.7
+  top_p: 0.8
+  top_k: 20
   do_sample: True
 lmms_eval_specific_kwargs:
   default:
