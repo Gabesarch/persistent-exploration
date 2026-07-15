@@ -48,6 +48,42 @@ That's the whole loop. Deeper reference below: the `eval_visual_probe_full` runn
 `MM_MAX_PIXELS` knob → **§5**; the per-model zoom suffixes → **§6**; the judge → **§7**;
 tools-on/off, turns, and how the zoom tool crops at native resolution → **§3–§4**.
 
+## Quickstart — CountQA drawing eval (counting / draw_points)
+
+The training-faithful counting benchmark for the **drawing** experiments — the drawing
+counterpart of the zoom quickstart above. One shared task
+(`countqa_drawing_vero_cap4k`: draw_points-only toolset, forced-think template, per-turn
+generation cap 4096 = training's `max_assistant_response_length`), served identically for
+the base model and any trained checkpoint, so **base-vs-trained differs only in weights**.
+Metric = `exact_match` (integer count) — **no judge, 1 GPU**, ~35 min at `LIMIT=400`.
+
+```bash
+# a trained checkpoint (FSDP ckpt -> HF first, ~3 min):
+sbatch --export=ALL,CKPT_ROOT=/scratch/.../checkpoints/vero2_verl/<RUN>,STEP=140 \
+       vero_eval/scripts/merge_ckpt_to_hf.sbatch
+sbatch --export=ALL,CHECKPOINT_PATH=$ROOT_PATH/vero2_merged_hf/<RUN>_step_140 \
+       vero_eval/scripts/eval_countqa_drawing.sbatch
+
+# the BASE model under the same forced-think drawing template (committed at
+# vero_eval/chat_templates/vero_forcedthink_draw.jinja):
+sbatch --export=ALL,MODEL=base vero_eval/scripts/eval_countqa_drawing.sbatch
+
+# a whole run's LEARNING CURVE (merge+eval chained per step, + base):
+bash vero_eval/scripts/eval_countqa_drawing_curve.sh \
+  --ckpt-root /scratch/.../checkpoints/vero2_verl/<RUN> --steps "15 40 65 140" --base
+```
+
+Safeguards baked into the runner (each cost a wasted eval to learn):
+- **distinct vLLM port per job** (auto: `9100 + jobid%800`) — two evals on one gpu-test
+  node with the default port kill each other's server and silently score the same model;
+- **`_cap4k` task, not the uncapped one** — `max_new_tokens 16384` + CountQA's 10 MP
+  images overflows the 32k context and silently drops requests;
+- `LIMIT=400` = the first 400 of 1528 flattened QA (deterministic subset; unset for full).
+
+Results: `vero_eval/results/cqa_drawing/<label>_<jobid>/**/*results*.json` →
+`results.countqa_drawing_vero_cap4k."exact_match,none"`. Reference numbers (n=400):
+base Qwen3-VL-8B-Instruct = **0.260**; sanity range for early checkpoints 0.20–0.28.
+
 ---
 
 ## 1. Layout

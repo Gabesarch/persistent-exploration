@@ -243,3 +243,10 @@ lr 1e-6, same reward stack, save_freq 20 / test_freq 40). The only differences:
 Same tool config (`image_drawing_tools.yaml`, draw_points-only), same system prompt
 (`prompts/system_prompt_chatting_tool_calling.txt`), same model
 (`$HF_HOME/Qwen/Qwen3-VL-8B-Instruct`).
+
+## Evaluating a drawing run
+
+The eval foundation lives in `vero_eval/` — see its README's **“Quickstart — CountQA drawing
+eval”**: one command per checkpoint (merge → matched `countqa_drawing_vero_cap4k` eval), a
+`MODEL=base` twin under the identical forced-think template, and a learning-curve driver
+(`vero_eval/scripts/eval_countqa_drawing_curve.sh`).
