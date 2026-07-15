@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import math
 import os
 import shutil
 import uuid
@@ -898,6 +899,18 @@ class RayPPOTrainer:
 
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+            if len(test_output_gen_batch) != len(test_batch):
+                branch_count = 0
+                branch_flags = test_output_gen_batch.non_tensor_batch.get("is_conditional_answer_retry_branch")
+                if branch_flags is not None:
+                    branch_count = int(np.sum(np.asarray(branch_flags, dtype=object) == True))
+                raise RuntimeError(
+                    "Validation rollout returned a different row count than the validation batch "
+                    f"({len(test_output_gen_batch)} vs {len(test_batch)}). "
+                    f"branch_rows={branch_count}. Branch rows are training-only for this experiment; "
+                    "keep actor_rollout_ref.rollout.multi_turn."
+                    "conditional_answer_retry_branch_enable_validation=false."
+                )
 
             print("validation generation end")
 
@@ -1491,6 +1504,48 @@ class RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
+    def _pad_branch_expanded_training_batch(self, batch: DataProto, metrics: dict) -> DataProto:
+        """Pad branch-expanded batches so distributed actor paths keep valid divisibility.
+
+        Branch rows make the post-rollout batch size data-dependent. Padded rows are
+        made loss-free and excluded from GDPO canonical baseline statistics.
+        """
+        baseline_weight_key = self.config.algorithm.get("gdpo_baseline_weight_key", None)
+        if not baseline_weight_key or baseline_weight_key not in batch.non_tensor_batch:
+            return batch
+
+        divisor = max(self._get_dp_size(self.actor_rollout_wg, "actor"), 1)
+        ppo_mini_batch_size = self.config.actor_rollout_ref.actor.get("ppo_mini_batch_size", None)
+        if ppo_mini_batch_size:
+            divisor = math.lcm(divisor, int(ppo_mini_batch_size))
+        if divisor <= 1 or len(batch) % divisor == 0:
+            return batch
+
+        original_len = len(batch)
+        batch, pad_size = pad_dataproto_to_divisor(batch, divisor)
+        if pad_size <= 0:
+            return batch
+
+        pad_slice = slice(original_len, len(batch))
+        metrics["gdpo/padding_rows/added"] = int(pad_size)
+        metrics["gdpo/padding_rows/divisor"] = int(divisor)
+
+        if "response_mask" in batch.batch:
+            batch.batch["response_mask"][pad_slice] = 0
+        if "rm_scores" in batch.batch:
+            batch.batch["rm_scores"][pad_slice] = 0
+
+        reward_keys = self.config.algorithm.get("gdpo_reward_keys", None) or []
+        for key in reward_keys:
+            if key in batch.non_tensor_batch:
+                batch.non_tensor_batch[key][pad_slice] = 0.0
+
+        batch.non_tensor_batch[baseline_weight_key][pad_slice] = 0.0
+        padding_mask = np.zeros(len(batch), dtype=bool)
+        padding_mask[pad_slice] = True
+        batch.non_tensor_batch["__branch_padding_row"] = padding_mask
+        return batch
+
     def _compute_values(self, batch: DataProto) -> DataProto:
         if self.use_legacy_worker_impl == "disable":
             batch_td = batch.to_tensordict()
@@ -1729,6 +1784,9 @@ class RayPPOTrainer:
                 gen_batch_output = gen_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
+                gen_batch_output.non_tensor_batch["__rollout_row_id"] = np.arange(
+                    len(gen_batch_output), dtype=np.int64
+                )
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
@@ -1780,7 +1838,11 @@ class RayPPOTrainer:
                             del rm_scores, gen_baseline_batch, gen_baseline_output
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    rollout_row_ids = gen_batch_output.non_tensor_batch.pop("__rollout_row_id", None)
+                    if rollout_row_ids is not None:
+                        batch = batch.select_idxs(np.asarray(rollout_row_ids, dtype=np.int64))
                     batch = batch.union(gen_batch_output)
+                    batch = self._pad_branch_expanded_training_batch(batch, metrics)
                     if self._should_compute_teacher_colocate(batch):
                         with marked_timer("teacher", timing_raw, color="cyan"):
                             batch_teacher = self._compute_teacher_colocate(batch)
@@ -2037,6 +2099,22 @@ class RayPPOTrainer:
                             metrics[f"gdpo/{key}/std"] = float(np.std(vals))
                             metrics[f"gdpo/{key}/max"] = float(np.max(vals))
                             metrics[f"gdpo/{key}/min"] = float(np.min(vals))
+                    baseline_weight_key = self.config.algorithm.get("gdpo_baseline_weight_key", None)
+                    if baseline_weight_key and baseline_weight_key in batch.non_tensor_batch:
+                        weights = np.asarray(batch.non_tensor_batch[baseline_weight_key], dtype=np.float32)
+                        padding_mask = np.asarray(
+                            batch.non_tensor_batch.get("__branch_padding_row", np.zeros(len(weights), dtype=bool)),
+                            dtype=bool,
+                        )
+                        branch_mask = (weights <= 0.0) & ~padding_mask
+                        metrics["gdpo/branch_rows/count"] = int(np.sum(branch_mask))
+                        metrics["gdpo/branch_rows/rate"] = float(np.mean(branch_mask)) if len(branch_mask) else 0.0
+                        metrics["gdpo/padding_rows/count"] = int(np.sum(padding_mask))
+                        metric_weights = weights[~padding_mask]
+                        if len(metric_weights):
+                            metrics["gdpo/baseline_weight/mean"] = float(np.mean(metric_weights))
+                            metrics["gdpo/baseline_weight/min"] = float(np.min(metric_weights))
+                            metrics["gdpo/baseline_weight/max"] = float(np.max(metric_weights))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()

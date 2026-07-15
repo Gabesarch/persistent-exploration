@@ -118,6 +118,11 @@ class MultiTurnConfig(BaseConfig):
     conditional_answer_retry_assistant_prefill: str = ""
     conditional_answer_retry_correct_accuracy_threshold: float = 0.0
     conditional_answer_retry_max_retries: Optional[int] = None
+    conditional_answer_retry_branch_enabled: bool = False
+    conditional_answer_retry_branch_enable_validation: bool = False
+    conditional_answer_retry_branch_mask_mode: str = "divergence_only"
+    conditional_answer_retry_branch_reward_components: dict[str, float] = field(default_factory=dict)
+    conditional_answer_retry_branch_baseline_weight_key: str = "gdpo_baseline_weight"
     llm_judge_enabled: bool = False
     llm_judge_prompt_path: Optional[str] = None
     llm_judge_reward_types: list[str] = field(default_factory=lambda: ["search"])

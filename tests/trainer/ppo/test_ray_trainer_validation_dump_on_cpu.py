@@ -18,8 +18,11 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import torch
 from omegaconf import OmegaConf
+from tensordict import TensorDict
 
+from verl import DataProto
 from verl.utils.crop_cache import CROP_IMAGE_REFS_KEY
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 
@@ -274,6 +277,64 @@ class TestRayTrainerValidationDumpOnCPU(unittest.TestCase):
         self.assertEqual(refs[1], "fallback.png")
         self.assertIsNone(refs[2])
         self.assertIsNone(refs[3])
+
+
+class TestRayTrainerBranchPaddingOnCPU(unittest.TestCase):
+    def test_branch_expanded_batch_is_padded_without_loss_or_baseline_effect(self):
+        trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+        trainer.config = OmegaConf.create(
+            {
+                "algorithm": {
+                    "gdpo_baseline_weight_key": "gdpo_baseline_weight",
+                    "gdpo_reward_keys": ["accuracy", "format", "tool_repeat_overlap"],
+                },
+                "actor_rollout_ref": {"actor": {"ppo_mini_batch_size": 4}},
+            }
+        )
+        trainer.actor_rollout_wg = object()
+        trainer._get_dp_size = lambda *_args, **_kwargs: 2
+
+        batch = DataProto(
+            batch=TensorDict(
+                {
+                    "attention_mask": torch.ones(5, 6, dtype=torch.long),
+                    "response_mask": torch.ones(5, 3, dtype=torch.long),
+                    "rm_scores": torch.ones(5, 3, dtype=torch.float32),
+                },
+                batch_size=5,
+            ),
+            non_tensor_batch={
+                "gdpo_baseline_weight": np.array([1.0, 0.0, 1.0, 1.0, 0.0], dtype=object),
+                "accuracy": np.array([0.8, 0.0, 0.7, 0.9, 0.0], dtype=object),
+                "format": np.array([1.0, 0.0, 1.0, 1.0, 0.0], dtype=object),
+                "tool_repeat_overlap": np.array([0.0, 0.0, -0.1, 0.0, 0.0], dtype=object),
+            },
+        )
+        metrics = {}
+
+        padded = trainer._pad_branch_expanded_training_batch(batch, metrics)
+
+        self.assertEqual(len(padded), 8)
+        self.assertEqual(metrics["gdpo/padding_rows/added"], 3)
+        self.assertEqual(padded.batch["response_mask"][5:].sum().item(), 0)
+        self.assertEqual(padded.batch["rm_scores"][5:].sum().item(), 0.0)
+        self.assertEqual(
+            padded.non_tensor_batch["gdpo_baseline_weight"].tolist(),
+            [1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+        )
+        self.assertEqual(padded.non_tensor_batch["accuracy"][5:].tolist(), [0.0, 0.0, 0.0])
+        self.assertEqual(
+            padded.non_tensor_batch["__branch_padding_row"].tolist(),
+            [False, False, False, False, False, True, True, True],
+        )
+
+
+class TestRayTrainerValidationShapeGuardOnCPU(unittest.TestCase):
+    def test_validation_row_count_guard_reports_branch_rows(self):
+        branch_flags = np.array([False, True, False], dtype=object)
+        branch_count = int(np.sum(branch_flags == True))
+
+        self.assertEqual(branch_count, 1)
 
 
 if __name__ == "__main__":

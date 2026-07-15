@@ -25,6 +25,7 @@ from PIL import Image
 
 from verl.experimental.agent_loop.agent_loop import (
     AgentLoopBase,
+    AgentLoopMetrics,
     AgentLoopOutput,
     register,
 )
@@ -141,6 +142,7 @@ class AgentData:
 
         # Extra fields for dynamic addition, e.g., tool session data
         self.extra_fields: dict[str, Any] = {}
+        self.branch_outputs: list[AgentLoopOutput] = []
         self.debug_events: list[dict[str, Any]] = []
         self.crop_image_refs: list[dict[str, Any]] = []
         self.force_next_tool_call = False
@@ -201,6 +203,21 @@ class ToolAgentLoop(AgentLoopBase):
         )
         self.conditional_answer_retry_max_retries = getattr(
             multi_turn_config, "conditional_answer_retry_max_retries", None
+        )
+        self.conditional_answer_retry_branch_enabled = getattr(
+            multi_turn_config, "conditional_answer_retry_branch_enabled", False
+        )
+        self.conditional_answer_retry_branch_enable_validation = getattr(
+            multi_turn_config, "conditional_answer_retry_branch_enable_validation", False
+        )
+        self.conditional_answer_retry_branch_mask_mode = getattr(
+            multi_turn_config, "conditional_answer_retry_branch_mask_mode", "divergence_only"
+        )
+        self.conditional_answer_retry_branch_reward_components = dict(
+            getattr(multi_turn_config, "conditional_answer_retry_branch_reward_components", {}) or {}
+        )
+        self.conditional_answer_retry_branch_baseline_weight_key = getattr(
+            multi_turn_config, "conditional_answer_retry_branch_baseline_weight_key", "gdpo_baseline_weight"
         )
         self.llm_judge_enabled = bool(getattr(multi_turn_config, "llm_judge_enabled", False))
         self.conditional_answer_retry_reward_fn = (
@@ -331,9 +348,9 @@ class ToolAgentLoop(AgentLoopBase):
         prompt_ids = agent_data.prompt_ids[: len(agent_data.prompt_ids) - len(agent_data.response_mask)]
         multi_modal_data = {}
         if agent_data.image_data is not None:
-            multi_modal_data["images"] = agent_data.image_data
+            multi_modal_data["images"] = list(agent_data.image_data)
         if agent_data.video_data is not None:
-            multi_modal_data["videos"] = agent_data.video_data
+            multi_modal_data["videos"] = list(agent_data.video_data)
 
         output: AgentLoopOutput = AgentLoopOutput(
             prompt_ids=prompt_ids,
@@ -348,6 +365,9 @@ class ToolAgentLoop(AgentLoopBase):
             routed_experts=agent_data.routed_experts,
             extra_fields={**TERMINAL_TOOL_EXTRA_FIELD_DEFAULTS, **agent_data.extra_fields},
         )
+        if self.conditional_answer_retry_branch_enabled:
+            output.extra_fields[self.conditional_answer_retry_branch_baseline_weight_key] = 1.0
+            output.extra_fields["is_conditional_answer_retry_branch"] = False
         output.extra_fields.update(
             {
                 "request_id": agent_data.request_id,
@@ -360,6 +380,7 @@ class ToolAgentLoop(AgentLoopBase):
         if final_grade is not None:
             output.reward_score = float(final_grade.get("score", 0.0) or 0.0)
             output.extra_fields["reward_extra_info"] = final_grade
+        output.branch_outputs = agent_data.branch_outputs
         if debug_enabled:
             await self._debug_log_sample_final(output, agent_data, kwargs, debug_trajectory)
         return output
@@ -667,6 +688,14 @@ class ToolAgentLoop(AgentLoopBase):
             self._log_incorrect_answer_retry_skipped(agent_data, grade, retry_count, skipped_reason)
             return None
 
+        self._maybe_append_wrong_answer_branch(
+            agent_data=agent_data,
+            generation_snapshot=generation_snapshot,
+            grade=grade,
+            retry_count=retry_count + 1,
+            removed_assistant_text=assistant_message,
+            rollout_kwargs=rollout_kwargs,
+        )
         self._rollback_generation_state(agent_data, generation_snapshot)
         retry_count += 1
         suffix = self.conditional_answer_retry_suffix or ""
@@ -688,6 +717,85 @@ class ToolAgentLoop(AgentLoopBase):
         if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
             return AgentState.TERMINATED
         return AgentState.GENERATING
+
+    def _maybe_append_wrong_answer_branch(
+        self,
+        agent_data: AgentData,
+        generation_snapshot: dict[str, Any],
+        grade: dict[str, Any],
+        retry_count: int,
+        removed_assistant_text: str,
+        rollout_kwargs: dict[str, Any],
+    ) -> None:
+        if not self.conditional_answer_retry_branch_enabled:
+            return
+        debug_trajectory = rollout_kwargs.get("_debug_trajectory", {}) or {}
+        if debug_trajectory.get("validate") and not self.conditional_answer_retry_branch_enable_validation:
+            return
+        if self.conditional_answer_retry_branch_mask_mode != "divergence_only":
+            raise ValueError(
+                "conditional_answer_retry_branch_mask_mode only supports 'divergence_only', "
+                f"got {self.conditional_answer_retry_branch_mask_mode!r}"
+            )
+
+        divergence_start = int(generation_snapshot["response_mask_len"])
+        response_ids = agent_data.prompt_ids[-len(agent_data.response_mask) :] if agent_data.response_mask else []
+        prompt_ids = agent_data.prompt_ids[: len(agent_data.prompt_ids) - len(agent_data.response_mask)]
+        branch_response_mask = [
+            int(mask) if idx >= divergence_start else 0 for idx, mask in enumerate(agent_data.response_mask)
+        ]
+        branch_response_mask = branch_response_mask[: len(response_ids)]
+
+        branch_logprobs = None
+        if agent_data.response_logprobs:
+            branch_logprobs = list(agent_data.response_logprobs[: len(response_ids)])
+
+        multi_modal_data = {}
+        if agent_data.image_data is not None:
+            multi_modal_data["images"] = list(agent_data.image_data)
+        if agent_data.video_data is not None:
+            multi_modal_data["videos"] = list(agent_data.video_data)
+
+        reward_extra_info = self._branch_reward_extra_info(grade)
+        baseline_key = self.conditional_answer_retry_branch_baseline_weight_key
+        branch_output = AgentLoopOutput(
+            prompt_ids=prompt_ids,
+            response_ids=response_ids[: self.response_length],
+            response_mask=branch_response_mask[: self.response_length],
+            multi_modal_data=multi_modal_data,
+            response_logprobs=branch_logprobs[: self.response_length] if branch_logprobs else None,
+            reward_score=float(reward_extra_info.get("score", 0.0) or 0.0),
+            num_turns=agent_data.user_turns + agent_data.assistant_turns + 1,
+            metrics=AgentLoopMetrics(),
+            routed_experts=None,
+            extra_fields={
+                **TERMINAL_TOOL_EXTRA_FIELD_DEFAULTS,
+                "request_id": agent_data.request_id,
+                "is_conditional_answer_retry_branch": True,
+                baseline_key: 0.0,
+                "conditional_answer_retry_branch_mask_mode": self.conditional_answer_retry_branch_mask_mode,
+                "conditional_answer_retry_branch_retry_count": retry_count,
+                "conditional_answer_retry_branch_grade": grade,
+                "conditional_answer_retry_branch_removed_assistant_text": removed_assistant_text,
+                "conditional_answer_retry_count": retry_count,
+                "conditional_answer_retry_last_grade": grade,
+                "conditional_answer_retry_skipped_reason": None,
+                "reward_extra_info": reward_extra_info,
+                "turn_scores": list(agent_data.turn_scores),
+                "tool_rewards": list(agent_data.tool_rewards),
+                CROP_IMAGE_REFS_KEY: list(agent_data.crop_image_refs),
+            },
+        )
+        agent_data.branch_outputs.append(branch_output)
+
+    def _branch_reward_extra_info(self, grade: dict[str, Any]) -> dict[str, Any]:
+        reward_extra_info = dict(grade) if isinstance(grade, dict) else {}
+        reward_extra_info["score"] = 0.0
+        for key in ("accuracy", "format", "tool_repeat_overlap"):
+            reward_extra_info[key] = 0.0
+        for key, value in self.conditional_answer_retry_branch_reward_components.items():
+            reward_extra_info[str(key)] = float(value)
+        return reward_extra_info
 
     async def _grade_current_response(self, agent_data: AgentData, rollout_kwargs: dict[str, Any]) -> dict[str, Any]:
         if self.conditional_answer_retry_reward_fn is None:
@@ -1604,6 +1712,20 @@ class ToolAgentLoop(AgentLoopBase):
             "num_turns": output.num_turns,
             "turn_scores": agent_data.turn_scores,
             "tool_rewards": agent_data.tool_rewards,
+            "conditional_answer_retry_branch_outputs": [
+                {
+                    "response_tokens": len(branch.response_ids),
+                    "masked_tokens": int(sum(branch.response_mask)),
+                    "is_conditional_answer_retry_branch": branch.extra_fields.get(
+                        "is_conditional_answer_retry_branch"
+                    ),
+                    self.conditional_answer_retry_branch_baseline_weight_key: branch.extra_fields.get(
+                        self.conditional_answer_retry_branch_baseline_weight_key
+                    ),
+                    "reward_extra_info": branch.extra_fields.get("reward_extra_info"),
+                }
+                for branch in (output.branch_outputs or [])
+            ],
             "debug_events": agent_data.debug_events,
             "metrics": output.metrics.model_dump(),
         }

@@ -669,3 +669,4 @@ class AlgoConfig(BaseConfig):
     gdpo_reward_keys: Optional[list[str]] = None
     gdpo_reward_weights: Optional[list[float]] = None
     gdpo_reward_eligibility: Optional[dict[str, Any]] = None
+    gdpo_baseline_weight_key: Optional[str] = None

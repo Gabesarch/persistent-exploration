@@ -64,66 +64,84 @@ has_hf_weights() {
   shopt -s nullglob
   local -a weights=("$hf_dir"/*.safetensors "$hf_dir"/*.bin)
   shopt -u nullglob
-  (( ${#weights[@]} > 0 ))
+  local weight
+  for weight in "${weights[@]}"; do
+    [[ -s "$weight" ]] && return 0
+  done
+  return 1
 }
 
 ensure_hf_checkpoint_path() {
   local input_path="$1"
   local actor_dir=""
+  local source_hf=""
   local hf_target=""
 
   if [[ -d "$input_path/actor" ]]; then
     actor_dir="$input_path/actor"
-    hf_target="$actor_dir/huggingface"
   elif [[ "$(basename "$input_path")" == "huggingface" && "$(basename "$(dirname "$input_path")")" == "actor" ]]; then
-    hf_target="$input_path"
-    actor_dir="$(dirname "$hf_target")"
+    actor_dir="$(dirname "$input_path")"
   elif [[ "$(basename "$input_path")" == "actor" ]]; then
     actor_dir="$input_path"
-    hf_target="$actor_dir/huggingface"
   else
     printf '%s\n' "$input_path"
     return 0
   fi
 
-  mkdir -p "$hf_target"
-  if has_hf_weights "$hf_target"; then
-    echo "[INFO] Found Hugging Face weights in $hf_target; skipping conversion." >&2
-    printf '%s\n' "$hf_target"
+  source_hf="$actor_dir/huggingface"
+  if has_hf_weights "$source_hf"; then
+    echo "[INFO] Found Hugging Face weights in $source_hf; skipping conversion." >&2
+    printf '%s\n' "$source_hf"
     return 0
   fi
 
   if ! compgen -G "$actor_dir/model_world_size_*_rank_*.pt" >/dev/null 2>&1; then
-    echo "[WARN] No HF weights in $hf_target and no FSDP shards in $actor_dir; using original path." >&2
+    echo "[WARN] No HF weights in $source_hf and no FSDP shards in $actor_dir; using original path." >&2
     printf '%s\n' "$input_path"
     return 0
   fi
+
+  hf_target="$source_hf"
 
   merge_hf_weights() {
     if has_hf_weights "$hf_target"; then
       echo "[INFO] Found Hugging Face weights in $hf_target after waiting for lock; skipping conversion." >&2
       return 0
     fi
-    echo "[INFO] Hugging Face weights not detected at $hf_target. Converting from FSDP checkpoint." >&2
-    python -m verl.model_merger merge \
+    local staging_target="${hf_target}.partial.${SLURM_JOB_ID:-$$}"
+    rm -rf "$staging_target"
+    echo "[INFO] Converting FSDP checkpoint to temporary directory $staging_target." >&2
+    if ! python -m verl.model_merger merge \
       --backend "$MERGE_BACKEND" \
       --local_dir "$actor_dir" \
-      --target_dir "$hf_target" \
-      --trust-remote-code >&2
-    if ! has_hf_weights "$hf_target"; then
-      echo "[ERROR] Failed to produce Hugging Face weights at $hf_target" >&2
+      --target_dir "$staging_target" \
+      --trust-remote-code >&2; then
+      rm -rf "$staging_target"
+      echo "[ERROR] FSDP-to-Hugging-Face conversion failed for $actor_dir" >&2
       return 1
     fi
+    if ! has_hf_weights "$staging_target"; then
+      rm -rf "$staging_target"
+      echo "[ERROR] Conversion completed without producing model weights for $actor_dir" >&2
+      return 1
+    fi
+    rm -rf "$hf_target"
+    mv "$staging_target" "$hf_target"
+    echo "[INFO] Cached converted Hugging Face checkpoint at $hf_target." >&2
   }
 
   if command -v flock >/dev/null 2>&1; then
-    (
+    if ! (
       exec 200>"$actor_dir/.merge.lock"
       flock 200
       merge_hf_weights
-    )
+    ); then
+      return 1
+    fi
   else
-    merge_hf_weights
+    if ! merge_hf_weights; then
+      return 1
+    fi
   fi
 
   printf '%s\n' "$hf_target"
@@ -139,7 +157,11 @@ case "$MODEL" in
   /*)               export CHECKPOINT_PATH="$MODEL"; SUFFIX="${SUFFIX:-reasoning}";;
   *)                echo "ERROR: unknown MODEL '$MODEL' (vero|vero-thinking|qwen3vl|qwen3vl-thinking|qwen25vl|<abs path>)" >&2; exit 1;;
 esac
-CHECKPOINT_PATH="$(ensure_hf_checkpoint_path "$CHECKPOINT_PATH")"
+CHECKPOINT_PATH_INPUT="$CHECKPOINT_PATH"
+if ! CHECKPOINT_PATH="$(ensure_hf_checkpoint_path "$CHECKPOINT_PATH_INPUT")"; then
+  echo "ERROR: unable to prepare a valid Hugging Face checkpoint from $CHECKPOINT_PATH_INPUT" >&2
+  exit 1
+fi
 export LMMS_EVAL_HF_TOKENIZER="${LMMS_EVAL_HF_TOKENIZER:-$VERO_EVAL_DIR/local_hf/Qwen3-8B}"
 export LMMS_EVAL_HF_TOKENIZER_LOCAL_ONLY="${LMMS_EVAL_HF_TOKENIZER_LOCAL_ONLY:-1}"
 export CHECKPOINT_PATH PORT API_KEY

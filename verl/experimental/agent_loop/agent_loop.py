@@ -26,7 +26,7 @@ import torch
 from cachetools import LRUCache
 from omegaconf import DictConfig, OmegaConf
 from PIL import Image
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
 
@@ -237,6 +237,8 @@ class AgentLoopOutput(BaseModel):
     """Auxiliary performance metrics"""
     extra_fields: dict[str, Any] = {}
     """Extra fields for dynamic addition."""
+    branch_outputs: list[Any] = Field(default_factory=list)
+    """Optional auxiliary outputs emitted by the agent loop."""
 
     def as_dict(self) -> dict[str, Any]:
         """Convert agent loop output to a dictionary."""
@@ -245,6 +247,7 @@ class AgentLoopOutput(BaseModel):
         output["prompts"] = torch.tensor(output.pop("prompt_ids"), dtype=torch.int64)
         output["responses"] = torch.tensor(output.pop("response_ids"), dtype=torch.int64)
         output["response_mask"] = torch.tensor(output.pop("response_mask"), dtype=torch.int64)
+        output.pop("branch_outputs", None)
 
         response_logprobs = output.pop("response_logprobs", None)
         if response_logprobs is not None:
@@ -636,6 +639,7 @@ class AgentLoopWorker:
                 for i in range(len(batch)):
                     trace_this_sample = i in traced_indices
                     kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
+                    kwargs["__agent_loop_input_row"] = i
                     tasks.append(
                         asyncio.create_task(
                             self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
@@ -648,7 +652,8 @@ class AgentLoopWorker:
                 role="agent_loop_worker",
                 extra={"request_count": len(tasks)},
             ):
-                outputs = await asyncio.gather(*tasks)
+                output_groups = await asyncio.gather(*tasks)
+                outputs = [output for group in output_groups for output in group]
 
             output = self._postprocess(
                 outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)
@@ -663,7 +668,7 @@ class AgentLoopWorker:
         agent_name: str,
         trace: bool = True,
         **kwargs,
-    ) -> _InternalAgentLoopOutput:
+    ) -> list[_InternalAgentLoopOutput]:
         with rollout_trace_attr(
             step=trajectory["step"],
             sample_index=trajectory["sample_index"],
@@ -687,7 +692,13 @@ class AgentLoopWorker:
                 data_config=DictConfigWrap(self.config.data),
             )
             output: AgentLoopOutput = await agent_loop.run(sampling_params, _debug_trajectory=trajectory, **kwargs)
-            return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
+            source_row = kwargs.get("__agent_loop_input_row")
+            output.extra_fields["__agent_loop_input_row"] = source_row
+            internal_outputs = [await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)]
+            for branch_output in output.branch_outputs or []:
+                branch_output.extra_fields["__agent_loop_input_row"] = source_row
+                internal_outputs.append(await self._agent_loop_postprocess(branch_output, trajectory["validate"], **kwargs))
+            return internal_outputs
 
     async def _agent_loop_postprocess(self, output, validate, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
@@ -997,7 +1008,13 @@ class AgentLoopWorker:
             "__num_turns__": np.array([input.num_turns for input in inputs], dtype=np.int32),
         }
         if self.reward_loop_worker_handles is None and input_non_tensor_batch:
-            non_tensor_batch.update(input_non_tensor_batch)
+            non_tensor_batch.update(self._expand_input_non_tensor_batch(inputs, input_non_tensor_batch))
+        elif input_non_tensor_batch and "__rollout_row_id" in input_non_tensor_batch:
+            # Trainer-side batch expansion needs this internal row map even when
+            # async reward workers own the user-facing non-tensor fields.
+            non_tensor_batch["__rollout_row_id"] = self._expand_input_non_tensor_batch(
+                inputs, {"__rollout_row_id": input_non_tensor_batch["__rollout_row_id"]}
+            )["__rollout_row_id"]
 
         # Add reward_extra_info to non_tensor_batch. Reward functions can emit sparse
         # metadata, e.g. LLM-judge keys only for reward types where the judge applies.
@@ -1037,13 +1054,24 @@ class AgentLoopWorker:
             "conditional_answer_retry_count",
             "conditional_answer_retry_last_grade",
             "conditional_answer_retry_skipped_reason",
+            "is_conditional_answer_retry_branch",
+            "gdpo_baseline_weight",
+            "conditional_answer_retry_branch_mask_mode",
+            "conditional_answer_retry_branch_retry_count",
+            "conditional_answer_retry_branch_grade",
+            "conditional_answer_retry_branch_removed_assistant_text",
             "turn_scores",
             "tool_rewards",
             "min_global_steps",
             "max_global_steps",
             "extras",
         }
-        all_keys = set(key for input_item in inputs for key in input_item.extra_fields) | default_extra_keys
+        all_keys = {
+            key
+            for input_item in inputs
+            for key in input_item.extra_fields
+            if not str(key).startswith("__agent_loop_")
+        } | default_extra_keys
         for key in all_keys:
             temp_arr = np.empty(len(inputs), dtype=object)
             temp_arr[:] = [input.extra_fields.get(key) for input in inputs]
@@ -1063,6 +1091,27 @@ class AgentLoopWorker:
             non_tensor_batch=non_tensor_batch,
             meta_info=meta_info,
         )
+
+    @staticmethod
+    def _expand_input_non_tensor_batch(
+        inputs: list[_InternalAgentLoopOutput],
+        input_non_tensor_batch: dict,
+    ) -> dict[str, np.ndarray]:
+        expanded = {}
+        for key, values in input_non_tensor_batch.items():
+            if len(values) == len(inputs):
+                expanded[key] = values
+                continue
+            row_values = []
+            for input_item in inputs:
+                source_row = input_item.extra_fields.get("__agent_loop_input_row")
+                if source_row is None:
+                    raise ValueError(
+                        f"Cannot expand non-tensor key {key!r}: missing source row for agent-loop output."
+                    )
+                row_values.append(values[int(source_row)])
+            expanded[key] = np.array(row_values, dtype=getattr(values, "dtype", object))
+        return expanded
 
 
 async def get_trajectory_info(step, index, validate):

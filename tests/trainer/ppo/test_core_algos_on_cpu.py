@@ -460,6 +460,94 @@ def test_gdpo_conditional_tool_efficiency_uses_eligibility_config():
     assert torch.allclose(scalar_adv[1], scalar_adv[3])
 
 
+def test_gdpo_baseline_weight_excludes_branch_from_component_and_final_stats():
+    canonical_rewards = [0.8, 0.7, 0.9, 0.6]
+    branch_reward = 0.0
+    response_mask = torch.ones((5, 3), dtype=torch.float32)
+    index = np.array(["prompt-a"] * 5, dtype=object)
+    batch = _make_gdpo_test_batch(num_rows=5)
+    non_tensor_batch = {
+        "accuracy": np.array(canonical_rewards + [branch_reward], dtype=np.float32),
+        "gdpo_baseline_weight": np.array([1.0, 1.0, 1.0, 1.0, 0.0], dtype=np.float32),
+    }
+    config = {
+        "gdpo_reward_keys": ["accuracy"],
+        "gdpo_reward_weights": [1.0],
+        "gdpo_baseline_weight_key": "gdpo_baseline_weight",
+    }
+
+    component_adv = _compute_gdpo_component_advantage(
+        token_level_rewards=_make_scalar_reward_component(canonical_rewards + [branch_reward], response_mask),
+        response_mask=response_mask,
+        index=index,
+        baseline_mask=torch.tensor([True, True, True, True, False]),
+    )
+    canonical = torch.tensor(canonical_rewards, dtype=torch.float32)
+    expected_branch = (branch_reward - canonical.mean()) / (canonical.std() + 1e-6)
+
+    assert torch.allclose(component_adv[4, -1], expected_branch, rtol=1e-5, atol=1e-6)
+
+    adv_with_branch, _ = compute_gdpo_outcome_advantage(
+        token_level_rewards=torch.zeros_like(response_mask),
+        response_mask=response_mask,
+        index=index,
+        config=config,
+        non_tensor_batch=non_tensor_batch,
+        batch=batch,
+    )
+    adv_without_branch, _ = compute_gdpo_outcome_advantage(
+        token_level_rewards=torch.zeros((4, 3), dtype=torch.float32),
+        response_mask=torch.ones((4, 3), dtype=torch.float32),
+        index=np.array(["prompt-a"] * 4, dtype=object),
+        config={"gdpo_reward_keys": ["accuracy"], "gdpo_reward_weights": [1.0]},
+        non_tensor_batch={"accuracy": np.array(canonical_rewards, dtype=np.float32)},
+        batch=_make_gdpo_test_batch(num_rows=4),
+    )
+
+    assert torch.allclose(adv_with_branch[:4], adv_without_branch, rtol=1e-5, atol=1e-6)
+
+
+def test_gdpo_baseline_weight_padding_rows_do_not_change_canonical_advantages():
+    canonical_rewards = [0.8, 0.7, 0.9, 0.6]
+    branch_reward = 0.0
+    response_mask = torch.ones((8, 3), dtype=torch.float32)
+    response_mask[5:] = 0
+    index = np.array(["prompt-a"] * 8, dtype=object)
+    batch = _make_gdpo_test_batch(num_rows=8)
+    non_tensor_batch = {
+        "accuracy": np.array(canonical_rewards + [branch_reward, 0.0, 0.0, 0.0], dtype=np.float32),
+        "gdpo_baseline_weight": np.array([1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
+    }
+    config = {
+        "gdpo_reward_keys": ["accuracy"],
+        "gdpo_reward_weights": [1.0],
+        "gdpo_baseline_weight_key": "gdpo_baseline_weight",
+    }
+
+    adv_with_padding, _ = compute_gdpo_outcome_advantage(
+        token_level_rewards=torch.zeros_like(response_mask),
+        response_mask=response_mask,
+        index=index,
+        config=config,
+        non_tensor_batch=non_tensor_batch,
+        batch=batch,
+    )
+    adv_without_padding, _ = compute_gdpo_outcome_advantage(
+        token_level_rewards=torch.zeros((5, 3), dtype=torch.float32),
+        response_mask=torch.ones((5, 3), dtype=torch.float32),
+        index=np.array(["prompt-a"] * 5, dtype=object),
+        config=config,
+        non_tensor_batch={
+            "accuracy": np.array(canonical_rewards + [branch_reward], dtype=np.float32),
+            "gdpo_baseline_weight": np.array([1.0, 1.0, 1.0, 1.0, 0.0], dtype=np.float32),
+        },
+        batch=_make_gdpo_test_batch(num_rows=5),
+    )
+
+    assert torch.allclose(adv_with_padding[:5], adv_without_padding, rtol=1e-5, atol=1e-6)
+    assert torch.all(adv_with_padding[5:] == 0)
+
+
 def test_multiturn_tool_reward_returns_tool_efficiency_without_changing_score():
     from verl.utils.reward_score.math_verify_reward_type_multiturn_tool_calling_optional_think import compute_score
 

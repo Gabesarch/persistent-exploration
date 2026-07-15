@@ -367,9 +367,10 @@ def _compute_gdpo_component_advantage(
     config: Optional[AlgoConfig] = None,
     eligible_mask: Optional[torch.Tensor] = None,
     min_group_size: int = 1,
+    baseline_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Compute one GDPO component advantage, optionally over eligible rows only."""
-    if eligible_mask is None:
+    if eligible_mask is None and baseline_mask is None:
         normalized_score, _ = compute_grpo_outcome_advantage(
             token_level_rewards=token_level_rewards,
             response_mask=response_mask,
@@ -382,28 +383,49 @@ def _compute_gdpo_component_advantage(
 
     scores = token_level_rewards.sum(dim=-1)
     scalars = torch.zeros_like(scores)
-    eligible_mask = eligible_mask.to(device=scores.device, dtype=torch.bool)
+    if eligible_mask is None:
+        eligible_mask = torch.ones_like(scores, dtype=torch.bool)
+    else:
+        eligible_mask = eligible_mask.to(device=scores.device, dtype=torch.bool)
+    if baseline_mask is None:
+        baseline_mask = torch.ones_like(scores, dtype=torch.bool)
+    else:
+        baseline_mask = baseline_mask.to(device=scores.device, dtype=torch.bool)
     min_group_size = max(int(min_group_size), 1)
 
     with torch.no_grad():
         for idx in set(index.tolist()):
             rows_np = np.nonzero(index == idx)[0]
             rows = torch.as_tensor(rows_np, dtype=torch.long, device=scores.device)
-            eligible_rows = rows[eligible_mask[rows]]
-            if eligible_rows.numel() < min_group_size:
+            target_rows = rows[eligible_mask[rows]]
+            baseline_rows = rows[eligible_mask[rows] & baseline_mask[rows]]
+            if baseline_rows.numel() < min_group_size or target_rows.numel() == 0:
                 continue
 
-            group_scores = scores[eligible_rows]
-            centered = group_scores - torch.mean(group_scores)
+            group_scores = scores[baseline_rows]
+            centered = scores[target_rows] - torch.mean(group_scores)
             if norm_adv_by_std_in_grpo:
                 if group_scores.numel() == 1:
                     std = torch.tensor(1.0, dtype=group_scores.dtype, device=group_scores.device)
                 else:
                     std = torch.std(group_scores)
                 centered = centered / (std + epsilon)
-            scalars[eligible_rows] = centered
+            scalars[target_rows] = centered
 
     return scalars.unsqueeze(-1) * response_mask
+
+
+def _masked_whiten_with_stat_mask(
+    values: torch.Tensor,
+    output_mask: torch.Tensor,
+    stat_mask: torch.Tensor,
+) -> torch.Tensor:
+    stat_mask = stat_mask.to(device=values.device, dtype=output_mask.dtype) * output_mask
+    if int(stat_mask.sum().item()) <= 1:
+        return values * output_mask
+    mean = verl_F.masked_mean(values, stat_mask)
+    var = verl_F.masked_var(values, stat_mask)
+    return (values - mean) * torch.rsqrt(var + 1e-8) * output_mask
 
 
 @register_adv_est(AdvantageEstimator.GDPO)  # or simply: @register_adv_est("gdpo")
@@ -487,6 +509,20 @@ def compute_gdpo_outcome_advantage(
         if gdpo_weights is not None:
             reward_weights = list(gdpo_weights)
         reward_eligibility = config.get("gdpo_reward_eligibility", None)
+        baseline_mask = None
+        baseline_weight_key = config.get("gdpo_baseline_weight_key", None)
+        if baseline_weight_key:
+            assert baseline_weight_key in non_tensor_batch, (
+                f"GDPO baseline weight key '{baseline_weight_key}' not found in non_tensor_batch. "
+                f"Available keys: {list(non_tensor_batch.keys())}."
+            )
+            baseline_weights = torch.tensor(
+                np.asarray(non_tensor_batch[baseline_weight_key], dtype=np.float32),
+                device=token_level_rewards.device,
+            )
+            baseline_mask = baseline_weights > 0.0
+    else:
+        baseline_mask = None
 
     if score_list is None:
         score_list = [token_level_rewards]
@@ -531,6 +567,7 @@ def compute_gdpo_outcome_advantage(
             config=config,
             eligible_mask=eligible_mask,
             min_group_size=min_group_size,
+            baseline_mask=baseline_mask,
         )
 
         if new_advantage is None:
@@ -538,7 +575,11 @@ def compute_gdpo_outcome_advantage(
         else:
             new_advantage += weights[i] * normalized_score
 
-    advantages = verl_F.masked_whiten(new_advantage, response_mask) * response_mask
+    if baseline_mask is not None:
+        stat_mask = baseline_mask.to(device=response_mask.device, dtype=response_mask.dtype).unsqueeze(-1)
+        advantages = _masked_whiten_with_stat_mask(new_advantage, response_mask, stat_mask)
+    else:
+        advantages = verl_F.masked_whiten(new_advantage, response_mask) * response_mask
 
     return advantages, advantages
 
