@@ -22,19 +22,35 @@ import torch
 import verl.trainer.ppo.core_algos
 from verl.trainer.ppo.core_algos import (
     _compute_gdpo_component_advantage,
+    compute_branch_strata_loss_weights,
     compute_gae_advantage_return,
     compute_gdpo_outcome_advantage,
     compute_grpo_outcome_advantage,
     compute_grpo_vectorized_outcome_advantage,
+    compute_policy_loss_gspo,
     compute_rloo_outcome_advantage,
     compute_rloo_vectorized_outcome_advantage,
     get_adv_estimator_fn,
     register_adv_est,
 )
+from verl.workers.config.actor import ActorConfig, BranchLossStrataConfig, PolicyLossConfig
 
 
 def mock_test_fn():
     pass
+
+
+def _branch_strata_actor_config(enabled: bool = True) -> ActorConfig:
+    return ActorConfig(
+        strategy="fsdp",
+        rollout_n=1,
+        use_dynamic_bsz=True,
+        loss_agg_mode="seq-mean-token-mean",
+        policy_loss=PolicyLossConfig(
+            loss_mode="gspo",
+            branch_strata=BranchLossStrataConfig(enabled=enabled),
+        ),
+    )
 
 
 class TestRegisterAdvEst(unittest.TestCase):
@@ -790,9 +806,7 @@ def test_stable_gdpo_randomized_branch_heavy_batches_are_finite_and_bounded():
             np.float32
         )
         attention_mask = torch.cat((torch.ones((num_rows, 2), dtype=torch.int64), response_mask.long()), dim=-1)
-        config = _stable_gdpo_config(
-            gdpo_reward_keys=["accuracy", "format"], gdpo_reward_weights=[0.9, 0.1]
-        )
+        config = _stable_gdpo_config(gdpo_reward_keys=["accuracy", "format"], gdpo_reward_weights=[0.9, 0.1])
         adv, _ = compute_gdpo_outcome_advantage(
             token_level_rewards=torch.zeros_like(response_mask),
             response_mask=response_mask,
@@ -927,6 +941,162 @@ def test_tool_efficiency_concave_penalty_log_limit_for_q_one():
     )
 
     assert reward == pytest.approx(-torch.log1p(torch.tensor(20.0)).item() / 10.0)
+
+
+def test_branch_strata_weights_parent_balance_and_fraction():
+    response_mask = torch.ones((6, 2), dtype=torch.float32)
+    branch_flags = np.asarray([False, False, False, True, True, True], dtype=object)
+    parent_ids = np.asarray(["a", "b", "c", "a", "a", "b"], dtype=object)
+    weights, metrics = compute_branch_strata_loss_weights(
+        response_mask=response_mask,
+        branch_flags=branch_flags,
+        parent_ids=parent_ids,
+        padding_mask=np.zeros(6, dtype=bool),
+        branch_fraction=0.2,
+    )
+
+    assert weights.sum().item() == pytest.approx(6.0)
+    assert weights[:3].sum().item() / 6.0 == pytest.approx(0.8)
+    assert weights[3:].sum().item() / 6.0 == pytest.approx(0.2)
+    assert weights[3].item() + weights[4].item() == pytest.approx(weights[5].item())
+    assert metrics["effective_fraction"] == pytest.approx(0.2)
+    assert metrics["branch_parents"] == 2
+
+
+def test_branch_strata_weights_cap_rare_branch_and_ignore_padding():
+    response_mask = torch.ones((6, 2), dtype=torch.float32)
+    response_mask[-1] = 0
+    weights, metrics = compute_branch_strata_loss_weights(
+        response_mask=response_mask,
+        branch_flags=np.asarray([False, False, False, False, True, None], dtype=object),
+        parent_ids=np.asarray(["a", "b", "c", "d", "a", None], dtype=object),
+        padding_mask=np.asarray([False, False, False, False, False, True]),
+        branch_fraction=0.4,
+    )
+
+    assert metrics["effective_fraction"] == pytest.approx(0.25)
+    assert weights[-1].item() == 0.0
+    assert weights.sum().item() == pytest.approx(6.0)
+    assert weights[4].item() <= 6.0 / 4.0
+
+
+def test_branch_strata_weights_no_branches_recover_canonical_mean():
+    response_mask = torch.ones((4, 2), dtype=torch.float32)
+    weights, metrics = compute_branch_strata_loss_weights(
+        response_mask=response_mask,
+        branch_flags=np.asarray([False] * 4, dtype=object),
+        parent_ids=np.asarray(["a", "b", "c", "d"], dtype=object),
+        padding_mask=np.zeros(4, dtype=bool),
+        branch_fraction=0.2,
+    )
+    assert torch.equal(weights, torch.ones(4))
+    assert metrics["effective_fraction"] == 0.0
+
+
+def test_branch_strata_zero_fraction_removes_branch_weight():
+    weights, metrics = compute_branch_strata_loss_weights(
+        response_mask=torch.ones((3, 2), dtype=torch.float32),
+        branch_flags=np.asarray([False, False, True], dtype=object),
+        parent_ids=np.asarray(["a", "b", "a"], dtype=object),
+        padding_mask=np.zeros(3, dtype=bool),
+        branch_fraction=0.0,
+    )
+
+    assert torch.equal(weights, torch.tensor([1.5, 1.5, 0.0]))
+    assert metrics["effective_fraction"] == 0.0
+    assert metrics["branch_weight_share"] == 0.0
+
+
+@pytest.mark.parametrize("malformed_flag", [1, "true", None])
+def test_branch_strata_weights_reject_malformed_active_flag(malformed_flag):
+    with pytest.raises(ValueError, match="non-boolean branch flag"):
+        compute_branch_strata_loss_weights(
+            response_mask=torch.ones((2, 2), dtype=torch.float32),
+            branch_flags=np.asarray([False, malformed_flag], dtype=object),
+            parent_ids=np.asarray(["a", "a"], dtype=object),
+            padding_mask=np.zeros(2, dtype=bool),
+            branch_fraction=0.2,
+        )
+
+
+def test_branch_strata_weights_reject_branch_without_divergence_tokens():
+    with pytest.raises(ValueError, match="positive divergence mask"):
+        compute_branch_strata_loss_weights(
+            response_mask=torch.tensor([[1, 1], [0, 0]], dtype=torch.float32),
+            branch_flags=np.asarray([False, True], dtype=object),
+            parent_ids=np.asarray(["a", "a"], dtype=object),
+            padding_mask=np.zeros(2, dtype=bool),
+            branch_fraction=0.2,
+        )
+
+
+@pytest.mark.parametrize("parent_ids", [["a", "b", "missing"], ["a", "a", "a"]])
+def test_branch_strata_weights_reject_missing_or_duplicate_parent(parent_ids):
+    response_mask = torch.ones((3, 2), dtype=torch.float32)
+    with pytest.raises(ValueError, match="exactly one active canonical"):
+        compute_branch_strata_loss_weights(
+            response_mask=response_mask,
+            branch_flags=np.asarray([False, False, True], dtype=object),
+            parent_ids=np.asarray(parent_ids, dtype=object),
+            padding_mask=np.zeros(3, dtype=bool),
+            branch_fraction=0.2,
+        )
+
+
+def test_gspo_branch_strata_weighted_loss_and_suffix_mask():
+    response_mask = torch.tensor([[1, 1, 1], [1, 1, 1], [0, 0, 1], [0, 0, 1]], dtype=torch.float32)
+    scalar_advantages = torch.tensor([1.0, 3.0, 5.0, 7.0]).unsqueeze(-1)
+    advantages = scalar_advantages.expand(-1, 3).clone()
+    advantages[2:, :2] = 1_000_000.0
+    weights = torch.tensor([1.6, 1.6, 0.4, 0.4])
+    is_branch = torch.tensor([False, False, True, True])
+    zeros = torch.zeros_like(advantages)
+
+    loss, metrics = compute_policy_loss_gspo(
+        old_log_prob=zeros,
+        log_prob=zeros,
+        advantages=advantages,
+        response_mask=response_mask,
+        config=_branch_strata_actor_config(),
+        branch_policy_loss_weight=weights,
+        branch_policy_loss_is_branch=is_branch,
+    )
+
+    assert loss.item() == pytest.approx(-2.8)
+    assert metrics["actor/pg_loss_canonical_unweighted"] == pytest.approx(-2.0)
+    assert metrics["actor/pg_loss_branch_unweighted"] == pytest.approx(-6.0)
+
+
+def test_gspo_branch_strata_dynamic_microbatch_accumulation_is_invariant():
+    response_mask = torch.tensor([[1, 1, 1], [1, 1, 1], [0, 0, 1], [0, 0, 1]], dtype=torch.float32)
+    advantages = torch.tensor([1.0, 3.0, 5.0, 7.0]).view(-1, 1).expand(-1, 3)
+    weights = torch.tensor([1.6, 1.6, 0.4, 0.4])
+    is_branch = torch.tensor([False, False, True, True])
+    zeros = torch.zeros_like(advantages)
+    config = _branch_strata_actor_config()
+
+    full, _ = compute_policy_loss_gspo(
+        old_log_prob=zeros,
+        log_prob=zeros,
+        advantages=advantages,
+        response_mask=response_mask,
+        config=config,
+        branch_policy_loss_weight=weights,
+        branch_policy_loss_is_branch=is_branch,
+    )
+    accumulated = full.new_zeros(())
+    for rows in (slice(0, 3), slice(3, 4)):
+        micro, _ = compute_policy_loss_gspo(
+            old_log_prob=zeros[rows],
+            log_prob=zeros[rows],
+            advantages=advantages[rows],
+            response_mask=response_mask[rows],
+            config=config,
+            branch_policy_loss_weight=weights[rows],
+            branch_policy_loss_is_branch=is_branch[rows],
+        )
+        accumulated += micro * (response_mask[rows].shape[0] / response_mask.shape[0])
+    assert accumulated.item() == pytest.approx(full.item())
 
 
 def test_compute_policy_loss_flow_grpo() -> None:

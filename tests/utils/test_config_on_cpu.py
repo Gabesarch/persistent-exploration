@@ -101,6 +101,23 @@ class TestConfigOnCPU(unittest.TestCase):
             self.assertEqual(cfg.algorithm.gdpo_final_std_floor, 0.05)
             self.assertEqual(cfg.algorithm.gdpo_final_adv_clip, 10.0)
 
+    def test_branch_strata_recipes_enable_guarded_gdpo_and_legacy_actor(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        branch_strata_configs = [
+            "gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_cropzoom_cpueff_hardonly_"
+            "answer_retry_branch_donly_llmjudge_forcedprefill_branchstrata.yaml",
+            "gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_cropzoom_debug256_cpueff_"
+            "answer_retry_branch_donly_llmjudge_forcedprefill_branchstrata.yaml",
+        ]
+        for config_name in branch_strata_configs:
+            cfg = OmegaConf.load(repo_root / "vero2_scripts" / "config" / config_name)
+            self.assertTrue(cfg.algorithm.gdpo_stability_enabled)
+            self.assertTrue(cfg.actor_rollout_ref.actor.policy_loss.branch_strata.enabled)
+            self.assertEqual(cfg.actor_rollout_ref.actor.policy_loss.branch_strata.branch_fraction, 0.2)
+            self.assertTrue(cfg.actor_rollout_ref.actor.policy_loss.branch_strata.cap_by_parent_prevalence)
+            self.assertTrue(cfg.actor_rollout_ref.actor.policy_loss.branch_strata.parent_balance)
+            self.assertEqual(cfg.trainer.use_legacy_worker_impl, "enable")
+
 
 class TestPrintCfgCommand(unittest.TestCase):
     """Test suite for the print_cfg.py command-line tool."""

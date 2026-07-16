@@ -463,6 +463,126 @@ def _validate_gdpo_stability_config(
     return component_std_floor, component_adv_clip, final_std_floor, final_adv_clip
 
 
+def compute_branch_strata_loss_weights(
+    response_mask: torch.Tensor,
+    branch_flags: np.ndarray,
+    parent_ids: np.ndarray,
+    padding_mask: np.ndarray,
+    branch_fraction: float,
+    cap_by_parent_prevalence: bool = True,
+    parent_balance: bool = True,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Build globally normalized row weights for canonical/branch loss strata."""
+    num_rows = int(response_mask.size(0))
+    if len(branch_flags) != num_rows or len(parent_ids) != num_rows or len(padding_mask) != num_rows:
+        raise ValueError(
+            "Branch-strata metadata must have one entry per response row: "
+            f"rows={num_rows}, branch_flags={len(branch_flags)}, parent_ids={len(parent_ids)}, "
+            f"padding_mask={len(padding_mask)}."
+        )
+    branch_fraction = float(branch_fraction)
+    if not 0.0 <= branch_fraction < 1.0:
+        raise ValueError(f"branch_fraction must satisfy 0 <= value < 1, got {branch_fraction!r}.")
+
+    active = response_mask.to(dtype=torch.bool).any(dim=-1).cpu().numpy()
+    padding = np.asarray(padding_mask, dtype=bool)
+    raw_flags = np.asarray(branch_flags, dtype=object)
+    parents = np.asarray(parent_ids, dtype=object)
+    branch = np.zeros(num_rows, dtype=bool)
+    for row in range(num_rows):
+        if padding[row]:
+            continue
+        flag = raw_flags[row]
+        if not isinstance(flag, bool | np.bool_):
+            raise ValueError(f"Non-padding branch-strata row {row} has non-boolean branch flag {flag!r}.")
+        if not active[row]:
+            row_kind = "branch" if bool(flag) else "canonical"
+            raise ValueError(
+                f"Non-padding {row_kind} row {row} has no active response tokens; "
+                "branch rows require a positive divergence mask."
+            )
+        branch[row] = bool(flag)
+
+    canonical = active & ~padding & ~branch
+    branch &= ~padding
+    canonical_rows = np.flatnonzero(canonical)
+    branch_rows = np.flatnonzero(branch)
+    if len(canonical_rows) == 0:
+        raise ValueError("Branch-stratified loss requires at least one active canonical row.")
+
+    canonical_by_parent: dict[Any, list[int]] = defaultdict(list)
+    for row in canonical_rows:
+        canonical_by_parent[parents[row]].append(int(row))
+
+    branches_by_parent: dict[Any, list[int]] = defaultdict(list)
+    for row in branch_rows:
+        parent = parents[row]
+        if parent is None or (isinstance(parent, str) and not parent.strip()):
+            raise ValueError(f"Active branch row {row} has an empty parent id.")
+        matches = canonical_by_parent.get(parent, [])
+        if len(matches) != 1:
+            raise ValueError(
+                f"Branch parent {parent!r} must match exactly one active canonical row; found {len(matches)}."
+            )
+        branches_by_parent[parent].append(int(row))
+
+    num_canonical = len(canonical_rows)
+    num_branch = len(branch_rows)
+    num_branch_parents = len(branches_by_parent)
+    effective_fraction = branch_fraction if num_branch else 0.0
+    parent_prevalence = num_branch_parents / num_canonical
+    if cap_by_parent_prevalence:
+        effective_fraction = min(effective_fraction, parent_prevalence)
+
+    weights = torch.zeros(num_rows, dtype=torch.float32, device=response_mask.device)
+    canonical_weight = (1.0 - effective_fraction) * num_rows / num_canonical
+    weights[torch.as_tensor(canonical_rows, dtype=torch.long, device=weights.device)] = canonical_weight
+
+    if num_branch:
+        branch_mass = effective_fraction * num_rows
+        if parent_balance:
+            mass_per_parent = branch_mass / num_branch_parents
+            for rows in branches_by_parent.values():
+                row_weight = mass_per_parent / len(rows)
+                weights[torch.as_tensor(rows, dtype=torch.long, device=weights.device)] = row_weight
+        else:
+            weights[torch.as_tensor(branch_rows, dtype=torch.long, device=weights.device)] = branch_mass / num_branch
+
+        if cap_by_parent_prevalence:
+            natural_row_scale = num_rows / num_canonical
+            max_branch_weight = float(
+                weights[torch.as_tensor(branch_rows, dtype=torch.long, device=weights.device)].max().item()
+            )
+            if max_branch_weight > natural_row_scale + 1e-6:
+                raise RuntimeError(
+                    "Branch prevalence capping invariant failed: individual branch weight "
+                    f"{max_branch_weight:.8g} exceeds expanded-batch/canonical scale {natural_row_scale:.8g}."
+                )
+
+    canonical_mass = float(weights[torch.as_tensor(canonical_rows, device=weights.device)].sum().item())
+    branch_mass = (
+        float(weights[torch.as_tensor(branch_rows, device=weights.device)].sum().item()) if num_branch else 0.0
+    )
+    active_weights = weights[torch.as_tensor(np.flatnonzero(active & ~padding), device=weights.device)]
+    branch_counts = [len(rows) for rows in branches_by_parent.values()]
+    return weights, {
+        "configured_fraction": branch_fraction,
+        "effective_fraction": effective_fraction,
+        "parent_prevalence": parent_prevalence,
+        "canonical_rows": float(num_canonical),
+        "branch_rows": float(num_branch),
+        "branch_parents": float(num_branch_parents),
+        "padding_rows": float(padding.sum()),
+        "canonical_weight_share": canonical_mass / num_rows,
+        "branch_weight_share": branch_mass / num_rows,
+        "parent_branch_count_mean": float(np.mean(branch_counts)) if branch_counts else 0.0,
+        "parent_branch_count_max": float(max(branch_counts)) if branch_counts else 0.0,
+        "row_weight_mean": float(active_weights.mean().item()) if active_weights.numel() else 0.0,
+        "row_weight_max": float(active_weights.max().item()) if active_weights.numel() else 0.0,
+        "weight_sum": float(weights.sum().item()),
+    }
+
+
 def _compute_stable_gdpo_component_scalars(
     scores: torch.Tensor,
     index: np.ndarray,
@@ -711,8 +831,8 @@ def compute_gdpo_outcome_advantage(
     stable_aggregate = None
     stable_component_totals = {"groups": 0, "low_variance_groups": 0, "target_rows": 0, "clipped_rows": 0}
     if stability_enabled:
-        component_std_floor, component_adv_clip, final_std_floor, final_adv_clip = (
-            _validate_gdpo_stability_config(config)
+        component_std_floor, component_adv_clip, final_std_floor, final_adv_clip = _validate_gdpo_stability_config(
+            config
         )
         stable_aggregate = torch.zeros(response_mask.size(0), dtype=torch.float32, device=response_mask.device)
 
@@ -764,9 +884,9 @@ def compute_gdpo_outcome_advantage(
                 diagnostics[f"gdpo/stability/{metric_name}/low_variance_group_rate"] = component_stats[
                     "low_variance_groups"
                 ] / max(component_stats["groups"], 1)
-                diagnostics[f"gdpo/stability/{metric_name}/clipped_row_rate"] = component_stats[
-                    "clipped_rows"
-                ] / max(component_stats["target_rows"], 1)
+                diagnostics[f"gdpo/stability/{metric_name}/clipped_row_rate"] = component_stats["clipped_rows"] / max(
+                    component_stats["target_rows"], 1
+                )
             continue
 
         normalized_score = _compute_gdpo_component_advantage(
@@ -798,9 +918,9 @@ def compute_gdpo_outcome_advantage(
             diagnostics["gdpo/stability/component_low_variance_group_rate"] = stable_component_totals[
                 "low_variance_groups"
             ] / max(stable_component_totals["groups"], 1)
-            diagnostics["gdpo/stability/component_clipped_row_rate"] = stable_component_totals[
-                "clipped_rows"
-            ] / max(stable_component_totals["target_rows"], 1)
+            diagnostics["gdpo/stability/component_clipped_row_rate"] = stable_component_totals["clipped_rows"] / max(
+                stable_component_totals["target_rows"], 1
+            )
             diagnostics.update({f"gdpo/stability/{key}": value for key, value in final_stats.items()})
         return advantages, advantages
 
@@ -1889,6 +2009,8 @@ def compute_policy_loss_gspo(
     loss_agg_mode: str = "seq-mean-token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    branch_policy_loss_weight: torch.Tensor | None = None,
+    branch_policy_loss_is_branch: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for GSPO.
@@ -1938,10 +2060,37 @@ def compute_policy_loss_gspo(
     if rollout_is_weights is not None:
         pg_losses = pg_losses * rollout_is_weights
 
-    # for GSPO, we need to aggregate the loss at the sequence level (seq-mean-token-mean)
-    pg_loss = agg_loss(
-        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode="seq-mean-token-mean", **config.global_batch_info
-    )
+    branch_strata_enabled = bool(config.policy_loss.branch_strata.enabled)
+    if branch_strata_enabled:
+        if branch_policy_loss_weight is None or branch_policy_loss_is_branch is None:
+            raise ValueError("Enabled branch-stratified GSPO requires row weights and branch indicators.")
+        if branch_policy_loss_weight.ndim != 1 or branch_policy_loss_weight.shape[0] != pg_losses.shape[0]:
+            raise ValueError(
+                "branch_policy_loss_weight must have shape [batch_size], got "
+                f"{tuple(branch_policy_loss_weight.shape)} for batch size {pg_losses.shape[0]}."
+            )
+        token_counts = response_mask.sum(dim=-1)
+        active_rows = token_counts > 0
+        sequence_losses = (pg_losses * response_mask).sum(dim=-1) / token_counts.clamp_min(1)
+        row_weights = branch_policy_loss_weight.to(device=sequence_losses.device, dtype=sequence_losses.dtype)
+        pg_loss = (sequence_losses * row_weights * active_rows).sum() / max(int(pg_losses.shape[0]), 1)
+
+        is_branch = branch_policy_loss_is_branch.to(device=sequence_losses.device, dtype=torch.bool) & active_rows
+        is_canonical = ~is_branch & active_rows
+        canonical_diagnostic = (
+            sequence_losses[is_canonical].mean() if is_canonical.any() else sequence_losses.new_zeros(())
+        )
+        branch_diagnostic = sequence_losses[is_branch].mean() if is_branch.any() else sequence_losses.new_zeros(())
+    else:
+        # for GSPO, we need to aggregate the loss at the sequence level (seq-mean-token-mean)
+        pg_loss = agg_loss(
+            loss_mat=pg_losses,
+            loss_mask=response_mask,
+            loss_agg_mode="seq-mean-token-mean",
+            **config.global_batch_info,
+        )
+        canonical_diagnostic = pg_loss.detach()
+        branch_diagnostic = pg_loss.new_zeros(())
 
     # For compatibility, return zero for pg_clipfrac_lower (not used in standard GSPO)
     pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
@@ -1952,6 +2101,8 @@ def compute_policy_loss_gspo(
         "actor/pg_clipfrac": pg_clipfrac.detach().item(),
         "actor/ppo_kl": ppo_kl.detach().item(),
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+        "actor/pg_loss_canonical_unweighted": canonical_diagnostic.detach().item(),
+        "actor/pg_loss_branch_unweighted": branch_diagnostic.detach().item(),
     }
     return pg_loss, pg_metrics
 

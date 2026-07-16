@@ -18,9 +18,11 @@ import unittest
 from verl.utils.config import omega_conf_to_dataclass
 from verl.workers.config import (
     ActorConfig,
+    BranchLossStrataConfig,
     FSDPActorConfig,
     McoreActorConfig,
     OptimizerConfig,
+    PolicyLossConfig,
 )
 
 
@@ -213,6 +215,28 @@ class TestActorConfig(unittest.TestCase):
             rollout_n=1,
         )
         self.assertIsNotNone(config)  # Should not raise an exception
+
+    def test_branch_strata_config_validation(self):
+        with self.assertRaisesRegex(ValueError, "0 <= value < 1"):
+            BranchLossStrataConfig(branch_fraction=1.0)
+
+        with self.assertRaisesRegex(ValueError, "loss_mode='gspo'"):
+            ActorConfig(
+                strategy="fsdp",
+                rollout_n=1,
+                use_dynamic_bsz=True,
+                loss_agg_mode="seq-mean-token-mean",
+                policy_loss=PolicyLossConfig(branch_strata=BranchLossStrataConfig(enabled=True)),
+            )
+
+        with self.assertRaisesRegex(ValueError, "loss_agg_mode='seq-mean-token-mean'"):
+            ActorConfig(
+                strategy="fsdp",
+                rollout_n=1,
+                use_dynamic_bsz=True,
+                loss_agg_mode="token-mean",
+                policy_loss=PolicyLossConfig(loss_mode="gspo", branch_strata=BranchLossStrataConfig(enabled=True)),
+            )
 
     def test_fsdp_actor_config_validation_exceptions(self):
         """Test that FSDPActorConfig.validate() raises appropriate validation exceptions."""

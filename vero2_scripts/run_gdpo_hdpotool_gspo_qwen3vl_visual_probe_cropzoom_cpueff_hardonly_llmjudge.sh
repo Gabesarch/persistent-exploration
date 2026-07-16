@@ -102,39 +102,7 @@ if [ "$ENGINE" != "vllm" ]; then
   HYDRA_ARGS=("actor_rollout_ref.rollout.name=$ENGINE" "${HYDRA_ARGS[@]}")
 fi
 
-has_hydra_override() {
-  local key="$1"
-  local arg
-  for arg in "${HYDRA_ARGS[@]}"; do
-    if [[ "$arg" == "$key="* || "$arg" == "+$key="* || "$arg" == "++$key="* ]]; then
-      return 0
-    fi
-  done
-  return 1
-}
-
-add_default_hydra_override() {
-  local key="$1"
-  local value="$2"
-  if ! has_hydra_override "$key"; then
-    HYDRA_ARGS+=("+$key=$value")
-  fi
-}
-
-# Match the LLM-judge accuracy grading used by the answer-retry/forced-prefill run,
-# without enabling answer retry or forced prefills in this hard-only run.
-add_default_hydra_override "actor_rollout_ref.rollout.multi_turn.llm_judge_enabled" "true"
-add_default_hydra_override "actor_rollout_ref.rollout.multi_turn.llm_judge_prompt_path" '${oc.env:VERL_ROOT}/vero2_scripts/prompts/llm_judge_visual_search_prompt.txt'
-add_default_hydra_override "actor_rollout_ref.rollout.multi_turn.llm_judge_reward_types" "[search]"
-add_default_hydra_override "actor_rollout_ref.rollout.multi_turn.llm_judge_assistant_prefill" '"{"'
-add_default_hydra_override "actor_rollout_ref.rollout.multi_turn.llm_judge_max_tokens" "48"
-add_default_hydra_override "actor_rollout_ref.rollout.multi_turn.llm_judge_temperature" "0.0"
-add_default_hydra_override "actor_rollout_ref.rollout.multi_turn.llm_judge_top_p" "1.0"
-add_default_hydra_override "actor_rollout_ref.rollout.multi_turn.llm_judge_partial_credit_score" "0.5"
-add_default_hydra_override "actor_rollout_ref.rollout.multi_turn.llm_judge_timeout_s" "null"
-add_default_hydra_override "actor_rollout_ref.rollout.multi_turn.llm_judge_fallback_to_string_reward" "true"
-
-CONFIG_NAME="gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_cropzoom_cpueff_hardonly"
+CONFIG_NAME="${CONFIG_NAME:-gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_cropzoom_cpueff_hardonly_llmjudge}"
 
 echo "CONFIG_NAME=$CONFIG_NAME"
 echo "TRAINER_PROJECT_NAME=$TRAINER_PROJECT_NAME"
@@ -142,9 +110,6 @@ echo "TRAINER_EXPERIMENT_NAME=$TRAINER_EXPERIMENT_NAME"
 echo "CHECKPOINT_EXPERIMENT_NAME=$CHECKPOINT_EXPERIMENT_NAME"
 echo "TRAINER_DEFAULT_LOCAL_DIR=$TRAINER_DEFAULT_LOCAL_DIR"
 echo "LEGACY_CHECKPOINT_DIR_LINKED=$LEGACY_CHECKPOINT_DIR_LINKED"
-echo "LLM_JUDGE_PROMPT=${VERL_ROOT}/vero2_scripts/prompts/llm_judge_visual_search_prompt.txt"
-echo "LLM_JUDGE_ASSISTANT_PREFILL={"
-echo "LLM_JUDGE_MAX_TOKENS=48"
 printf 'HYDRA_ARGS:'; printf ' %q' "${HYDRA_ARGS[@]}"; printf '\n'
 
 python3 -m verl.trainer.main_ppo \

@@ -33,6 +33,7 @@ from .model import HFModelConfig
 from .optimizer import OptimizerConfig
 
 __all__ = [
+    "BranchLossStrataConfig",
     "PolicyLossConfig",
     "RouterReplayConfig",
     "ActorConfig",
@@ -75,6 +76,28 @@ class RouterReplayConfig(BaseConfig):
 
 
 @dataclass
+class BranchLossStrataConfig(BaseConfig):
+    """Configuration for parent-balanced canonical/branch policy-loss strata."""
+
+    enabled: bool = False
+    branch_fraction: float = 0.2
+    cap_by_parent_prevalence: bool = True
+    parent_balance: bool = True
+    branch_indicator_key: str = "is_conditional_answer_retry_branch"
+    parent_id_key: str = "request_id"
+
+    def __post_init__(self):
+        if not 0.0 <= float(self.branch_fraction) < 1.0:
+            raise ValueError(
+                f"policy_loss.branch_strata.branch_fraction must satisfy 0 <= value < 1, got {self.branch_fraction!r}."
+            )
+        if not str(self.branch_indicator_key).strip():
+            raise ValueError("policy_loss.branch_strata.branch_indicator_key must be nonempty.")
+        if not str(self.parent_id_key).strip():
+            raise ValueError("policy_loss.branch_strata.parent_id_key must be nonempty.")
+
+
+@dataclass
 class PolicyLossConfig(BaseConfig):
     """Configuration for policy loss computation.
 
@@ -97,6 +120,7 @@ class PolicyLossConfig(BaseConfig):
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
     rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
+    branch_strata: BranchLossStrataConfig = field(default_factory=BranchLossStrataConfig)
 
 
 @dataclass
@@ -216,6 +240,11 @@ class ActorConfig(BaseConfig):
         ]
         if self.loss_agg_mode not in valid_loss_agg_modes:
             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
+        if self.policy_loss.branch_strata.enabled:
+            if self.policy_loss.loss_mode != "gspo":
+                raise ValueError("policy_loss.branch_strata.enabled requires policy_loss.loss_mode='gspo'.")
+            if self.loss_agg_mode != "seq-mean-token-mean":
+                raise ValueError("policy_loss.branch_strata.enabled requires loss_agg_mode='seq-mean-token-mean'.")
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""

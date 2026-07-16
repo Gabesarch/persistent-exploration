@@ -597,6 +597,12 @@ class DataParallelPPOActor(BasePPOActor):
         # Include rollout_log_probs for computing rollout_corr metrics in bypass mode
         if "rollout_log_probs" in data.batch.keys():
             select_keys.append("rollout_log_probs")
+        branch_strata_enabled = bool(self.config.policy_loss.branch_strata.enabled)
+        if branch_strata_enabled:
+            for key in ("branch_policy_loss_weight", "branch_policy_loss_is_branch"):
+                if key not in data.batch.keys():
+                    raise ValueError(f"Enabled branch-stratified policy loss requires tensor batch key {key!r}.")
+                select_keys.append(key)
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = []
@@ -683,7 +689,16 @@ class DataParallelPPOActor(BasePPOActor):
                     # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
 
+                    branch_policy_loss_weight = model_inputs.get("branch_policy_loss_weight", None)
+                    branch_policy_loss_is_branch = model_inputs.get("branch_policy_loss_is_branch", None)
+
                     # Compute policy loss (any function is expected to return 2 values)
+                    policy_loss_kwargs = {}
+                    if branch_strata_enabled:
+                        policy_loss_kwargs.update(
+                            branch_policy_loss_weight=branch_policy_loss_weight,
+                            branch_policy_loss_is_branch=branch_policy_loss_is_branch,
+                        )
                     pg_loss, pg_metrics = policy_loss_fn(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,
@@ -692,6 +707,7 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_agg_mode=loss_agg_mode,
                         config=self.config,
                         rollout_is_weights=rollout_is_weights,
+                        **policy_loss_kwargs,
                     )
                     micro_batch_metrics.update(pg_metrics)
 

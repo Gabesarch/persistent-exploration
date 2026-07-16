@@ -82,12 +82,12 @@ from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.lazy_multi_modal import lazy_multi_modal_inputs_enabled
 from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
-from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.response_display import (
     apply_response_display_prefix,
     apply_response_display_prefixes,
     get_response_display_prefix,
 )
+from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
@@ -344,9 +344,61 @@ class RayPPOTrainer:
 
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
+        self._validate_branch_strata_config()
         self._validate_lazy_multi_modal_inputs_config()
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+    def _branch_strata_config(self):
+        policy_loss = self.config.actor_rollout_ref.actor.get("policy_loss", {})
+        return policy_loss.get("branch_strata", {})
+
+    def _validate_branch_strata_config(self) -> None:
+        strata = self._branch_strata_config()
+        if not strata or not bool(strata.get("enabled", False)):
+            return
+        if self.use_legacy_worker_impl == "disable":
+            raise ValueError(
+                "policy_loss.branch_strata currently requires trainer.use_legacy_worker_impl != 'disable'."
+            )
+        if self.config.actor_rollout_ref.actor.policy_loss.loss_mode != "gspo":
+            raise ValueError("policy_loss.branch_strata requires policy_loss.loss_mode='gspo'.")
+        if self.config.actor_rollout_ref.actor.loss_agg_mode != "seq-mean-token-mean":
+            raise ValueError("policy_loss.branch_strata requires loss_agg_mode='seq-mean-token-mean'.")
+
+    def _attach_branch_strata_loss_weights(self, batch: DataProto, metrics: dict) -> None:
+        strata = self._branch_strata_config()
+        if not strata or not bool(strata.get("enabled", False)):
+            return
+        branch_key = str(strata.get("branch_indicator_key", "is_conditional_answer_retry_branch"))
+        parent_key = str(strata.get("parent_id_key", "request_id"))
+        if branch_key not in batch.non_tensor_batch:
+            raise ValueError(f"Branch-stratified loss requires non-tensor batch key {branch_key!r}.")
+        if parent_key not in batch.non_tensor_batch:
+            raise ValueError(f"Branch-stratified loss requires non-tensor batch key {parent_key!r}.")
+        padding_mask = np.asarray(
+            batch.non_tensor_batch.get("__branch_padding_row", np.zeros(len(batch), dtype=bool)), dtype=bool
+        )
+        weights, diagnostics = core_algos.compute_branch_strata_loss_weights(
+            response_mask=batch.batch["response_mask"],
+            branch_flags=np.asarray(batch.non_tensor_batch[branch_key], dtype=object),
+            parent_ids=np.asarray(batch.non_tensor_batch[parent_key], dtype=object),
+            padding_mask=padding_mask,
+            branch_fraction=float(strata.get("branch_fraction", 0.2)),
+            cap_by_parent_prevalence=bool(strata.get("cap_by_parent_prevalence", True)),
+            parent_balance=bool(strata.get("parent_balance", True)),
+        )
+        batch.batch["branch_policy_loss_weight"] = weights
+        branch_flags = np.asarray(batch.non_tensor_batch[branch_key], dtype=object)
+        is_branch = torch.tensor(
+            [bool(flag) if isinstance(flag, bool | np.bool_) else False for flag in branch_flags],
+            dtype=torch.bool,
+            device=weights.device,
+        )
+        is_branch[torch.as_tensor(padding_mask, dtype=torch.bool, device=weights.device)] = False
+        batch.batch["branch_policy_loss_is_branch"] = is_branch
+        for name, value in diagnostics.items():
+            metrics[f"branch_strata/{name}"] = value
 
     def _gpu_memory_context(self, batch: DataProto | None = None, extra: Mapping[str, Any] | None = None) -> dict:
         context = {}
@@ -696,9 +748,7 @@ class RayPPOTrainer:
             )
             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
-            image_paths = self._collect_image_references(
-                [item.non_tensor_batch.get("extra_info") for item in batch]
-            )
+            image_paths = self._collect_image_references([item.non_tensor_batch.get("extra_info") for item in batch])
 
             reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
             if "request_id" in batch.non_tensor_batch:
@@ -792,9 +842,7 @@ class RayPPOTrainer:
             values_list = [values]
 
         if len(values_list) != expected_len:
-            raise ValueError(
-                f"{key}: len(values)={len(values_list)}, expected_len={expected_len}"
-            )
+            raise ValueError(f"{key}: len(values)={len(values_list)}, expected_len={expected_len}")
         return values_list
 
     @classmethod
@@ -810,9 +858,7 @@ class RayPPOTrainer:
             if key == "reward":
                 continue
             if len(values) != current_size:
-                raise ValueError(
-                    f"{key}: len(accumulated_values)={len(values)}, expected_len={current_size}"
-                )
+                raise ValueError(f"{key}: len(accumulated_values)={len(values)}, expected_len={current_size}")
 
         for key, values in list(reward_extra_infos_dict.items()):
             if key != "reward" and key not in reward_extra_info:
@@ -836,9 +882,7 @@ class RayPPOTrainer:
         for key in keys:
             values = list(reward_extra_infos_dict.get(key, []))
             if values and len(values) != sample_count:
-                raise ValueError(
-                    f"{key}: len(values)={len(values)}, expected_len={sample_count}"
-                )
+                raise ValueError(f"{key}: len(values)={len(values)}, expected_len={sample_count}")
             padded[key] = values if values else [None] * sample_count
         return padded
 
@@ -907,7 +951,9 @@ class RayPPOTrainer:
                 branch_count = 0
                 branch_flags = test_output_gen_batch.non_tensor_batch.get("is_conditional_answer_retry_branch")
                 if branch_flags is not None:
-                    branch_count = int(np.sum(np.asarray(branch_flags, dtype=object) == True))
+                    branch_count = sum(
+                        flag is True or isinstance(flag, np.bool_) and bool(flag) for flag in branch_flags
+                    )
                 raise RuntimeError(
                     "Validation rollout returned a different row count than the validation batch "
                     f"({len(test_output_gen_batch)} vs {len(test_batch)}). "
@@ -1788,9 +1834,7 @@ class RayPPOTrainer:
                 gen_batch_output = gen_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
-                gen_batch_output.non_tensor_batch["__rollout_row_id"] = np.arange(
-                    len(gen_batch_output), dtype=np.int64
-                )
+                gen_batch_output.non_tensor_batch["__rollout_row_id"] = np.arange(len(gen_batch_output), dtype=np.int64)
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
@@ -1854,6 +1898,7 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+                    self._attach_branch_strata_loss_weights(batch, metrics)
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -2031,9 +2076,7 @@ class RayPPOTrainer:
                         # 3. The current step number is a multiple of the save frequency.
                         # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
                         if self.config.trainer.save_freq > 0 and (
-                            is_last_step
-                            or self.global_steps % self.config.trainer.save_freq == 0
-                            or esi_force_save
+                            is_last_step or self.global_steps % self.config.trainer.save_freq == 0 or esi_force_save
                         ):
                             if esi_force_save:
                                 print("Force saving checkpoint: ESI instance expiration approaching.")
