@@ -243,6 +243,9 @@ actor_rollout_ref:
     dtype: bfloat16
     engine_kwargs:
       vllm:
+        attention_config:
+          backend: FLASH_ATTN
+          flash_attn_version: 2
         mm_processor_cache_gb: 0
     gpu_memory_utilization: 0.6
     enable_prefix_caching: false
