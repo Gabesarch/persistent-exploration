@@ -1,13 +1,14 @@
 # Training-faithful Vero DRAWING variant of countqa — mirrors countqa_reasoning_zoom.
 #
 # Vero RL drawing checkpoint + draw_points-only toolset (the exact training toolset:
-# ../_tool_templates/_vero/_toolset_draw_vero_yaml) + training sampling (0.7 / 1.0 / -1)
+# ../_tool_templates/_vero/_toolset_draw_vero_yaml) + the unified pair sampling standard
+# (0.7 / 0.8 / 20 — matched and native for both pair sides, per visual_probe_hard_*_zoom)
 # + per-turn generation cap 4096 = training's max_assistant_response_length (also prevents
 # 32k-context overflow on CountQA's 10 MP images — max_new_tokens 16384 silently drops requests).
 #
-# Content-identical to the ad-hoc "countqa_drawing_vero_cap4k" task used for the July 2026
-# learning curves (base 0.260 under matched-template serving; pilot & dponly curves) — scores
-# remain directly comparable. Run with MODEL=vero TOOLS=on.
+# Lineage: derived from the ad-hoc "countqa_drawing_vero_cap4k" task behind the July 2026
+# curves, but the sampling changed 2026-07-16 (was training-val 0.7/1.0/-1) — scores from here
+# start a NEW comparable series; do not mix with the July numbers. Run with MODEL=vero TOOLS=on.
 include:
 - countqa.yaml
 - ../_tool_templates/_vero/_toolset_draw_vero_yaml
@@ -18,8 +19,8 @@ task: "countqa_reasoning_drawing"
 generation_kwargs:
   max_new_tokens: 4096
   temperature: 0.7
-  top_p: 1.0
-  top_k: -1
+  top_p: 0.8
+  top_k: 20
   do_sample: true
 lmms_eval_specific_kwargs:
   default:

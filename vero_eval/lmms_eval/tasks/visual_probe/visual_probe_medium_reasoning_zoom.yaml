@@ -24,8 +24,8 @@ generation_kwargs:
   # generation_config defaults (top_k=20, top_p=0.8), which diverges from training.
   max_new_tokens: 16384
   temperature: 0.7
-  top_p: 1.0
-  top_k: -1
+  top_p: 0.8
+  top_k: 20
   do_sample: True
 lmms_eval_specific_kwargs:
   default:

@@ -54,8 +54,12 @@ The drawing counterpart of the zoom quickstart above, with the same MODEL→task
 
 | MODEL | task | serving |
 |---|---|---|
-| `vero` | `countqa_reasoning_drawing` | training-faithful: draw_points-only toolset, forced-think template from the checkpoint, sampling 0.7/1.0/-1, per-turn cap 4096 |
-| `qwen3vl` | `countqa_qwen3_drawing` | base-native: instruct draw toolset, generation_config sampling 0.7/0.8/20 (the c42abfe base-eval convention), cap 4096 |
+| `vero` | `countqa_reasoning_drawing` | training-faithful toolset (draw_points-only) + forced-think template from the checkpoint, per-turn cap 4096 |
+| `qwen3vl` | `countqa_qwen3_drawing` | base-native: instruct draw toolset, cap 4096 |
+
+Both sides use the repo-wide **unified sampling standard 0.7 / 0.8 / 20** (the base
+generation_config defaults, inherited by RL checkpoints — matched AND native for both;
+same as the `visual_probe_hard_*_zoom` pair).
 
 Metric = `exact_match` (integer count) — **no judge, 1 GPU**, ~35 min at `LIMIT=400`.
 
@@ -82,11 +86,10 @@ Safeguards baked into the runner (each cost a wasted eval to learn):
 - `LIMIT=400` = the first 400 of 1528 flattened QA (deterministic subset; unset for full).
 
 Results: `vero_eval/results/cqa_drawing/<label>_<jobid>/**/*results*.json` →
-`results.<task>."exact_match,none"`. Baseline note: the July 2026 curves used the
-*matched-template* method (base served under the checkpoint template on the shared task;
-base = **0.260**, n=400) — `countqa_reasoning_drawing` scores stay comparable to those
-curves, but the native `countqa_qwen3_drawing` baseline is a different method: re-measure
-it rather than comparing against 0.260.
+`results.<task>."exact_match,none"`. ⚠️ Series note: the July 2026 curves (base = 0.260,
+n=400) were measured under the pre-unification method (matched-template base, sampling
+0.7/1.0/-1). After the 2026-07-16 sampling unification, new numbers start a fresh
+comparable series — re-measure the base with `MODEL=qwen3vl` and don't mix the two series.
 
 ---
 
