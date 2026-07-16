@@ -322,7 +322,42 @@ actor_rollout_ref:
       tokenization_sanity_check_mode: strict
       format: hermes
       num_repeat_rollouts: null
+      force_tool_calls_until_final_turn: false
+      force_answer_on_final_turn: false
+      final_answer_token_margin: 2048
+      force_final_answer_think_prefill: ''
+      tool_response_turn_suffix_enabled: false
+      tool_response_explore_turns: 10
+      tool_response_explore_suffix: Even if you are confident in your answer, please
+        explore more by outputting a zoom tool call in the next turn. You are encouraged
+        to use depth first search (zooming deeper into previously explored regions)
+        and breadth first search (zooming into image regions not yet examined), and
+        are discouraged from similarly repeating previous zoom explorations.
+      tool_response_final_suffix: The maximum amount of tool calling has been reached.
+        Please output a final answer in the next turn.
+      conditional_answer_retry_enabled: false
+      conditional_answer_retry_force_next_tool_call: true
+      conditional_answer_retry_suffix: 'You have not gathered enough information yet.
+        In your next turn, keep exploring rather than answering prematurely: use more
+        tool calls to broaden the search, test alternative hypotheses, look for disconfirming
+        evidence, and dig deeper into the most likely explanations. Finalize only
+        when the evidence clearly supports a conclusion.'
+      conditional_answer_retry_assistant_prefill: ''
+      conditional_answer_retry_correct_accuracy_threshold: 0.0
+      conditional_answer_retry_max_retries: null
+      conditional_answer_retry_branch_enabled: false
+      conditional_answer_retry_branch_enable_validation: false
+      conditional_answer_retry_branch_mask_mode: divergence_only
+      conditional_answer_retry_branch_reward_components: {}
+      conditional_answer_retry_branch_use_graded_rewards: false
+      conditional_answer_retry_branch_baseline_weight_key: gdpo_baseline_weight
     calculate_log_probs: false
+    lazy_multi_modal_inputs:
+      _target_: verl.workers.config.LazyMultiModalInputsConfig
+      enabled: false
+      assert_metadata_match: true
+      crop_cache_root: null
+      cleanup_crop_cache: true
     agent:
       _target_: verl.workers.config.AgentLoopConfig
       num_workers: 8
@@ -475,7 +510,13 @@ data:
   filter_overlong_prompts_workers: 1
   truncation: error
   image_key: images
+  image_root: null
+  max_pixels: null
   video_key: videos
+  system_prompt: null
+  add_fixation_post_prompt: false
+  normalize_bbox_to_1000: false
+  per_batch_domain_weights: null
   trust_remote_code: false
   custom_cls:
     path: null
@@ -779,6 +820,12 @@ algorithm:
   lam: 1.0
   adv_estimator: gae
   norm_adv_by_std_in_grpo: true
+  gdpo_baseline_weight_key: null
+  gdpo_stability_enabled: false
+  gdpo_component_std_floor: 0.05
+  gdpo_component_adv_clip: 5.0
+  gdpo_final_std_floor: 0.05
+  gdpo_final_adv_clip: 10.0
   use_kl_in_reward: false
   kl_penalty: kl
   kl_ctrl:
@@ -850,6 +897,21 @@ trainer:
   log_val_generations: 0
   rollout_data_dir: null
   validation_data_dir: null
+  save_validation_crops: false
+  comprehensive_debug_logging:
+    enabled: false
+    dir: ${trainer.default_local_dir}/debug_logs
+    log_every_n_steps: 1
+    save_cropped_images: true
+    save_source_images: false
+    max_text_chars: null
+    gpu_memory_logging:
+      enabled: false
+      sync_cuda: false
+      reset_peak_stats: true
+      log_driver_stages: true
+      log_worker_stages: true
+      log_nvidia_smi: true
   nnodes: 1
   n_gpus_per_node: 8
   save_freq: -1

@@ -9,10 +9,15 @@ hydra:
 algorithm:
   adv_estimator: gdpo
   # Conditional retry changes tool-call counts only after incorrect answers, so
-  # use task/format rewards plus an explicit repeat-overlap penalty.
+  # use task/format rewards plus a composite crop-quality penalty.
   gdpo_reward_keys: [accuracy, format, tool_repeat_overlap]
   gdpo_reward_weights: [0.9, 0.1, 0.3]
   gdpo_baseline_weight_key: gdpo_baseline_weight
+  gdpo_stability_enabled: true
+  gdpo_component_std_floor: 0.05
+  gdpo_component_adv_clip: 5.0
+  gdpo_final_std_floor: 0.05
+  gdpo_final_adv_clip: 10.0
   use_kl_in_reward: false
   kl_ctrl:
     kl_coef: 0
@@ -316,8 +321,12 @@ reward:
       tool_efficiency_concave_k: 10.0
       tool_efficiency_concave_q: 0.95
       tool_repeat_overlap_iou_threshold: 0.9
-      tool_repeat_overlap_penalty_per_repeat: -0.5
-      tool_repeat_overlap_max_penalty: -1.0
+      tool_repeat_overlap_small_crop_area_threshold: 0.0002
+      tool_repeat_overlap_repeat_weight: 1.0
+      tool_repeat_overlap_small_crop_weight: 0.5
+      tool_repeat_overlap_free_depth_refinements: 2
+      tool_repeat_overlap_depth_containment_threshold: 0.95
+      tool_repeat_overlap_excess_depth_weight: 0.5
       allow_unboxed_answer_for_accuracy: true
       require_boxed_answer_for_full_format: true
       unboxed_answer_format_score: 0.5

@@ -265,6 +265,10 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
 
+    gdpo_stability_metrics = batch.meta_info.get("gdpo_stability_metrics", None)
+    if gdpo_stability_metrics:
+        metrics.update(gdpo_stability_metrics)
+
     return metrics
 
 

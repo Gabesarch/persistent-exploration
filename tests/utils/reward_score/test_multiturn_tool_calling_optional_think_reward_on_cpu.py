@@ -8,7 +8,15 @@ from verl.utils.reward_score.math_verify_reward_type_multiturn_tool_calling_opti
     compute_score_from_data_source,
     extract_answer_for_accuracy,
     format_reward,
+    tool_repeat_overlap_reward,
 )
+
+
+def zoom_call(bbox, img_idx=0):
+    return {
+        "name": "image_zoom_in_tool",
+        "arguments": {"bbox_2d": bbox, "label": "region", "img_idx": img_idx},
+    }
 
 
 def test_mandatory_think_accepts_think_wrapped_answer():
@@ -69,7 +77,9 @@ def test_mandatory_think_accepts_decoded_role_markers_around_tool_response():
     solution = """
 <think>I need to zoom into the jersey painting.</think>
 <tool_call>
-{"name": "image_zoom_in_tool", "arguments": {"bbox_2d": [751, 187, 924, 298], "label": "painting of a baseball jersey", "img_idx": 0}}
+{"name": "image_zoom_in_tool", "arguments": {
+  "bbox_2d": [751, 187, 924, 298], "label": "painting of a baseball jersey", "img_idx": 0
+}}
 </tool_call>user
 <tool_response>
 Zoomed in on the image to the region [751, 187, 924, 298] with label painting of a baseball jersey.
@@ -309,7 +319,9 @@ def test_shared_answer_extraction_uses_unboxed_content_for_judge_prediction():
 
 
 def test_shared_answer_extraction_uses_boxed_payload_for_judge_prediction():
-    result = extract_answer_for_accuracy("The sign says \\boxed{GRAND}.", "search", allow_unboxed_answer_for_accuracy=True)
+    result = extract_answer_for_accuracy(
+        "The sign says \\boxed{GRAND}.", "search", allow_unboxed_answer_for_accuracy=True
+    )
 
     assert result.prediction == "GRAND"
     assert result.has_boxed is True
@@ -466,7 +478,7 @@ def test_tool_repeat_overlap_penalizes_same_img_idx_high_iou_repeat():
     assert result["tool_repeat_overlap"] == pytest.approx(-0.5)
 
 
-def test_tool_repeat_overlap_clamps_multiple_same_img_idx_repeats():
+def test_tool_repeat_overlap_normalizes_multiple_same_img_idx_repeats():
     solution = """
 <think>Zoom into the legend.</think>
 <tool_call>
@@ -497,7 +509,7 @@ def test_tool_repeat_overlap_clamps_multiple_same_img_idx_repeats():
 
     assert result["format"] == 1.0
     assert result["tool_call_count"] == 3
-    assert result["tool_repeat_overlap"] == pytest.approx(-1.0)
+    assert result["tool_repeat_overlap"] == pytest.approx(-2.0 / 3.0)
 
 
 def test_tool_repeat_overlap_ignores_high_iou_across_different_img_idx():
@@ -527,6 +539,151 @@ def test_tool_repeat_overlap_ignores_high_iou_across_different_img_idx():
     assert result["format"] == 1.0
     assert result["tool_call_count"] == 2
     assert result["tool_repeat_overlap"] == 0.0
+
+
+def test_tool_repeat_overlap_has_no_early_saturation():
+    calls = [zoom_call([100 + offset, 100 + offset, 400 - offset, 400 - offset]) for offset in range(5)]
+
+    assert tool_repeat_overlap_reward(calls) == pytest.approx(-4.0 / 5.0)
+
+
+def test_tool_repeat_overlap_accepts_legacy_penalty_kwargs_without_using_old_clamp():
+    calls = [zoom_call([100 + offset, 100 + offset, 400 - offset, 400 - offset]) for offset in range(3)]
+
+    result = tool_repeat_overlap_reward(calls, penalty_per_repeat=-10.0, max_penalty=-0.1)
+
+    assert result == pytest.approx(-2.0 / 3.0)
+
+
+@pytest.mark.parametrize(
+    ("bbox", "expected"),
+    [
+        ([0, 0, 19.9, 10], -0.5),  # Just below 200 / 1,000,000.
+        ([0, 0, 20, 10], 0.0),  # The threshold is strict.
+        ([0, 0, 20.1, 10], 0.0),
+    ],
+)
+def test_tool_repeat_overlap_small_crop_threshold(bbox, expected):
+    assert tool_repeat_overlap_reward([zoom_call(bbox)]) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        zoom_call([0, 0, 10]),
+        zoom_call([0, 0, float("nan"), 10]),
+        zoom_call([10, 0, 0, 10]),
+        zoom_call([0, 0, 10, 10], img_idx=1.5),
+        {"name": "other_tool", "arguments": {}},
+    ],
+)
+def test_tool_repeat_overlap_ignores_malformed_and_non_zoom_calls(call):
+    assert tool_repeat_overlap_reward([call]) == 0.0
+
+
+def test_tool_repeat_overlap_allows_two_depth_refinements_then_penalizes_excess():
+    two_refinements = [
+        zoom_call([0, 0, 1000, 1000]),
+        zoom_call([100, 100, 900, 900]),
+        zoom_call([200, 200, 800, 800]),
+    ]
+    three_refinements = [*two_refinements, zoom_call([250, 250, 750, 750])]
+
+    assert tool_repeat_overlap_reward(two_refinements) == 0.0
+    assert tool_repeat_overlap_reward(three_refinements) == pytest.approx(-0.5 / 4.0)
+
+
+def test_tool_repeat_overlap_depth_run_resets_after_breadth_switch():
+    calls = [
+        zoom_call([0, 0, 1000, 1000]),
+        zoom_call([50, 50, 700, 700]),
+        zoom_call([100, 100, 600, 600]),
+        zoom_call([700, 700, 1000, 1000]),
+        zoom_call([725, 725, 975, 975]),
+        zoom_call([750, 750, 950, 950]),
+    ]
+
+    assert tool_repeat_overlap_reward(calls) == 0.0
+
+
+def test_tool_repeat_overlap_depth_run_resets_after_image_switch():
+    calls = [
+        zoom_call([0, 0, 1000, 1000], img_idx=0),
+        zoom_call([100, 100, 900, 900], img_idx=0),
+        zoom_call([200, 200, 800, 800], img_idx=0),
+        zoom_call([250, 250, 750, 750], img_idx=1),
+    ]
+
+    assert tool_repeat_overlap_reward(calls) == 0.0
+
+
+def test_tool_repeat_overlap_does_not_double_count_repeats_as_depth():
+    calls = [zoom_call([100 + offset, 100 + offset, 400 - offset, 400 - offset]) for offset in range(4)]
+
+    assert tool_repeat_overlap_reward(calls) == pytest.approx(-3.0 / 4.0)
+
+
+def test_tool_repeat_overlap_combines_small_crop_and_excess_depth_penalties():
+    calls = [
+        zoom_call([0, 0, 1000, 1000]),
+        zoom_call([400, 400, 500, 500]),
+        zoom_call([430, 430, 460, 460]),
+        zoom_call([440, 440, 450, 450]),
+    ]
+
+    # The final crop is tiny and is the third consecutive nested refinement.
+    assert tool_repeat_overlap_reward(calls) == pytest.approx(-0.25)
+
+
+def test_tool_repeat_overlap_survives_malformed_final_answer():
+    solution = """
+<think>Zoom into the legend.</think>
+<tool_call>
+{"name": "image_zoom_in_tool", "arguments": {"bbox_2d": [100, 100, 400, 400], "label": "legend", "img_idx": 0}}
+</tool_call>
+<tool_response>ok</tool_response>
+<think>Repeat the crop.</think>
+<tool_call>
+{"name": "image_zoom_in_tool", "arguments": {"bbox_2d": [105, 105, 395, 395], "label": "legend", "img_idx": 0}}
+</tool_call>
+<tool_response>ok</tool_response>
+<think>Malformed final response.</think><answer>Memory Care
+""".strip()
+
+    result = compute_score_from_data_source(
+        data_source="qwen3vl_filtering",
+        solution_str=solution,
+        ground_truth="memory care",
+        extra_info={"reward_type": "string_match"},
+    )
+
+    assert result["format"] == 0.0
+    assert result["accuracy"] == 0.0
+    assert result["tool_repeat_overlap"] == pytest.approx(-0.5)
+
+
+def test_tool_repeat_overlap_custom_weights_match_sync_and_async_entrypoints():
+    solution = """
+<think>Zoom once.</think>
+<tool_call>
+{"name": "image_zoom_in_tool", "arguments": {"bbox_2d": [0, 0, 10, 10], "label": "detail", "img_idx": 0}}
+</tool_call>
+<tool_response>ok</tool_response>
+<think>Answer.</think><answer>Memory Care</answer>
+""".strip()
+    kwargs = {
+        "data_source": "qwen3vl_filtering",
+        "solution_str": solution,
+        "ground_truth": "memory care",
+        "extra_info": {"reward_type": "string_match"},
+        "tool_repeat_overlap_small_crop_weight": 0.25,
+    }
+
+    sync_result = compute_score_from_data_source(**kwargs)
+    async_result = asyncio.run(async_compute_score_from_data_source(**kwargs))
+
+    assert async_result == sync_result
+    assert sync_result["tool_repeat_overlap"] == pytest.approx(-0.25)
 
 
 def test_mandatory_think_tool_call_bonus_applies_at_threshold():

@@ -343,14 +343,23 @@ def _extract_zoom_call_box(tool_call: dict[str, Any]) -> tuple[int, tuple[float,
     bbox = arguments.get("bbox_2d")
     if not isinstance(bbox, list) or len(bbox) != 4 or any(isinstance(value, bool) for value in bbox):
         return None
+    raw_img_idx = arguments.get("img_idx")
+    if isinstance(raw_img_idx, bool):
+        return None
     try:
         x1, y1, x2, y2 = (float(value) for value in bbox)
-        img_idx = int(arguments.get("img_idx"))
+        img_idx_value = float(raw_img_idx)
     except (TypeError, ValueError):
         return None
-    if not all(math.isfinite(value) for value in (x1, y1, x2, y2)) or not x1 < x2 or not y1 < y2:
+    if (
+        not all(math.isfinite(value) for value in (x1, y1, x2, y2, img_idx_value))
+        or not img_idx_value.is_integer()
+        or img_idx_value < 0
+        or not x1 < x2
+        or not y1 < y2
+    ):
         return None
-    return img_idx, (x1, y1, x2, y2)
+    return int(img_idx_value), (x1, y1, x2, y2)
 
 
 def _bbox_iou(box_a: tuple[float, float, float, float], box_b: tuple[float, float, float, float]) -> float:
@@ -369,25 +378,113 @@ def _bbox_iou(box_a: tuple[float, float, float, float], box_b: tuple[float, floa
     return inter / union
 
 
+def _bbox_area(box: tuple[float, float, float, float]) -> float:
+    return (box[2] - box[0]) * (box[3] - box[1])
+
+
+def _bbox_containment(
+    inner: tuple[float, float, float, float],
+    outer: tuple[float, float, float, float],
+) -> float:
+    ix1, iy1, ix2, iy2 = inner
+    ox1, oy1, ox2, oy2 = outer
+    intersection = max(0.0, min(ix2, ox2) - max(ix1, ox1)) * max(0.0, min(iy2, oy2) - max(iy1, oy1))
+    inner_area = _bbox_area(inner)
+    return intersection / inner_area if inner_area > 0.0 else 0.0
+
+
+def _extract_executed_tool_calls_best_effort(predict_str: str) -> list[dict[str, Any]]:
+    """Recover well-formed tool calls that have a following tool response.
+
+    Accuracy and format scoring intentionally retain the strict trajectory parser. This
+    recovery path is used only for tool-quality rewards so a malformed final answer does
+    not erase penalties for tool calls that were already executed.
+    """
+    text = _normalize_chat_template_role_markers(str(predict_str))
+    tool_calls: list[dict[str, Any]] = []
+    pos = 0
+    while True:
+        start = text.find(_TOOL_CALL_OPEN, pos)
+        if start < 0:
+            break
+        payload_start = start + len(_TOOL_CALL_OPEN)
+        payload_end = text.find(_TOOL_CALL_CLOSE, payload_start)
+        if payload_end < 0:
+            break
+        parsed = _parse_tool_call_payload(text[payload_start:payload_end])
+        response_pos = _skip_ws(text, payload_end + len(_TOOL_CALL_CLOSE))
+        response, next_pos = _consume_tagged_block(text, response_pos, _TOOL_RESPONSE_OPEN, _TOOL_RESPONSE_CLOSE)
+        if parsed is not None and response is not None:
+            tool_calls.append(parsed)
+        pos = next_pos if next_pos > response_pos else payload_end + len(_TOOL_CALL_CLOSE)
+    return tool_calls
+
+
 def tool_repeat_overlap_reward(
     tool_calls: list[dict[str, Any]],
     iou_threshold: float = 0.9,
-    penalty_per_repeat: float = -0.5,
-    max_penalty: float = -1.0,
+    penalty_per_repeat: float | None = None,  # Legacy compatibility; intentionally unused.
+    max_penalty: float | None = None,  # Legacy compatibility; intentionally unused.
+    *,
+    small_crop_area_threshold: float = 0.0002,
+    repeat_weight: float = 1.0,
+    small_crop_weight: float = 0.5,
+    free_depth_refinements: int = 2,
+    depth_containment_threshold: float = 0.95,
+    excess_depth_weight: float = 0.5,
 ) -> float:
-    threshold = float(iou_threshold)
+    """Return a normalized composite crop-quality penalty under the existing key."""
+    del penalty_per_repeat, max_penalty
+    parsed_calls = [parsed for call in tool_calls if (parsed := _extract_zoom_call_box(call)) is not None]
+    num_calls = len(parsed_calls)
+    if num_calls == 0:
+        return 0.0
+
+    threshold = min(max(float(iou_threshold), 0.0), 1.0)
+    area_threshold = max(float(small_crop_area_threshold), 0.0)
+    containment_threshold = min(max(float(depth_containment_threshold), 0.0), 1.0)
+    free_depth = max(int(free_depth_refinements), 0)
     repeat_count = 0
+    small_crop_count = 0
+    excess_depth_count = 0
+    depth_run = 0
     previous_by_img_idx: dict[int, list[tuple[float, float, float, float]]] = {}
-    for tool_call in tool_calls:
-        parsed = _extract_zoom_call_box(tool_call)
-        if parsed is None:
-            continue
-        img_idx, box = parsed
+    previous_call: tuple[int, tuple[float, float, float, float]] | None = None
+    for img_idx, box in parsed_calls:
         previous_boxes = previous_by_img_idx.setdefault(img_idx, [])
-        if any(_bbox_iou(box, previous_box) >= threshold for previous_box in previous_boxes):
+        is_repeat = any(_bbox_iou(box, previous_box) >= threshold for previous_box in previous_boxes)
+        if is_repeat:
             repeat_count += 1
+
+        area = _bbox_area(box)
+        if area / 1_000_000.0 < area_threshold:
+            small_crop_count += 1
+
+        is_depth_refinement = False
+        if previous_call is not None and previous_call[0] == img_idx and not is_repeat:
+            previous_box = previous_call[1]
+            is_depth_refinement = (
+                area < _bbox_area(previous_box)
+                and _bbox_containment(box, previous_box) >= containment_threshold
+            )
+        if is_depth_refinement:
+            depth_run += 1
+            if depth_run > free_depth:
+                excess_depth_count += 1
+        else:
+            depth_run = 0
+
         previous_boxes.append(box)
-    return max(float(max_penalty), repeat_count * float(penalty_per_repeat))
+        previous_call = (img_idx, box)
+
+    repeat_fraction = repeat_count / num_calls
+    small_crop_fraction = small_crop_count / num_calls
+    excess_depth_fraction = excess_depth_count / num_calls
+    return -(
+        max(float(repeat_weight), 0.0) * repeat_fraction
+        + max(float(small_crop_weight), 0.0) * small_crop_fraction
+        + max(float(excess_depth_weight), 0.0) * excess_depth_fraction
+    )
 
 
 def compute_score(
@@ -403,8 +500,14 @@ def compute_score(
     tool_efficiency_concave_q: float = 0.95,
     tool_efficiency_score_weight: float = 0.0,
     tool_repeat_overlap_iou_threshold: float = 0.9,
-    tool_repeat_overlap_penalty_per_repeat: float = -0.5,
-    tool_repeat_overlap_max_penalty: float = -1.0,
+    tool_repeat_overlap_penalty_per_repeat: float | None = None,
+    tool_repeat_overlap_max_penalty: float | None = None,
+    tool_repeat_overlap_small_crop_area_threshold: float = 0.0002,
+    tool_repeat_overlap_repeat_weight: float = 1.0,
+    tool_repeat_overlap_small_crop_weight: float = 0.5,
+    tool_repeat_overlap_free_depth_refinements: int = 2,
+    tool_repeat_overlap_depth_containment_threshold: float = 0.95,
+    tool_repeat_overlap_excess_depth_weight: float = 0.5,
     allow_unboxed_answer_for_accuracy: bool = True,
     require_boxed_answer_for_full_format: bool = False,
     unboxed_answer_format_score: float = 0.0,
@@ -453,11 +556,18 @@ def compute_score(
         concave_k=tool_efficiency_concave_k,
         concave_q=tool_efficiency_concave_q,
     )
+    penalty_tool_calls = tool_calls if is_valid else _extract_executed_tool_calls_best_effort(predict_str)
     tool_repeat_overlap_score = tool_repeat_overlap_reward(
-        tool_calls,
+        penalty_tool_calls,
         iou_threshold=tool_repeat_overlap_iou_threshold,
         penalty_per_repeat=tool_repeat_overlap_penalty_per_repeat,
         max_penalty=tool_repeat_overlap_max_penalty,
+        small_crop_area_threshold=tool_repeat_overlap_small_crop_area_threshold,
+        repeat_weight=tool_repeat_overlap_repeat_weight,
+        small_crop_weight=tool_repeat_overlap_small_crop_weight,
+        free_depth_refinements=tool_repeat_overlap_free_depth_refinements,
+        depth_containment_threshold=tool_repeat_overlap_depth_containment_threshold,
+        excess_depth_weight=tool_repeat_overlap_excess_depth_weight,
     )
     score = (
         (1.0 - format_score - float(tool_efficiency_score_weight)) * accuracy
@@ -495,8 +605,14 @@ def compute_score_from_data_source(
     tool_efficiency_concave_q: float = 0.95,
     tool_efficiency_score_weight: float = 0.0,
     tool_repeat_overlap_iou_threshold: float = 0.9,
-    tool_repeat_overlap_penalty_per_repeat: float = -0.5,
-    tool_repeat_overlap_max_penalty: float = -1.0,
+    tool_repeat_overlap_penalty_per_repeat: float | None = None,
+    tool_repeat_overlap_max_penalty: float | None = None,
+    tool_repeat_overlap_small_crop_area_threshold: float = 0.0002,
+    tool_repeat_overlap_repeat_weight: float = 1.0,
+    tool_repeat_overlap_small_crop_weight: float = 0.5,
+    tool_repeat_overlap_free_depth_refinements: int = 2,
+    tool_repeat_overlap_depth_containment_threshold: float = 0.95,
+    tool_repeat_overlap_excess_depth_weight: float = 0.5,
     allow_unboxed_answer_for_accuracy: bool = True,
     require_boxed_answer_for_full_format: bool = False,
     unboxed_answer_format_score: float = 0.0,
@@ -518,6 +634,12 @@ def compute_score_from_data_source(
         tool_repeat_overlap_iou_threshold=tool_repeat_overlap_iou_threshold,
         tool_repeat_overlap_penalty_per_repeat=tool_repeat_overlap_penalty_per_repeat,
         tool_repeat_overlap_max_penalty=tool_repeat_overlap_max_penalty,
+        tool_repeat_overlap_small_crop_area_threshold=tool_repeat_overlap_small_crop_area_threshold,
+        tool_repeat_overlap_repeat_weight=tool_repeat_overlap_repeat_weight,
+        tool_repeat_overlap_small_crop_weight=tool_repeat_overlap_small_crop_weight,
+        tool_repeat_overlap_free_depth_refinements=tool_repeat_overlap_free_depth_refinements,
+        tool_repeat_overlap_depth_containment_threshold=tool_repeat_overlap_depth_containment_threshold,
+        tool_repeat_overlap_excess_depth_weight=tool_repeat_overlap_excess_depth_weight,
         allow_unboxed_answer_for_accuracy=allow_unboxed_answer_for_accuracy,
         require_boxed_answer_for_full_format=require_boxed_answer_for_full_format,
         unboxed_answer_format_score=unboxed_answer_format_score,
@@ -540,8 +662,14 @@ async def async_compute_score_from_data_source(
     tool_efficiency_concave_q: float = 0.95,
     tool_efficiency_score_weight: float = 0.0,
     tool_repeat_overlap_iou_threshold: float = 0.9,
-    tool_repeat_overlap_penalty_per_repeat: float = -0.5,
-    tool_repeat_overlap_max_penalty: float = -1.0,
+    tool_repeat_overlap_penalty_per_repeat: float | None = None,
+    tool_repeat_overlap_max_penalty: float | None = None,
+    tool_repeat_overlap_small_crop_area_threshold: float = 0.0002,
+    tool_repeat_overlap_repeat_weight: float = 1.0,
+    tool_repeat_overlap_small_crop_weight: float = 0.5,
+    tool_repeat_overlap_free_depth_refinements: int = 2,
+    tool_repeat_overlap_depth_containment_threshold: float = 0.95,
+    tool_repeat_overlap_excess_depth_weight: float = 0.5,
     allow_unboxed_answer_for_accuracy: bool = True,
     require_boxed_answer_for_full_format: bool = False,
     unboxed_answer_format_score: float = 0.0,
@@ -564,6 +692,12 @@ async def async_compute_score_from_data_source(
         tool_repeat_overlap_iou_threshold=tool_repeat_overlap_iou_threshold,
         tool_repeat_overlap_penalty_per_repeat=tool_repeat_overlap_penalty_per_repeat,
         tool_repeat_overlap_max_penalty=tool_repeat_overlap_max_penalty,
+        tool_repeat_overlap_small_crop_area_threshold=tool_repeat_overlap_small_crop_area_threshold,
+        tool_repeat_overlap_repeat_weight=tool_repeat_overlap_repeat_weight,
+        tool_repeat_overlap_small_crop_weight=tool_repeat_overlap_small_crop_weight,
+        tool_repeat_overlap_free_depth_refinements=tool_repeat_overlap_free_depth_refinements,
+        tool_repeat_overlap_depth_containment_threshold=tool_repeat_overlap_depth_containment_threshold,
+        tool_repeat_overlap_excess_depth_weight=tool_repeat_overlap_excess_depth_weight,
         allow_unboxed_answer_for_accuracy=allow_unboxed_answer_for_accuracy,
         require_boxed_answer_for_full_format=require_boxed_answer_for_full_format,
         unboxed_answer_format_score=unboxed_answer_format_score,

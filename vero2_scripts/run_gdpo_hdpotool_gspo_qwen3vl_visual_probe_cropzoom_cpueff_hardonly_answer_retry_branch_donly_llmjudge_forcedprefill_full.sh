@@ -10,7 +10,7 @@
 #SBATCH --array=1-10%1
 #SBATCH --output=slurm/output/%x_%j.log
 #SBATCH --error=slurm/error/%x_%j.log
-#SBATCH --dependency=afterany:10636856_10
+#SBATCH --dependency=afterany:10793564_10
 
 ##SBATCH --job-name=crop_hard
 ##SBATCH --partition=gpu-test

@@ -246,6 +246,9 @@ multi_turn:
   conditional_answer_retry_branch_enable_validation: False
   conditional_answer_retry_branch_mask_mode: "divergence_only"
   conditional_answer_retry_branch_reward_components: {}
+  # Preserve the complete retry grade (including scalar score) on emitted branch rows.
+  # When false, conditional_answer_retry_branch_reward_components supplies fixed rewards.
+  conditional_answer_retry_branch_use_graded_rewards: False
   conditional_answer_retry_branch_baseline_weight_key: "gdpo_baseline_weight"
 
 # support logging rollout prob for debugging purpose

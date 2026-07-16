@@ -670,3 +670,9 @@ class AlgoConfig(BaseConfig):
     gdpo_reward_weights: Optional[list[float]] = None
     gdpo_reward_eligibility: Optional[dict[str, Any]] = None
     gdpo_baseline_weight_key: Optional[str] = None
+    # Opt-in branch-safe component normalization and response-level final whitening.
+    gdpo_stability_enabled: bool = False
+    gdpo_component_std_floor: float = 0.05
+    gdpo_component_adv_clip: Optional[float] = 5.0
+    gdpo_final_std_floor: float = 0.05
+    gdpo_final_adv_clip: Optional[float] = 10.0

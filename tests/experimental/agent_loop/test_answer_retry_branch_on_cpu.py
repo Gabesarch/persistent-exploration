@@ -15,6 +15,7 @@ def _make_loop() -> ToolAgentLoop:
         "format": 0.0,
         "tool_repeat_overlap": 0.0,
     }
+    loop.conditional_answer_retry_branch_use_graded_rewards = False
     loop.conditional_answer_retry_branch_baseline_weight_key = "gdpo_baseline_weight"
     loop.response_length = 32
     return loop
@@ -64,6 +65,38 @@ def test_wrong_answer_branch_uses_divergence_only_mask_and_zero_components():
     assert reward_extra_info["accuracy"] == 0.0
     assert reward_extra_info["format"] == 0.0
     assert reward_extra_info["tool_repeat_overlap"] == 0.0
+
+
+def test_wrong_answer_branch_can_preserve_complete_graded_reward():
+    loop = _make_loop()
+    loop.conditional_answer_retry_branch_use_graded_rewards = True
+    agent_data = _make_agent_data()
+    grade = {
+        "score": 0.05,
+        "accuracy": 0.0,
+        "format": 0.5,
+        "tool_repeat_overlap": -0.25,
+        "tool_efficiency": 0.75,
+        "tool_call_bonus": 0.1,
+        "future_reward_component": 0.4,
+    }
+
+    loop._maybe_append_wrong_answer_branch(
+        agent_data=agent_data,
+        generation_snapshot={"response_mask_len": 4},
+        grade=grade,
+        retry_count=1,
+        removed_assistant_text="<think>bad</think><answer>wrong</answer>",
+        rollout_kwargs={"_debug_trajectory": {"validate": False}},
+    )
+
+    branch = agent_data.branch_outputs[0]
+    assert branch.reward_score == grade["score"]
+    assert branch.extra_fields["reward_extra_info"] == grade
+    assert branch.extra_fields["gdpo_baseline_weight"] == 0.0
+
+    zero_format_grade = {**grade, "score": 0.0, "format": 0.0}
+    assert loop._branch_reward_extra_info(zero_format_grade) == zero_format_grade
 
 
 def test_wrong_answer_branch_not_emitted_for_validation_by_default():

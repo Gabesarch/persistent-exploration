@@ -296,6 +296,7 @@ class TestComputeDataMetrics(unittest.TestCase):
         """Set up common test data."""
         # Create a mock DataProto object
         self.batch = MagicMock()
+        self.batch.meta_info = {}
         self.batch.batch = {
             "token_level_scores": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
             "token_level_rewards": torch.tensor([[0.5, 1.0], [1.5, 2.0]]),
@@ -348,6 +349,17 @@ class TestComputeDataMetrics(unittest.TestCase):
         self.assertIn("critic/score/mean", metrics)
         self.assertIn("critic/rewards/mean", metrics)
         self.assertIn("response_length/mean", metrics)
+
+    def test_compute_data_metrics_includes_gdpo_stability_metadata(self):
+        self.batch.meta_info["gdpo_stability_metrics"] = {
+            "gdpo/stability/final_max_abs": 1.25,
+            "gdpo/stability/final_low_variance_fallback": 1.0,
+        }
+
+        metrics = compute_data_metrics(self.batch, use_critic=False)
+
+        self.assertEqual(metrics["gdpo/stability/final_max_abs"], 1.25)
+        self.assertEqual(metrics["gdpo/stability/final_low_variance_fallback"], 1.0)
 
 
 class TestComputeTimingMetrics(unittest.TestCase):

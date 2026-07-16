@@ -232,6 +232,8 @@ def compute_advantage(
         if adv_estimator in (AdvantageEstimator.GDPO, "gdpo"):
             adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
             adv_kwargs["batch"] = data.batch
+            gdpo_diagnostics: dict[str, float] = {}
+            adv_kwargs["diagnostics"] = gdpo_diagnostics
         # Add sum_pi_squared for Optimal Token Baseline
         if adv_estimator in (AdvantageEstimator.OPTIMAL_TOKEN_BASELINE, AdvantageEstimator.TIR_OPTIMAL_TOKEN_BASELINE):
             # Check if sum_pi_squared is available
@@ -250,6 +252,8 @@ def compute_advantage(
         advantages, returns = adv_estimator_fn(**adv_kwargs)
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+        if adv_estimator in (AdvantageEstimator.GDPO, "gdpo") and gdpo_diagnostics:
+            data.meta_info["gdpo_stability_metrics"] = gdpo_diagnostics
     return data
 
 

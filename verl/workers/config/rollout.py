@@ -122,6 +122,7 @@ class MultiTurnConfig(BaseConfig):
     conditional_answer_retry_branch_enable_validation: bool = False
     conditional_answer_retry_branch_mask_mode: str = "divergence_only"
     conditional_answer_retry_branch_reward_components: dict[str, float] = field(default_factory=dict)
+    conditional_answer_retry_branch_use_graded_rewards: bool = False
     conditional_answer_retry_branch_baseline_weight_key: str = "gdpo_baseline_weight"
     llm_judge_enabled: bool = False
     llm_judge_prompt_path: Optional[str] = None

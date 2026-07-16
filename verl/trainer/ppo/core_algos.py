@@ -20,6 +20,8 @@ implement PPO-like algorithms.
 
 __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 
+import math
+import warnings
 from collections import defaultdict
 from enum import Enum
 from typing import Any, Callable, Optional
@@ -428,6 +430,166 @@ def _masked_whiten_with_stat_mask(
     return (values - mean) * torch.rsqrt(var + 1e-8) * output_mask
 
 
+def _validate_gdpo_stability_config(
+    config: Optional[AlgoConfig],
+) -> tuple[float, Optional[float], float, Optional[float]]:
+    """Read and validate opt-in GDPO stability settings."""
+    config = config or {}
+    component_std_floor = float(config.get("gdpo_component_std_floor", 0.05))
+    component_adv_clip = config.get("gdpo_component_adv_clip", 5.0)
+    final_std_floor = float(config.get("gdpo_final_std_floor", 0.05))
+    final_adv_clip = config.get("gdpo_final_adv_clip", 10.0)
+
+    for name, value in (
+        ("gdpo_component_std_floor", component_std_floor),
+        ("gdpo_final_std_floor", final_std_floor),
+    ):
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"algorithm.{name} must be finite and nonnegative, got {value!r}.")
+
+    for name, value in (
+        ("gdpo_component_adv_clip", component_adv_clip),
+        ("gdpo_final_adv_clip", final_adv_clip),
+    ):
+        if value is not None:
+            value = float(value)
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"algorithm.{name} must be null or finite and positive, got {value!r}.")
+        if name == "gdpo_component_adv_clip":
+            component_adv_clip = value
+        else:
+            final_adv_clip = value
+
+    return component_std_floor, component_adv_clip, final_std_floor, final_adv_clip
+
+
+def _compute_stable_gdpo_component_scalars(
+    scores: torch.Tensor,
+    index: np.ndarray,
+    active_mask: torch.Tensor,
+    norm_adv_by_std_in_grpo: bool,
+    std_floor: float,
+    adv_clip: Optional[float],
+    eligible_mask: Optional[torch.Tensor] = None,
+    min_group_size: int = 1,
+    baseline_mask: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, dict[str, int]]:
+    """Compute branch-safe response-level advantages for one GDPO reward component."""
+    scores = scores.float()
+    scalars = torch.zeros_like(scores)
+    active_mask = active_mask.to(device=scores.device, dtype=torch.bool)
+    if eligible_mask is None:
+        eligible_mask = torch.ones_like(active_mask)
+    else:
+        eligible_mask = eligible_mask.to(device=scores.device, dtype=torch.bool)
+    if baseline_mask is None:
+        baseline_mask = torch.ones_like(active_mask)
+    else:
+        baseline_mask = baseline_mask.to(device=scores.device, dtype=torch.bool)
+    min_group_size = max(int(min_group_size), 1)
+    stats = {"groups": 0, "low_variance_groups": 0, "target_rows": 0, "clipped_rows": 0}
+
+    with torch.no_grad():
+        for idx in set(index.tolist()):
+            rows_np = np.nonzero(index == idx)[0]
+            rows = torch.as_tensor(rows_np, dtype=torch.long, device=scores.device)
+            target_rows = rows[active_mask[rows] & eligible_mask[rows]]
+            baseline_rows = rows[active_mask[rows] & eligible_mask[rows] & baseline_mask[rows]]
+            if baseline_rows.numel() < min_group_size or target_rows.numel() == 0:
+                continue
+
+            group_scores = scores[baseline_rows]
+            mean = torch.mean(group_scores)
+            centered = scores[target_rows] - mean
+            stats["groups"] += 1
+            stats["target_rows"] += int(target_rows.numel())
+
+            if norm_adv_by_std_in_grpo:
+                std = torch.std(group_scores) if group_scores.numel() > 1 else group_scores.new_zeros(())
+                if not torch.isfinite(std):
+                    raise ValueError(f"GDPO component canonical std is nonfinite for group {idx!r}: {std.item()!r}.")
+                std_value = float(std.item())
+                if std_value > 0.0 and std_value >= std_floor:
+                    centered = centered / std
+                else:
+                    stats["low_variance_groups"] += 1
+
+            if not torch.isfinite(centered).all():
+                raise ValueError(f"GDPO component advantage is nonfinite for group {idx!r}.")
+            if adv_clip is not None:
+                stats["clipped_rows"] += int((centered.abs() > adv_clip).sum().item())
+                centered = centered.clamp(min=-adv_clip, max=adv_clip)
+            scalars[target_rows] = centered
+
+    return scalars, stats
+
+
+def _finalize_stable_gdpo_advantages(
+    aggregate_scalars: torch.Tensor,
+    response_mask: torch.Tensor,
+    baseline_mask: Optional[torch.Tensor],
+    std_floor: float,
+    adv_clip: Optional[float],
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Whiten response-level GDPO scalars using canonical response statistics."""
+    active_mask = response_mask.to(dtype=torch.bool).any(dim=-1)
+    stat_rows = active_mask.clone()
+    if baseline_mask is not None:
+        stat_rows &= baseline_mask.to(device=aggregate_scalars.device, dtype=torch.bool)
+
+    active_count = int(active_mask.sum().item())
+    stat_count = int(stat_rows.sum().item())
+    if active_count == 0:
+        zeros = torch.zeros_like(response_mask, dtype=torch.float32)
+        return zeros, {
+            "final_canonical_mean": 0.0,
+            "final_canonical_std": 0.0,
+            "final_low_variance_fallback": 1.0,
+            "final_clipped_row_rate": 0.0,
+            "pre_final_max_abs": 0.0,
+            "final_max_abs": 0.0,
+            "nonfinite_count": 0.0,
+        }
+    if stat_count == 0:
+        raise ValueError("Stable GDPO has active responses but no active canonical rows for final statistics.")
+
+    aggregate_scalars = aggregate_scalars.float()
+    canonical = aggregate_scalars[stat_rows]
+    mean = canonical.mean()
+    std = canonical.std() if stat_count > 1 else canonical.new_zeros(())
+    if not torch.isfinite(mean) or not torch.isfinite(std):
+        raise ValueError(
+            f"Stable GDPO final canonical statistics are nonfinite: mean={mean.item()!r}, std={std.item()!r}."
+        )
+
+    centered = aggregate_scalars - mean
+    std_value = float(std.item())
+    low_variance = std_value == 0.0 or std_value < std_floor
+    normalized = centered if low_variance else centered / std
+    nonfinite_count = int((~torch.isfinite(normalized[active_mask])).sum().item())
+    if nonfinite_count:
+        raise ValueError(
+            "Stable GDPO produced nonfinite final response advantages "
+            f"(count={nonfinite_count}, canonical_mean={mean.item():.6g}, canonical_std={std.item():.6g})."
+        )
+
+    clipped_rows = 0
+    if adv_clip is not None:
+        clipped_rows = int((normalized[active_mask].abs() > adv_clip).sum().item())
+        normalized = normalized.clamp(min=-adv_clip, max=adv_clip)
+    normalized = torch.where(active_mask, normalized, torch.zeros_like(normalized))
+    advantages = normalized.unsqueeze(-1) * response_mask
+    return advantages, {
+        "final_canonical_mean": float(mean.item()),
+        "final_canonical_std": float(std.item()),
+        "final_low_variance_fallback": float(low_variance),
+        "final_clipped_row_rate": clipped_rows / max(active_count, 1),
+        "pre_final_max_abs": float(aggregate_scalars[active_mask].abs().max().item()),
+        "final_max_abs": float(normalized[active_mask].abs().max().item()),
+        "nonfinite_count": 0.0,
+    }
+
+
 @register_adv_est(AdvantageEstimator.GDPO)  # or simply: @register_adv_est("gdpo")
 def compute_gdpo_outcome_advantage(
     token_level_rewards: torch.Tensor,
@@ -438,6 +600,7 @@ def compute_gdpo_outcome_advantage(
     config: Optional[AlgoConfig] = None,
     non_tensor_batch: Optional[dict] = None,
     batch: Optional[dict] = None,
+    diagnostics: Optional[dict[str, float]] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -534,6 +697,25 @@ def compute_gdpo_outcome_advantage(
     else:
         weights = torch.ones(num_scores, dtype=torch.float32, device=token_level_rewards.device)
 
+    stability_enabled = bool(config.get("gdpo_stability_enabled", False)) if config is not None else False
+    if baseline_mask is not None and not stability_enabled:
+        warnings.warn(
+            "GDPO baseline statistics exclude rows via gdpo_baseline_weight_key while "
+            "gdpo_stability_enabled is false. This legacy path can create extreme advantages "
+            "when canonical variance is zero; enable guarded GDPO unless reproducing a legacy run.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    component_std_floor = component_adv_clip = final_std_floor = final_adv_clip = None
+    stable_aggregate = None
+    stable_component_totals = {"groups": 0, "low_variance_groups": 0, "target_rows": 0, "clipped_rows": 0}
+    if stability_enabled:
+        component_std_floor, component_adv_clip, final_std_floor, final_adv_clip = (
+            _validate_gdpo_stability_config(config)
+        )
+        stable_aggregate = torch.zeros(response_mask.size(0), dtype=torch.float32, device=response_mask.device)
+
     new_advantage = None
 
     for i in range(num_scores):
@@ -558,6 +740,35 @@ def compute_gdpo_outcome_advantage(
             )
             eligible_mask = eligibility_values >= threshold
 
+        if stability_enabled:
+            component_name = reward_keys[i] if reward_keys is not None else f"component_{i}"
+            try:
+                component_scalars, component_stats = _compute_stable_gdpo_component_scalars(
+                    scores=score_list[i].sum(dim=-1),
+                    index=index,
+                    active_mask=response_mask.to(dtype=torch.bool).any(dim=-1),
+                    norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                    std_floor=component_std_floor,
+                    adv_clip=component_adv_clip,
+                    eligible_mask=eligible_mask,
+                    min_group_size=min_group_size,
+                    baseline_mask=baseline_mask,
+                )
+            except ValueError as exc:
+                raise ValueError(f"Stable GDPO component {component_name!r} failed: {exc}") from exc
+            stable_aggregate += weights[i] * component_scalars
+            for stat_name in stable_component_totals:
+                stable_component_totals[stat_name] += component_stats[stat_name]
+            if diagnostics is not None:
+                metric_name = "".join(char if char.isalnum() else "_" for char in component_name)
+                diagnostics[f"gdpo/stability/{metric_name}/low_variance_group_rate"] = component_stats[
+                    "low_variance_groups"
+                ] / max(component_stats["groups"], 1)
+                diagnostics[f"gdpo/stability/{metric_name}/clipped_row_rate"] = component_stats[
+                    "clipped_rows"
+                ] / max(component_stats["target_rows"], 1)
+            continue
+
         normalized_score = _compute_gdpo_component_advantage(
             token_level_rewards=score_list[i],
             response_mask=response_mask,
@@ -574,6 +785,24 @@ def compute_gdpo_outcome_advantage(
             new_advantage = weights[i] * normalized_score
         else:
             new_advantage += weights[i] * normalized_score
+
+    if stability_enabled:
+        advantages, final_stats = _finalize_stable_gdpo_advantages(
+            aggregate_scalars=stable_aggregate,
+            response_mask=response_mask,
+            baseline_mask=baseline_mask,
+            std_floor=final_std_floor,
+            adv_clip=final_adv_clip,
+        )
+        if diagnostics is not None:
+            diagnostics["gdpo/stability/component_low_variance_group_rate"] = stable_component_totals[
+                "low_variance_groups"
+            ] / max(stable_component_totals["groups"], 1)
+            diagnostics["gdpo/stability/component_clipped_row_rate"] = stable_component_totals[
+                "clipped_rows"
+            ] / max(stable_component_totals["target_rows"], 1)
+            diagnostics.update({f"gdpo/stability/{key}": value for key, value in final_stats.items()})
+        return advantages, advantages
 
     if baseline_mask is not None:
         stat_mask = baseline_mask.to(device=response_mask.device, dtype=response_mask.dtype).unsqueeze(-1)

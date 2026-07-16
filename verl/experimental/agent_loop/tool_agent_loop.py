@@ -216,6 +216,9 @@ class ToolAgentLoop(AgentLoopBase):
         self.conditional_answer_retry_branch_reward_components = dict(
             getattr(multi_turn_config, "conditional_answer_retry_branch_reward_components", {}) or {}
         )
+        self.conditional_answer_retry_branch_use_graded_rewards = bool(
+            getattr(multi_turn_config, "conditional_answer_retry_branch_use_graded_rewards", False)
+        )
         self.conditional_answer_retry_branch_baseline_weight_key = getattr(
             multi_turn_config, "conditional_answer_retry_branch_baseline_weight_key", "gdpo_baseline_weight"
         )
@@ -790,6 +793,9 @@ class ToolAgentLoop(AgentLoopBase):
 
     def _branch_reward_extra_info(self, grade: dict[str, Any]) -> dict[str, Any]:
         reward_extra_info = dict(grade) if isinstance(grade, dict) else {}
+        if self.conditional_answer_retry_branch_use_graded_rewards:
+            return reward_extra_info
+
         reward_extra_info["score"] = 0.0
         for key in ("accuracy", "format", "tool_repeat_overlap"):
             reward_extra_info[key] = 0.0

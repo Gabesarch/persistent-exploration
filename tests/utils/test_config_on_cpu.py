@@ -77,6 +77,30 @@ class TestConfigOnCPU(unittest.TestCase):
         self.assertFalse(cfg.trainer.save_validation_crops)
         self.assertEqual(cfg.trainer.comprehensive_debug_logging.log_every_n_steps, 1)
 
+    def test_gdpo_stability_defaults_off_and_branch_configs_opt_in(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        base_cfg = OmegaConf.load(repo_root / "verl" / "trainer" / "config" / "ppo_trainer.yaml")
+        self.assertFalse(base_cfg.algorithm.gdpo_stability_enabled)
+        self.assertEqual(base_cfg.algorithm.gdpo_component_std_floor, 0.05)
+        self.assertEqual(base_cfg.algorithm.gdpo_component_adv_clip, 5.0)
+        self.assertEqual(base_cfg.algorithm.gdpo_final_std_floor, 0.05)
+        self.assertEqual(base_cfg.algorithm.gdpo_final_adv_clip, 10.0)
+
+        branch_configs = [
+            "gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_cropzoom_cpueff_hardonly_"
+            "answer_retry_branch_donly_llmjudge_forcedprefill.yaml",
+            "gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_cropzoom_debug256_cpueff_"
+            "answer_retry_branch_donly_llmjudge_forcedprefill.yaml",
+        ]
+        for config_name in branch_configs:
+            cfg = OmegaConf.load(repo_root / "vero2_scripts" / "config" / config_name)
+            self.assertEqual(cfg.algorithm.gdpo_baseline_weight_key, "gdpo_baseline_weight")
+            self.assertTrue(cfg.algorithm.gdpo_stability_enabled)
+            self.assertEqual(cfg.algorithm.gdpo_component_std_floor, 0.05)
+            self.assertEqual(cfg.algorithm.gdpo_component_adv_clip, 5.0)
+            self.assertEqual(cfg.algorithm.gdpo_final_std_floor, 0.05)
+            self.assertEqual(cfg.algorithm.gdpo_final_adv_clip, 10.0)
+
 
 class TestPrintCfgCommand(unittest.TestCase):
     """Test suite for the print_cfg.py command-line tool."""

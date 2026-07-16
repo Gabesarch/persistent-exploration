@@ -329,6 +329,26 @@ def _make_scalar_reward_component(values: list[float], response_mask: torch.Tens
     return rewards
 
 
+def _stable_gdpo_config(**overrides) -> dict:
+    config = {
+        "gdpo_reward_keys": ["accuracy"],
+        "gdpo_reward_weights": [1.0],
+        "gdpo_baseline_weight_key": "gdpo_baseline_weight",
+        "gdpo_stability_enabled": True,
+        "gdpo_component_std_floor": 0.05,
+        "gdpo_component_adv_clip": 5.0,
+        "gdpo_final_std_floor": 0.05,
+        "gdpo_final_adv_clip": 10.0,
+    }
+    config.update(overrides)
+    return config
+
+
+def _response_advantages(advantages: torch.Tensor, response_mask: torch.Tensor) -> torch.Tensor:
+    lengths = response_mask.sum(dim=-1).clamp_min(1)
+    return (advantages * response_mask).sum(dim=-1) / lengths
+
+
 def test_gdpo_without_eligibility_matches_existing_component_sum_behavior():
     response_mask = torch.ones((4, 3), dtype=torch.float32)
     index = np.array(["prompt-a", "prompt-a", "prompt-b", "prompt-b"], dtype=object)
@@ -546,6 +566,248 @@ def test_gdpo_baseline_weight_padding_rows_do_not_change_canonical_advantages():
 
     assert torch.allclose(adv_with_padding[:5], adv_without_padding, rtol=1e-5, atol=1e-6)
     assert torch.all(adv_with_padding[5:] == 0)
+
+
+def test_stable_gdpo_constant_canonical_rewards_preserve_bounded_branch_signal():
+    response_mask = torch.ones((5, 3), dtype=torch.float32)
+    rewards = [1.0, 1.0, 1.0, 1.0, 0.0]
+    diagnostics = {}
+    adv, returns = compute_gdpo_outcome_advantage(
+        token_level_rewards=torch.zeros_like(response_mask),
+        response_mask=response_mask,
+        index=np.array(["prompt-a"] * 5, dtype=object),
+        config=_stable_gdpo_config(),
+        non_tensor_batch={
+            "accuracy": np.asarray(rewards, dtype=np.float32),
+            "gdpo_baseline_weight": np.asarray([1.0, 1.0, 1.0, 1.0, 0.0], dtype=np.float32),
+        },
+        batch=_make_gdpo_test_batch(num_rows=5),
+        diagnostics=diagnostics,
+    )
+
+    expected = torch.tensor([0.0, 0.0, 0.0, 0.0, -1.0])
+    assert torch.equal(_response_advantages(adv, response_mask), expected)
+    assert torch.equal(returns, adv)
+    assert diagnostics["gdpo/stability/accuracy/low_variance_group_rate"] == 1.0
+    assert diagnostics["gdpo/stability/final_low_variance_fallback"] == 1.0
+    assert diagnostics["gdpo/stability/final_max_abs"] == 1.0
+
+
+def test_stable_gdpo_constant_canonical_and_branch_rewards_produce_zero():
+    response_mask = torch.ones((5, 2), dtype=torch.float32)
+    adv, _ = compute_gdpo_outcome_advantage(
+        token_level_rewards=torch.zeros_like(response_mask),
+        response_mask=response_mask,
+        index=np.array(["prompt-a"] * 5, dtype=object),
+        config=_stable_gdpo_config(),
+        non_tensor_batch={
+            "accuracy": np.ones(5, dtype=np.float32),
+            "gdpo_baseline_weight": np.asarray([1.0, 1.0, 1.0, 1.0, 0.0], dtype=np.float32),
+        },
+        batch=_make_gdpo_test_batch(num_rows=5, response_len=2),
+    )
+    assert torch.equal(adv, torch.zeros_like(adv))
+
+
+def test_stable_gdpo_nearly_constant_component_uses_raw_centered_difference():
+    response_mask = torch.ones((5, 2), dtype=torch.float32)
+    rewards = [0.99, 1.0, 1.0, 1.0, 0.0]
+    adv, _ = compute_gdpo_outcome_advantage(
+        token_level_rewards=torch.zeros_like(response_mask),
+        response_mask=response_mask,
+        index=np.array(["prompt-a"] * 5, dtype=object),
+        config=_stable_gdpo_config(),
+        non_tensor_batch={
+            "accuracy": np.asarray(rewards, dtype=np.float32),
+            "gdpo_baseline_weight": np.asarray([1.0, 1.0, 1.0, 1.0, 0.0], dtype=np.float32),
+        },
+        batch=_make_gdpo_test_batch(num_rows=5, response_len=2),
+    )
+
+    scalars = _response_advantages(adv, response_mask)
+    assert torch.allclose(scalars[:4], torch.tensor([-0.0075, 0.0025, 0.0025, 0.0025]), atol=1e-6)
+    assert torch.allclose(scalars[4], torch.tensor(-0.9975), atol=1e-6)
+
+
+def test_stable_gdpo_healthy_variance_keeps_gdpo_standardization():
+    response_mask = torch.ones((5, 2), dtype=torch.float32)
+    rewards = [1.0, 0.0, 1.0, 0.0, 0.0]
+    adv, _ = compute_gdpo_outcome_advantage(
+        token_level_rewards=torch.zeros_like(response_mask),
+        response_mask=response_mask,
+        index=np.array(["prompt-a"] * 5, dtype=object),
+        config=_stable_gdpo_config(),
+        non_tensor_batch={
+            "accuracy": np.asarray(rewards, dtype=np.float32),
+            "gdpo_baseline_weight": np.asarray([1.0, 1.0, 1.0, 1.0, 0.0], dtype=np.float32),
+        },
+        batch=_make_gdpo_test_batch(num_rows=5, response_len=2),
+    )
+
+    expected = torch.tensor([0.8660254, -0.8660254, 0.8660254, -0.8660254, -0.8660254])
+    assert torch.allclose(_response_advantages(adv, response_mask), expected, atol=1e-5)
+
+
+def test_stable_gdpo_without_component_std_uses_raw_centered_differences():
+    response_mask = torch.ones((5, 2), dtype=torch.float32)
+    rewards = [1.0, 0.0, 1.0, 0.0, 0.0]
+    adv, _ = compute_gdpo_outcome_advantage(
+        token_level_rewards=torch.zeros_like(response_mask),
+        response_mask=response_mask,
+        index=np.array(["prompt-a"] * 5, dtype=object),
+        norm_adv_by_std_in_grpo=False,
+        config=_stable_gdpo_config(gdpo_final_std_floor=2.0),
+        non_tensor_batch={
+            "accuracy": np.asarray(rewards, dtype=np.float32),
+            "gdpo_baseline_weight": np.asarray([1.0, 1.0, 1.0, 1.0, 0.0], dtype=np.float32),
+        },
+        batch=_make_gdpo_test_batch(num_rows=5, response_len=2),
+    )
+    expected = torch.tensor([0.5, -0.5, 0.5, -0.5, -0.5])
+    assert torch.allclose(_response_advantages(adv, response_mask), expected, atol=1e-6)
+
+
+def test_stable_gdpo_component_and_final_clips_bound_excluded_branch():
+    response_mask = torch.ones((5, 2), dtype=torch.float32)
+    baseline_weights = np.asarray([1.0, 1.0, 1.0, 1.0, 0.0], dtype=np.float32)
+    index = np.array(["prompt-a"] * 5, dtype=object)
+    batch = _make_gdpo_test_batch(num_rows=5, response_len=2)
+
+    component_diagnostics = {}
+    component_adv, _ = compute_gdpo_outcome_advantage(
+        token_level_rewards=torch.zeros_like(response_mask),
+        response_mask=response_mask,
+        index=index,
+        config=_stable_gdpo_config(),
+        non_tensor_batch={
+            "accuracy": np.asarray([1.0, 1.0, 1.0, 1.0, -100.0], dtype=np.float32),
+            "gdpo_baseline_weight": baseline_weights,
+        },
+        batch=batch,
+        diagnostics=component_diagnostics,
+    )
+    assert _response_advantages(component_adv, response_mask)[-1] == -5.0
+    assert component_diagnostics["gdpo/stability/component_clipped_row_rate"] == 0.2
+
+    final_diagnostics = {}
+    final_adv, _ = compute_gdpo_outcome_advantage(
+        token_level_rewards=torch.zeros_like(response_mask),
+        response_mask=response_mask,
+        index=index,
+        config=_stable_gdpo_config(gdpo_component_adv_clip=None),
+        non_tensor_batch={
+            "accuracy": np.asarray([1.0, 0.0, 1.0, 0.0, -100.0], dtype=np.float32),
+            "gdpo_baseline_weight": baseline_weights,
+        },
+        batch=batch,
+        diagnostics=final_diagnostics,
+    )
+    assert _response_advantages(final_adv, response_mask)[-1] == -10.0
+    assert final_diagnostics["gdpo/stability/final_clipped_row_rate"] == 0.2
+
+
+def test_stable_gdpo_response_statistics_ignore_lengths_padding_and_branch_multiplicity():
+    rewards = np.asarray([1.0, 0.0, 1.0, 0.0, 0.0], dtype=np.float32)
+    weights = np.asarray([1.0, 1.0, 1.0, 1.0, 0.0], dtype=np.float32)
+    index = np.array(["prompt-a"] * 5, dtype=object)
+    short_mask = torch.ones((5, 4), dtype=torch.float32)
+    varied_mask = torch.tensor(
+        [[1, 0, 0, 0], [1, 1, 0, 0], [1, 1, 1, 0], [1, 1, 1, 1], [1, 0, 0, 0]], dtype=torch.float32
+    )
+
+    def compute(mask, reward_values, baseline_weights, groups):
+        attention_mask = torch.cat((torch.ones((mask.size(0), 2), dtype=torch.int64), mask.long()), dim=-1)
+        adv, _ = compute_gdpo_outcome_advantage(
+            token_level_rewards=torch.zeros_like(mask),
+            response_mask=mask,
+            index=groups,
+            config=_stable_gdpo_config(),
+            non_tensor_batch={"accuracy": reward_values, "gdpo_baseline_weight": baseline_weights},
+            batch={"prompts": torch.ones((mask.size(0), 2), dtype=torch.int64), "attention_mask": attention_mask},
+        )
+        return _response_advantages(adv, mask)
+
+    short = compute(short_mask, rewards, weights, index)
+    varied = compute(varied_mask, rewards, weights, index)
+    assert torch.allclose(short, varied, atol=1e-6)
+
+    expanded_mask = torch.cat((varied_mask, varied_mask[4:].repeat(3, 1), torch.zeros((2, 4))), dim=0)
+    expanded_rewards = np.concatenate((rewards, np.zeros(5, dtype=np.float32)))
+    expanded_weights = np.concatenate((weights, np.zeros(5, dtype=np.float32)))
+    expanded_groups = np.array(["prompt-a"] * 10, dtype=object)
+    expanded = compute(expanded_mask, expanded_rewards, expanded_weights, expanded_groups)
+    assert torch.allclose(expanded[:5], varied, atol=1e-6)
+    assert torch.all(expanded[-2:] == 0)
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"gdpo_component_std_floor": -0.1}, "gdpo_component_std_floor"),
+        ({"gdpo_final_std_floor": float("nan")}, "gdpo_final_std_floor"),
+        ({"gdpo_component_adv_clip": 0.0}, "gdpo_component_adv_clip"),
+        ({"gdpo_final_adv_clip": float("inf")}, "gdpo_final_adv_clip"),
+    ],
+)
+def test_stable_gdpo_rejects_invalid_stability_config(override, message):
+    response_mask = torch.ones((2, 2), dtype=torch.float32)
+    with pytest.raises(ValueError, match=message):
+        compute_gdpo_outcome_advantage(
+            token_level_rewards=torch.zeros_like(response_mask),
+            response_mask=response_mask,
+            index=np.array(["prompt-a"] * 2, dtype=object),
+            config=_stable_gdpo_config(**override),
+            non_tensor_batch={
+                "accuracy": np.asarray([1.0, 0.0], dtype=np.float32),
+                "gdpo_baseline_weight": np.asarray([1.0, 1.0], dtype=np.float32),
+            },
+            batch=_make_gdpo_test_batch(num_rows=2, response_len=2),
+        )
+
+
+def test_stable_gdpo_randomized_branch_heavy_batches_are_finite_and_bounded():
+    rng = np.random.default_rng(1234)
+    for _ in range(20):
+        canonical_count = 8
+        branch_count = int(rng.integers(1, 17))
+        padding_count = int(rng.integers(0, 4))
+        num_rows = canonical_count + branch_count + padding_count
+        response_mask = torch.zeros((num_rows, 7), dtype=torch.float32)
+        for row in range(canonical_count + branch_count):
+            response_mask[row, : int(rng.integers(1, 8))] = 1
+        accuracy = np.concatenate(
+            (rng.integers(0, 2, canonical_count), rng.integers(0, 2, branch_count), np.zeros(padding_count))
+        ).astype(np.float32)
+        fmt_base = float(rng.choice([0.0, 0.99, 1.0]))
+        format_rewards = np.concatenate(
+            (
+                np.clip(fmt_base + rng.normal(0, 0.002, canonical_count), 0, 1),
+                rng.uniform(0, 1, branch_count),
+                np.zeros(padding_count),
+            )
+        ).astype(np.float32)
+        baseline_weights = np.concatenate((np.ones(canonical_count), np.zeros(branch_count + padding_count))).astype(
+            np.float32
+        )
+        attention_mask = torch.cat((torch.ones((num_rows, 2), dtype=torch.int64), response_mask.long()), dim=-1)
+        config = _stable_gdpo_config(
+            gdpo_reward_keys=["accuracy", "format"], gdpo_reward_weights=[0.9, 0.1]
+        )
+        adv, _ = compute_gdpo_outcome_advantage(
+            token_level_rewards=torch.zeros_like(response_mask),
+            response_mask=response_mask,
+            index=np.array(["prompt-a"] * num_rows, dtype=object),
+            config=config,
+            non_tensor_batch={
+                "accuracy": accuracy,
+                "format": format_rewards,
+                "gdpo_baseline_weight": baseline_weights,
+            },
+            batch={"prompts": torch.ones((num_rows, 2), dtype=torch.int64), "attention_mask": attention_mask},
+        )
+        assert torch.isfinite(adv).all()
+        assert float(adv.abs().max()) <= 10.0
+        assert torch.all(adv[response_mask == 0] == 0)
 
 
 def test_multiturn_tool_reward_returns_tool_efficiency_without_changing_score():
