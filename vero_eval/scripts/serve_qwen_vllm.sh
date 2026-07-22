@@ -91,12 +91,15 @@ nohup vllm serve "$CHECKPOINT_PATH" \
   > "$LOGFILE" 2>&1 &
 disown
 
-echo "Waiting for vLLM to be ready (up to 5 min)..."
-for _ in $(seq 1 60); do
+# Readiness wait: default 12 min (a Qwen3.5-9B merged ckpt measured 5m02s to first response
+# on an A100 — the old 5-min cap lost that race by seconds). Override with VLLM_WAIT_MIN.
+VLLM_WAIT_MIN="${VLLM_WAIT_MIN:-12}"
+echo "Waiting for vLLM to be ready (up to ${VLLM_WAIT_MIN} min)..."
+for _ in $(seq 1 $(( VLLM_WAIT_MIN * 12 ))); do
   if curl --max-time 2 -s -o /dev/null "http://localhost:${PORT}/v1/models"; then
     echo "vLLM is up at http://localhost:${PORT}"; exit 0
   fi
   sleep 5
 done
-echo "vLLM did not respond after 5 minutes. Check logs: $LOGFILE" >&2
+echo "vLLM did not respond after ${VLLM_WAIT_MIN} minutes. Check logs: $LOGFILE" >&2
 exit 1
