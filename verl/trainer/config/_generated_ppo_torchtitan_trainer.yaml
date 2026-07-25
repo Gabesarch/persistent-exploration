@@ -301,6 +301,7 @@ actor_rollout_ref:
       force_answer_on_final_turn: false
       final_answer_token_margin: 2048
       force_final_answer_think_prefill: ''
+      force_final_answer_think_prefill_trainable: false
       tool_response_turn_suffix_enabled: false
       tool_response_explore_turns: 10
       tool_response_explore_suffix: Even if you are confident in your answer, please
@@ -318,6 +319,7 @@ actor_rollout_ref:
         evidence, and dig deeper into the most likely explanations. Finalize only
         when the evidence clearly supports a conclusion.'
       conditional_answer_retry_assistant_prefill: ''
+      conditional_answer_retry_assistant_prefill_trainable: false
       conditional_answer_retry_correct_accuracy_threshold: 0.0
       conditional_answer_retry_max_retries: null
       conditional_answer_retry_branch_enabled: false

@@ -15,8 +15,20 @@
 set -x
 set -o pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-BASE_SCRIPT="$SCRIPT_DIR/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_cropzoom_cpueff_hardonly_llmjudge.sh"
+# Slurm executes a copied submission script from /var/spool/slurmd, so
+# BASH_SOURCE does not point back to the repository there. Prefer the directory
+# from which sbatch was invoked; retain sibling resolution for direct execution.
+if [ -n "${SLURM_SUBMIT_DIR:-}" ]; then
+  BASE_SCRIPT="$SLURM_SUBMIT_DIR/vero2_scripts/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_cropzoom_cpueff_hardonly_llmjudge.sh"
+else
+  SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+  BASE_SCRIPT="$SCRIPT_DIR/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_cropzoom_cpueff_hardonly_llmjudge.sh"
+fi
+
+if [ ! -x "$BASE_SCRIPT" ]; then
+  echo "error: executable base launcher not found at $BASE_SCRIPT" >&2
+  exit 2
+fi
 
 # Keep lr=5e-6 runs separate from checkpoints produced by other learning rates.
 export TRAINER_EXPERIMENT_SUFFIX="${TRAINER_EXPERIMENT_SUFFIX:-chart_qwen3vl_visual_probe_cropzoom_gdpo_hdpotool_hardonly_llmjudge_lr5e6}"

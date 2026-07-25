@@ -243,10 +243,12 @@ actor_rollout_ref:
       # Normal rollout first; incorrect answers are removed and followed by a forced tool-call retry.
       force_tool_calls_until_final_turn: false
       force_answer_on_final_turn: true
+      force_final_answer_think_prefill: "This is the final turn, so I need to answer from the evidence gathered so far."
       final_answer_token_margin: 2048
       conditional_answer_retry_enabled: true
       conditional_answer_retry_force_next_tool_call: true
       conditional_answer_retry_suffix: ""
+      conditional_answer_retry_assistant_prefill: "Let’s see. I still don’t have decisive evidence, so I should inspect a substantially different region. If one area looks especially promising, I can examine it more closely, but I should look elsewhere once further zooming stops revealing new evidence."
       conditional_answer_retry_correct_accuracy_threshold: 0.0
       conditional_answer_retry_max_retries: null
       conditional_answer_retry_branch_enabled: true
@@ -385,4 +387,3 @@ trainer:
       log_driver_stages: true
       log_worker_stages: true
       log_nvidia_smi: true
-

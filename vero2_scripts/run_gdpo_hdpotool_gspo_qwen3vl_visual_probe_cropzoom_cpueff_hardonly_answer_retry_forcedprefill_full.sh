@@ -42,9 +42,6 @@ if [ "$#" -gt 0 ] && [[ "$1" != -* ]]; then
   shift
 fi
 HYDRA_ARGS=("$@")
-DEFAULT_ANSWER_RETRY_ASSISTANT_PREFILL="Let's see, I do not have enough information to answer and need to continue exploring with additional tool calls."
-ANSWER_RETRY_ASSISTANT_PREFILL="${ANSWER_RETRY_ASSISTANT_PREFILL:-$DEFAULT_ANSWER_RETRY_ASSISTANT_PREFILL}"
-export ANSWER_RETRY_ASSISTANT_PREFILL
 
 CHECKPOINT_DATE_TIME="${CHECKPOINT_DATE_TIME:-20260524_160610}"
 RUN_UNIQUE_ID="${RUN_UNIQUE_ID:-${SLURM_JOB_ID:-pid_$$}}"
@@ -105,23 +102,6 @@ if [ "$ENGINE" != "vllm" ]; then
   HYDRA_ARGS=("actor_rollout_ref.rollout.name=$ENGINE" "${HYDRA_ARGS[@]}")
 fi
 
-has_hydra_override() {
-  local key="$1"
-  local arg
-  for arg in "${HYDRA_ARGS[@]}"; do
-    if [[ "$arg" == "$key="* ]]; then
-      return 0
-    fi
-  done
-  return 1
-}
-
-if ! has_hydra_override "actor_rollout_ref.rollout.multi_turn.conditional_answer_retry_assistant_prefill"; then
-  HYDRA_ARGS=(
-    'actor_rollout_ref.rollout.multi_turn.conditional_answer_retry_assistant_prefill=${oc.env:ANSWER_RETRY_ASSISTANT_PREFILL}'
-    "${HYDRA_ARGS[@]}"
-  )
-fi
 
 CONFIG_NAME="gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_cropzoom_cpueff_hardonly_answer_retry_forcedprefill"
 
@@ -131,7 +111,6 @@ echo "TRAINER_EXPERIMENT_NAME=$TRAINER_EXPERIMENT_NAME"
 echo "CHECKPOINT_EXPERIMENT_NAME=$CHECKPOINT_EXPERIMENT_NAME"
 echo "TRAINER_DEFAULT_LOCAL_DIR=$TRAINER_DEFAULT_LOCAL_DIR"
 echo "LEGACY_CHECKPOINT_DIR_LINKED=$LEGACY_CHECKPOINT_DIR_LINKED"
-echo "ANSWER_RETRY_ASSISTANT_PREFILL=$ANSWER_RETRY_ASSISTANT_PREFILL"
 printf 'HYDRA_ARGS:'; printf ' %q' "${HYDRA_ARGS[@]}"; printf '\n'
 
 python3 -m verl.trainer.main_ppo \

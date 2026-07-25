@@ -1067,6 +1067,38 @@ def test_gspo_branch_strata_weighted_loss_and_suffix_mask():
     assert metrics["actor/pg_loss_branch_unweighted"] == pytest.approx(-6.0)
 
 
+def test_gspo_trainable_prefill_mask_controls_gradient():
+    old_log_prob = torch.zeros((1, 4), dtype=torch.float32)
+    advantages = torch.ones((1, 4), dtype=torch.float32)
+    config = _branch_strata_actor_config(enabled=False)
+
+    masked_log_prob = torch.zeros((1, 4), dtype=torch.float32, requires_grad=True)
+    masked_prefill = torch.tensor([[0, 0, 1, 1]], dtype=torch.float32)
+    masked_loss, _ = compute_policy_loss_gspo(
+        old_log_prob=old_log_prob,
+        log_prob=masked_log_prob,
+        advantages=advantages,
+        response_mask=masked_prefill,
+        config=config,
+    )
+    masked_loss.backward()
+
+    trainable_log_prob = torch.zeros((1, 4), dtype=torch.float32, requires_grad=True)
+    trainable_prefill = torch.ones((1, 4), dtype=torch.float32)
+    trainable_loss, _ = compute_policy_loss_gspo(
+        old_log_prob=old_log_prob,
+        log_prob=trainable_log_prob,
+        advantages=advantages,
+        response_mask=trainable_prefill,
+        config=config,
+    )
+    trainable_loss.backward()
+
+    assert torch.equal(masked_log_prob.grad[0, :2], torch.zeros(2))
+    assert torch.all(masked_log_prob.grad[0, 2:].abs() > 0)
+    assert torch.all(trainable_log_prob.grad[0, :2].abs() > 0)
+
+
 def test_gspo_branch_strata_dynamic_microbatch_accumulation_is_invariant():
     response_mask = torch.tensor([[1, 1, 1], [1, 1, 1], [0, 0, 1], [0, 0, 1]], dtype=torch.float32)
     advantages = torch.tensor([1.0, 3.0, 5.0, 7.0]).view(-1, 1).expand(-1, 3)

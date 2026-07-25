@@ -174,6 +174,9 @@ class ToolAgentLoop(AgentLoopBase):
         self.force_answer_on_final_turn = getattr(multi_turn_config, "force_answer_on_final_turn", False)
         self.final_answer_token_margin = getattr(multi_turn_config, "final_answer_token_margin", 2048)
         self.force_final_answer_think_prefill = getattr(multi_turn_config, "force_final_answer_think_prefill", "")
+        self.force_final_answer_think_prefill_trainable = bool(
+            getattr(multi_turn_config, "force_final_answer_think_prefill_trainable", False)
+        )
         self.force_final_answer_prefix = getattr(multi_turn_config, "force_final_answer_prefix", "")
         self.tool_response_turn_suffix_enabled = getattr(multi_turn_config, "tool_response_turn_suffix_enabled", False)
         self.tool_response_explore_turns = getattr(multi_turn_config, "tool_response_explore_turns", 10)
@@ -197,6 +200,9 @@ class ToolAgentLoop(AgentLoopBase):
         )
         self.conditional_answer_retry_assistant_prefill = getattr(
             multi_turn_config, "conditional_answer_retry_assistant_prefill", ""
+        )
+        self.conditional_answer_retry_assistant_prefill_trainable = bool(
+            getattr(multi_turn_config, "conditional_answer_retry_assistant_prefill_trainable", False)
         )
         self.conditional_answer_retry_correct_accuracy_threshold = getattr(
             multi_turn_config, "conditional_answer_retry_correct_accuracy_threshold", 0.0
@@ -628,13 +634,27 @@ class ToolAgentLoop(AgentLoopBase):
 
     def _append_conditional_retry_assistant_prefill(self, agent_data: AgentData) -> list[int]:
         prefill = self.conditional_answer_retry_assistant_prefill or ""
-        return self._append_masked_assistant_prefill(agent_data, prefill)
+        return self._append_assistant_prefill(
+            agent_data,
+            prefill,
+            trainable=self.conditional_answer_retry_assistant_prefill_trainable,
+        )
 
     def _append_force_final_answer_think_prefill(self, agent_data: AgentData) -> list[int]:
         prefill = self.force_final_answer_think_prefill or ""
-        return self._append_masked_assistant_prefill(agent_data, prefill)
+        return self._append_assistant_prefill(
+            agent_data,
+            prefill,
+            trainable=self.force_final_answer_think_prefill_trainable,
+        )
 
-    def _append_masked_assistant_prefill(self, agent_data: AgentData, prefill: str) -> list[int]:
+    def _append_assistant_prefill(
+        self,
+        agent_data: AgentData,
+        prefill: str,
+        *,
+        trainable: bool,
+    ) -> list[int]:
         if not prefill:
             return []
         prefill_ids = self.tokenizer.encode(prefill, add_special_tokens=False)
@@ -643,7 +663,10 @@ class ToolAgentLoop(AgentLoopBase):
         if len(agent_data.response_mask) + len(prefill_ids) >= self.response_length:
             return []
         agent_data.prompt_ids += prefill_ids
-        agent_data.response_mask += [0] * len(prefill_ids)
+        # Trainable prefills are counterfactual, teacher-forced actions. Their rollout
+        # log-probability placeholders remain zero for alignment, so configurations
+        # enabling them must recompute old-policy likelihoods rather than use rollout IS.
+        agent_data.response_mask += [int(trainable)] * len(prefill_ids)
         return prefill_ids
 
     def _snapshot_generation_state(self, agent_data: AgentData) -> dict[str, Any]:

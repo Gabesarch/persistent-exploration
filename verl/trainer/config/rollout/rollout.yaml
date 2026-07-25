@@ -227,6 +227,10 @@ multi_turn:
   # Prefix inserted inside the `<think>` block before generation on forced final-answer turns.
   force_final_answer_think_prefill: ""
 
+  # Include the injected final-answer think prefill in the policy-loss mask.
+  # Keep false for normal on-policy rollouts; true uses recomputed old-policy likelihoods.
+  force_final_answer_think_prefill_trainable: False
+
   # Append turn-dependent guidance to tool responses without forcing logits/actions.
   tool_response_turn_suffix_enabled: False
   tool_response_explore_turns: 10
@@ -240,6 +244,11 @@ multi_turn:
   conditional_answer_retry_force_next_tool_call: True
   conditional_answer_retry_suffix: "You have not gathered enough information yet. In your next turn, keep exploring rather than answering prematurely: use more tool calls to broaden the search, test alternative hypotheses, look for disconfirming evidence, and dig deeper into the most likely explanations. Finalize only when the evidence clearly supports a conclusion."
   conditional_answer_retry_assistant_prefill: ""
+
+  # Include the injected retry prefill in the policy-loss mask.
+  # Keep false for normal on-policy rollouts; true uses recomputed old-policy likelihoods.
+  conditional_answer_retry_assistant_prefill_trainable: False
+
   conditional_answer_retry_correct_accuracy_threshold: 0.0
   conditional_answer_retry_max_retries: null
   conditional_answer_retry_branch_enabled: False

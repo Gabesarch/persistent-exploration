@@ -11,7 +11,7 @@ algorithm:
   # Conditional retry changes tool-call counts only after incorrect answers, so
   # use task/format rewards plus a composite crop-quality penalty.
   gdpo_reward_keys: [accuracy, format, tool_repeat_overlap]
-  gdpo_reward_weights: [0.9, 0.1, 0.3]
+  gdpo_reward_weights: [0.8, 0.2, 0.3]
   gdpo_baseline_weight_key: gdpo_baseline_weight
   gdpo_stability_enabled: true
   gdpo_component_std_floor: 0.05
@@ -243,10 +243,12 @@ actor_rollout_ref:
       # Normal rollout first; incorrect answers are removed and followed by a forced tool-call retry.
       force_tool_calls_until_final_turn: false
       force_answer_on_final_turn: true
+      force_final_answer_think_prefill: "This is the final turn, so I need to answer from the evidence gathered so far."
       final_answer_token_margin: 2048
       conditional_answer_retry_enabled: true
       conditional_answer_retry_force_next_tool_call: true
       conditional_answer_retry_suffix: ""
+      conditional_answer_retry_assistant_prefill: "Let’s see. I still don’t have decisive evidence, so I should inspect a substantially different region. If one area looks especially promising, I can examine it more closely, but I should look elsewhere once further zooming stops revealing new evidence."
       conditional_answer_retry_correct_accuracy_threshold: 0.0
       conditional_answer_retry_max_retries: null
       conditional_answer_retry_branch_enabled: true
@@ -353,7 +355,7 @@ critic:
 trainer:
   critic_warmup: 0
   logger: ["console", "wandb"]
-  save_freq: 20
+  save_freq: 10
   test_freq: 10
   nnodes: 1
   n_gpus_per_node: 8
@@ -382,4 +384,3 @@ trainer:
       log_driver_stages: true
       log_worker_stages: true
       log_nvidia_smi: true
-

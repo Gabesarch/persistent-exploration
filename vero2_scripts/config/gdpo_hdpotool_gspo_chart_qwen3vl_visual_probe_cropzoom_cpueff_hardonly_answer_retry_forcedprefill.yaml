@@ -233,6 +233,7 @@ actor_rollout_ref:
       conditional_answer_retry_enabled: true
       conditional_answer_retry_force_next_tool_call: true
       conditional_answer_retry_suffix: ""
+      conditional_answer_retry_assistant_prefill: "Let’s see. I still don’t have decisive evidence, so I should inspect a substantially different region. If one area looks especially promising, I can examine it more closely, but I should look elsewhere once further zooming stops revealing new evidence."
       conditional_answer_retry_correct_accuracy_threshold: 0.0
       conditional_answer_retry_max_retries: null
     tensor_model_parallel_size: 1

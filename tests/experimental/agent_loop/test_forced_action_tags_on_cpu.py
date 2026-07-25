@@ -227,6 +227,7 @@ def _make_loop(tokenizer: _FakeTokenizer, server_manager: _FakeServerManager, to
     loop.force_answer_on_final_turn = False
     loop.final_answer_token_margin = 2048
     loop.force_final_answer_think_prefill = ""
+    loop.force_final_answer_think_prefill_trainable = False
     loop.force_final_answer_prefix = ""
     loop.max_assistant_turns = 11
     loop.max_user_turns = 10
@@ -253,6 +254,7 @@ def _make_conditional_retry_loop(
     loop.force_answer_on_final_turn = False
     loop.final_answer_token_margin = 4
     loop.force_final_answer_think_prefill = ""
+    loop.force_final_answer_think_prefill_trainable = False
     loop.force_final_answer_prefix = ""
     loop.max_assistant_turns = 11
     loop.max_user_turns = 10
@@ -269,9 +271,11 @@ def _make_conditional_retry_loop(
     loop.conditional_answer_retry_force_next_tool_call = True
     loop.conditional_answer_retry_suffix = "retry suffix"
     loop.conditional_answer_retry_assistant_prefill = ""
+    loop.conditional_answer_retry_assistant_prefill_trainable = False
     loop.conditional_answer_retry_correct_accuracy_threshold = 0.0
     loop.conditional_answer_retry_max_retries = None
     loop.conditional_answer_retry_reward_fn = reward_fn
+    loop.conditional_answer_retry_branch_enabled = False
     loop.llm_judge_enabled = False
     loop.llm_judge_prompt_template = None
     loop.llm_judge_reward_types = {"search"}
@@ -340,11 +344,13 @@ def test_tool_agent_loop_init_tolerates_missing_optional_multi_turn_keys(monkeyp
 
     assert loop.force_final_answer_prefix == ""
     assert loop.force_final_answer_think_prefill == ""
+    assert loop.force_final_answer_think_prefill_trainable is False
     assert loop.force_tool_calls_until_final_turn is False
     assert loop.force_answer_on_final_turn is False
     assert loop.conditional_answer_retry_enabled is False
     assert loop.conditional_answer_retry_force_next_tool_call is True
     assert loop.conditional_answer_retry_assistant_prefill == ""
+    assert loop.conditional_answer_retry_assistant_prefill_trainable is False
     assert loop.llm_judge_enabled is False
     assert loop.llm_judge_reward_types == {"search"}
     assert loop.llm_judge_assistant_prefill == "{"
@@ -518,6 +524,32 @@ def test_forced_final_turn_think_prefill_is_masked_and_in_prompt():
     extra_args = server_manager.sampling_params_by_call[0]["extra_args"]
     assert extra_args[FORCE_ACTION_REQUIRED_TAG_KEY] == "<answer>"
     assert extra_args[FORCE_ACTION_TAG_IDS_KEY] == [2, 20, 21, 22]
+    assert "forced_structure_error" not in agent_data.extra_fields
+
+
+def test_forced_final_turn_think_prefill_is_trainable_when_enabled():
+    tokenizer = _FakeTokenizer()
+    server_manager = _SequencedFakeServerManager([[31, 1, 2, 20, 21, 22, 50]])
+    tool_parser = _FakeToolParser([])
+    agent_data = _make_agent_data()
+    agent_data.assistant_turns = 10
+
+    async def run_test():
+        loop = _make_loop(tokenizer, server_manager, tool_parser)
+        loop.force_final_answer_think_prefill = (
+            "This is the final turn, so I need to answer from the evidence gathered so far."
+        )
+        loop.force_final_answer_think_prefill_trainable = True
+        return await loop._handle_generating_state(agent_data, {"temperature": 1.0})
+
+    state = asyncio.run(run_test())
+
+    assert state == AgentState.TERMINATED
+    assert server_manager.prompt_ids_by_call[0][-1:] == [72]
+    assert agent_data.response_mask == [1] * 8
+    assert agent_data.response_logprobs == [0.0] * 8
+    assert len(agent_data.response_mask) == len(agent_data.response_logprobs)
+    assert agent_data.prompt_ids[-8:] == [72, 31, 1, 2, 20, 21, 22, 50]
     assert "forced_structure_error" not in agent_data.extra_fields
 
 
@@ -832,6 +864,117 @@ def test_conditional_answer_retry_assistant_prefill_is_masked_and_in_prompt():
     assert agent_data.response_mask == [0, 0] + [1] * 7
     assert agent_data.response_logprobs == [0.0, 0.0] + [0.0] * 7
     assert agent_data.prompt_ids[-9:] == [70, 71, 30, 31, 1, 2, 10, 40, 11]
+
+
+def test_conditional_answer_retry_assistant_prefill_is_trainable_when_enabled():
+    tokenizer = _FakeTokenizer()
+    server_manager = _SequencedFakeServerManager(
+        [
+            [30, 31, 1, 2, 20, 21, 22, 50],
+            [30, 31, 1, 2, 10, 40, 11],
+        ]
+    )
+    tool_parser = _SequencedFakeToolParser(
+        [
+            [],
+            [FunctionCall(name="image_zoom_in_tool", arguments="{}")],
+        ]
+    )
+    agent_data = _make_agent_data()
+
+    async def run_test():
+        loop = _make_conditional_retry_loop(
+            tokenizer,
+            server_manager,
+            tool_parser,
+            lambda **kwargs: {"accuracy": 0.0, "score": 0.0},
+        )
+        loop.conditional_answer_retry_assistant_prefill = "retry prefill"
+        loop.conditional_answer_retry_assistant_prefill_trainable = True
+        first_state = await loop._handle_generating_state(
+            agent_data,
+            {"temperature": 1.0},
+            rollout_kwargs={"data_source": "unit", "reward_model": {"ground_truth": "ok"}, "extra_info": {}},
+        )
+        second_state = await loop._handle_generating_state(
+            agent_data,
+            {"temperature": 1.0},
+            rollout_kwargs={"data_source": "unit", "reward_model": {"ground_truth": "ok"}, "extra_info": {}},
+        )
+        return first_state, second_state
+
+    first_state, second_state = asyncio.run(run_test())
+
+    assert first_state == AgentState.GENERATING
+    assert second_state == AgentState.PROCESSING_TOOLS
+    assert server_manager.prompt_ids_by_call[1][-2:] == [70, 71]
+    assert agent_data.response_mask == [1] * 9
+    assert agent_data.response_logprobs == [0.0] * 9
+    assert len(agent_data.response_mask) == len(agent_data.response_logprobs)
+    assert agent_data.prompt_ids[-9:] == [70, 71, 30, 31, 1, 2, 10, 40, 11]
+
+
+def test_retry_and_final_answer_prefills_are_both_trainable_in_one_trajectory():
+    tokenizer = _FakeTokenizer()
+    server_manager = _SequencedFakeServerManager(
+        [
+            [30, 31, 1, 2, 20, 21, 22, 50],
+            [30, 31, 1, 2, 10, 40, 11],
+            [31, 1, 2, 20, 21, 22, 50],
+        ]
+    )
+    tool_parser = _SequencedFakeToolParser(
+        [
+            [],
+            [FunctionCall(name="image_zoom_in_tool", arguments="{}")],
+            [],
+        ]
+    )
+    agent_data = _make_agent_data()
+
+    async def run_test():
+        loop = _make_conditional_retry_loop(
+            tokenizer,
+            server_manager,
+            tool_parser,
+            lambda **kwargs: {"accuracy": 0.0, "score": 0.0},
+        )
+        loop.conditional_answer_retry_assistant_prefill = "retry prefill"
+        loop.conditional_answer_retry_assistant_prefill_trainable = True
+        loop.force_final_answer_think_prefill = (
+            "This is the final turn, so I need to answer from the evidence gathered so far."
+        )
+        loop.force_final_answer_think_prefill_trainable = True
+        loop.force_answer_on_final_turn = True
+
+        first_state = await loop._handle_generating_state(
+            agent_data,
+            {"temperature": 1.0},
+            rollout_kwargs={"data_source": "unit", "reward_model": {"ground_truth": "ok"}, "extra_info": {}},
+        )
+        second_state = await loop._handle_generating_state(
+            agent_data,
+            {"temperature": 1.0},
+            rollout_kwargs={"data_source": "unit", "reward_model": {"ground_truth": "ok"}, "extra_info": {}},
+        )
+        agent_data.assistant_turns = 10
+        final_state = await loop._handle_generating_state(
+            agent_data,
+            {"temperature": 1.0},
+            rollout_kwargs={"data_source": "unit", "reward_model": {"ground_truth": "ok"}, "extra_info": {}},
+        )
+        return first_state, second_state, final_state
+
+    first_state, second_state, final_state = asyncio.run(run_test())
+
+    assert first_state == AgentState.GENERATING
+    assert second_state == AgentState.PROCESSING_TOOLS
+    assert final_state == AgentState.TERMINATED
+    assert server_manager.prompt_ids_by_call[1][-2:] == [70, 71]
+    assert server_manager.prompt_ids_by_call[2][-1:] == [72]
+    assert agent_data.response_mask == [1] * 17
+    assert agent_data.response_logprobs == [0.0] * 17
+    assert len(agent_data.response_mask) == len(agent_data.response_logprobs)
 
 
 def test_conditional_answer_retry_skips_when_caps_prevent_more_exploration():
