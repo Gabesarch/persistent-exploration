@@ -302,6 +302,7 @@ actor_rollout_ref:
       max_assistant_turns: null
       tool_config_path: null
       max_user_turns: null
+      max_assistant_tokens_per_turn: null
       max_parallel_calls: 1
       max_tool_response_length: 256
       tool_response_truncate_side: middle
@@ -325,6 +326,7 @@ actor_rollout_ref:
       tool_response_final_suffix: The maximum amount of tool calling has been reached.
         Please output a final answer in the next turn.
       conditional_answer_retry_enabled: false
+      conditional_answer_retry_enable_validation: true
       conditional_answer_retry_force_next_tool_call: true
       conditional_answer_retry_suffix: 'You have not gathered enough information yet.
         In your next turn, keep exploring rather than answering prematurely: use more

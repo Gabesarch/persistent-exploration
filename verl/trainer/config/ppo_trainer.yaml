@@ -201,6 +201,10 @@ trainer:
   # Path to resume training from (only used when resume_mode is "resume_path")
   resume_from_path: null
 
+  # Fallback checkpoint used by "auto" only when default_local_dir has no checkpoint.
+  # Once the destination saves a checkpoint, that newer destination checkpoint wins.
+  bootstrap_from_path: null
+
   # Whether to run validation before training begins
   val_before_train: True
 

@@ -1,10 +1,11 @@
 import asyncio
+import json
 from types import SimpleNamespace
 from typing import Any, Optional
 
-from omegaconf import OmegaConf
 import pytest
 import torch
+from omegaconf import OmegaConf
 from vllm import SamplingParams
 
 from verl.experimental.agent_loop.tool_agent_loop import (
@@ -18,7 +19,10 @@ from verl.utils.forced_action_tags import (
     FORCE_ACTION_LOGITS_PROCESSOR_FQCN,
     FORCE_ACTION_REQUIRED_TAG_KEY,
     FORCE_ACTION_TAG_IDS_KEY,
+    VLLM_OPENAI_EXTRA_ARGS_KEY,
     ForceActionTagAfterThinkRequestProcessor,
+    build_forced_action_extra_args,
+    build_forced_action_openai_extra_body,
     ensure_forced_action_logits_processor,
 )
 from verl.utils.vllm_forced_action_logits_processor import ForceActionTagAfterThinkLogitsProcessor
@@ -31,6 +35,12 @@ class _FakeTokenizer:
             "</think>": [1],
             "</think>\n": [1, 2],
             "</think>\n\n": [1, 2, 2],
+            "</": [80],
+            "think": [81],
+            ">": [82],
+            "<": [83],
+            "/": [84],
+            "/think": [85],
             "<tool_call>": [10],
             "\n<tool_call>": [2, 10],
             "<answer>": [20, 21, 22],
@@ -83,7 +93,7 @@ def _processor_for_tag(tokenizer: _FakeTokenizer, required_tag: str) -> ForceAct
 
 def _forced_token(processor: ForceActionTagAfterThinkRequestProcessor, token_ids: list[int]) -> int:
     logits = torch.zeros(64)
-    processed = processor(token_ids, logits)
+    processed = processor([], token_ids, logits)
     finite = torch.isfinite(processed).nonzero().flatten().tolist()
     assert len(finite) == 1
     return finite[0]
@@ -93,7 +103,7 @@ def test_force_action_tag_after_think_leaves_unmatched_logits_unchanged():
     processor = _processor_for_tag(_FakeTokenizer(), "<tool_call>")
     logits = torch.arange(64, dtype=torch.float32)
 
-    processed = processor([30, 31], logits.clone())
+    processed = processor([], [30, 31], logits.clone())
 
     assert torch.equal(processed, logits)
 
@@ -112,6 +122,88 @@ def test_force_action_tag_after_think_forces_multi_token_answer_prefix():
     assert _forced_token(processor, [30, 31, 1, 2]) == 20
     assert _forced_token(processor, [30, 31, 1, 2, 20]) == 21
     assert _forced_token(processor, [30, 31, 1, 2, 20, 21]) == 22
+
+
+def test_force_action_tag_after_think_matches_across_prompt_output_boundary():
+    processor = _processor_for_tag(_FakeTokenizer(), "<answer>")
+    logits = torch.zeros(64)
+
+    processed = processor([30, 31, 1], [], logits)
+    assert torch.isfinite(processed).nonzero().flatten().tolist() == [20]
+
+    processed = processor([30, 31, 1], [20, 21], torch.zeros(64))
+    assert torch.isfinite(processed).nonzero().flatten().tolist() == [22]
+
+
+def test_force_action_tag_after_think_is_only_forced_once_per_request():
+    processor = _processor_for_tag(_FakeTokenizer(), "<answer>")
+
+    assert _forced_token(processor, [30, 31, 1]) == 20
+    assert _forced_token(processor, [30, 31, 1, 20]) == 21
+    assert _forced_token(processor, [30, 31, 1, 20, 21]) == 22
+
+    # The next decoding step observes the completed forced tag. A later
+    # spurious </think> inside the answer must not inject a second <answer>.
+    unchanged = torch.arange(64, dtype=torch.float32)
+    processed = processor([], [30, 31, 1, 20, 21, 22], unchanged.clone())
+    assert torch.equal(processed, unchanged)
+    processed = processor([], [30, 31, 1, 20, 21, 22, 50, 1], unchanged.clone())
+    assert torch.equal(processed, unchanged)
+
+
+def test_shared_payload_accepts_special_and_decomposed_after_think_encodings():
+    payload = build_forced_action_extra_args(
+        _FakeTokenizer(),
+        "<answer>",
+        forced_suffix="\n\\boxed{",
+    )
+
+    assert payload[FORCE_ACTION_TAG_IDS_KEY] == [2, 20, 21, 22, 2, 60, 61]
+    assert payload[FORCE_ACTION_AFTER_THINK_IDS_OPTIONS_KEY] == [
+        [1],
+        [80, 81, 82],
+        [83, 84, 81, 82],
+        [83, 85, 82],
+    ]
+
+
+def test_openai_payload_uses_vllm_xargs_not_internal_extra_args_field():
+    body = build_forced_action_openai_extra_body(_FakeTokenizer(), "<answer>")
+
+    assert set(body) == {VLLM_OPENAI_EXTRA_ARGS_KEY}
+    assert body[VLLM_OPENAI_EXTRA_ARGS_KEY][FORCE_ACTION_REQUIRED_TAG_KEY] == "<answer>"
+    assert body[VLLM_OPENAI_EXTRA_ARGS_KEY][FORCE_ACTION_TAG_IDS_KEY] == [2, 20, 21, 22]
+    assert json.loads(body[VLLM_OPENAI_EXTRA_ARGS_KEY][FORCE_ACTION_AFTER_THINK_IDS_OPTIONS_KEY]) == [
+        [1],
+        [80, 81, 82],
+        [83, 84, 81, 82],
+        [83, 85, 82],
+    ]
+
+
+def test_vllm_adapter_decodes_openai_json_marker_options():
+    body = build_forced_action_openai_extra_body(_FakeTokenizer(), "<answer>")
+    params = SamplingParams(extra_args=body[VLLM_OPENAI_EXTRA_ARGS_KEY])
+    processor = ForceActionTagAfterThinkLogitsProcessor(None, torch.device("cpu"), False)
+
+    ForceActionTagAfterThinkLogitsProcessor.validate_params(params)
+    request_processor = processor.new_req_logits_processor(params)
+
+    assert _forced_token(request_processor, [30, 31, 1]) == 2
+    assert _forced_token(request_processor, [30, 31, 1, 2]) == 20
+
+
+def test_vllm_openai_schema_accepts_serialized_forced_action_payload():
+    protocol = pytest.importorskip("vllm.entrypoints.openai.chat_completion.protocol")
+    body = build_forced_action_openai_extra_body(_FakeTokenizer(), "<answer>")
+
+    request = protocol.ChatCompletionRequest(
+        model="qwen_vllm",
+        messages=[{"role": "user", "content": "question"}],
+        **body,
+    )
+
+    assert request.vllm_xargs == body[VLLM_OPENAI_EXTRA_ARGS_KEY]
 
 
 def test_vllm_adapter_validates_and_builds_request_processor():
@@ -230,6 +322,7 @@ def _make_loop(tokenizer: _FakeTokenizer, server_manager: _FakeServerManager, to
     loop.force_final_answer_think_prefill_trainable = False
     loop.force_final_answer_prefix = ""
     loop.max_assistant_turns = 11
+    loop.max_assistant_tokens_per_turn = None
     loop.max_user_turns = 10
     loop.response_length = 24576
     loop.server_manager = server_manager
@@ -257,6 +350,7 @@ def _make_conditional_retry_loop(
     loop.force_final_answer_think_prefill_trainable = False
     loop.force_final_answer_prefix = ""
     loop.max_assistant_turns = 11
+    loop.max_assistant_tokens_per_turn = None
     loop.max_user_turns = 10
     loop.response_length = 64
     loop.server_manager = server_manager
@@ -268,6 +362,7 @@ def _make_conditional_retry_loop(
     loop.interaction_config_file = None
     loop.response_display_prefix = ""
     loop.conditional_answer_retry_enabled = True
+    loop.conditional_answer_retry_enable_validation = True
     loop.conditional_answer_retry_force_next_tool_call = True
     loop.conditional_answer_retry_suffix = "retry suffix"
     loop.conditional_answer_retry_assistant_prefill = ""
@@ -347,7 +442,9 @@ def test_tool_agent_loop_init_tolerates_missing_optional_multi_turn_keys(monkeyp
     assert loop.force_final_answer_think_prefill_trainable is False
     assert loop.force_tool_calls_until_final_turn is False
     assert loop.force_answer_on_final_turn is False
+    assert loop.max_assistant_tokens_per_turn is None
     assert loop.conditional_answer_retry_enabled is False
+    assert loop.conditional_answer_retry_enable_validation is True
     assert loop.conditional_answer_retry_force_next_tool_call is True
     assert loop.conditional_answer_retry_assistant_prefill == ""
     assert loop.conditional_answer_retry_assistant_prefill_trainable is False
@@ -378,6 +475,32 @@ def _make_agent_data() -> AgentData:
     return agent_data
 
 
+def test_assistant_turn_token_cap_uses_configured_existing_and_remaining_minimum():
+    loop = object.__new__(ToolAgentLoop)
+    loop.max_assistant_tokens_per_turn = 4096
+    loop.response_length = 10000
+    agent_data = _make_agent_data()
+    agent_data.response_mask = [1] * 3500
+
+    params = loop._with_assistant_turn_token_cap({"temperature": 1.0, "max_tokens": 5000}, agent_data)
+
+    assert params["max_tokens"] == 4096
+
+    agent_data.response_mask = [1] * 7500
+    params = loop._with_assistant_turn_token_cap({"temperature": 1.0, "max_tokens": 5000}, agent_data)
+    assert params["max_tokens"] == 2500
+
+
+def test_assistant_turn_token_cap_default_does_not_change_sampling_params():
+    loop = object.__new__(ToolAgentLoop)
+    loop.max_assistant_tokens_per_turn = None
+    loop.response_length = 10000
+    agent_data = _make_agent_data()
+    sampling_params = {"temperature": 1.0}
+
+    assert loop._with_assistant_turn_token_cap(sampling_params, agent_data) is sampling_params
+
+
 def test_forced_tool_turn_adds_extra_args_without_bad_words_or_request_logits_processor():
     tokenizer = _FakeTokenizer()
     server_manager = _FakeServerManager([30, 31, 1, 2, 10, 40, 11])
@@ -399,7 +522,12 @@ def test_forced_tool_turn_adds_extra_args_without_bad_words_or_request_logits_pr
     assert extra_args["existing"] == "kept"
     assert extra_args[FORCE_ACTION_REQUIRED_TAG_KEY] == "<tool_call>"
     assert extra_args[FORCE_ACTION_TAG_IDS_KEY] == [2, 10]
-    assert extra_args[FORCE_ACTION_AFTER_THINK_IDS_OPTIONS_KEY] == [[1]]
+    assert extra_args[FORCE_ACTION_AFTER_THINK_IDS_OPTIONS_KEY] == [
+        [1],
+        [80, 81, 82],
+        [83, 84, 81, 82],
+        [83, 85, 82],
+    ]
 
 
 def test_forced_tool_turn_marks_missing_tool_call_invalid():
@@ -651,6 +779,70 @@ def test_conditional_answer_retry_keeps_correct_first_answer_without_forcing():
     assert FORCE_ACTION_REQUIRED_TAG_KEY not in server_manager.sampling_params_by_call[0].get("extra_args", {})
     assert agent_data.extra_fields["conditional_answer_retry_last_grade"]["accuracy"] == 1.0
     assert agent_data.extra_fields.get("conditional_answer_retry_count") is None
+
+
+def test_conditional_answer_retry_is_disabled_for_validation_when_configured():
+    tokenizer = _FakeTokenizer()
+    server_manager = _SequencedFakeServerManager([[30, 31, 1, 2, 20, 21, 22, 50]])
+    tool_parser = _SequencedFakeToolParser([[]])
+    agent_data = _make_agent_data()
+
+    def unexpected_reward_fn(**kwargs):
+        raise AssertionError("validation rollout must not invoke the GT retry validator")
+
+    async def run_test():
+        loop = _make_conditional_retry_loop(
+            tokenizer,
+            server_manager,
+            tool_parser,
+            unexpected_reward_fn,
+        )
+        loop.conditional_answer_retry_enable_validation = False
+        return await loop._handle_generating_state(
+            agent_data,
+            {"temperature": 1.0},
+            rollout_kwargs={
+                "data_source": "unit",
+                "reward_model": {"ground_truth": "ok"},
+                "extra_info": {},
+                "_debug_trajectory": {"validate": True},
+            },
+        )
+
+    state = asyncio.run(run_test())
+
+    assert state == AgentState.TERMINATED
+    assert agent_data.extra_fields.get("conditional_answer_retry_last_grade") is None
+    assert agent_data.extra_fields.get("conditional_answer_retry_count") is None
+
+
+def test_validation_without_retry_still_forces_answer_on_final_turn():
+    tokenizer = _FakeTokenizer()
+    server_manager = _SequencedFakeServerManager([[31, 1, 2, 20, 21, 22, 50]])
+    tool_parser = _SequencedFakeToolParser([[]])
+    agent_data = _make_agent_data()
+    agent_data.assistant_turns = 10
+
+    async def run_test():
+        loop = _make_conditional_retry_loop(
+            tokenizer,
+            server_manager,
+            tool_parser,
+            lambda **kwargs: {"accuracy": 0.0},
+        )
+        loop.force_answer_on_final_turn = True
+        loop.conditional_answer_retry_enable_validation = False
+        return await loop._handle_generating_state(
+            agent_data,
+            {"temperature": 1.0},
+            rollout_kwargs={"_debug_trajectory": {"validate": True}},
+        )
+
+    state = asyncio.run(run_test())
+
+    assert state == AgentState.TERMINATED
+    extra_args = server_manager.sampling_params_by_call[0]["extra_args"]
+    assert extra_args[FORCE_ACTION_REQUIRED_TAG_KEY] == "<answer>"
 
 
 def test_conditional_answer_retry_grades_with_response_display_prefix():

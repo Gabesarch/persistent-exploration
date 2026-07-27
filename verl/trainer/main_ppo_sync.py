@@ -76,7 +76,7 @@ from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_teacher_policy
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils import tensordict_utils as tu
-from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
+from verl.utils.checkpoint.checkpoint_manager import resolve_ppo_checkpoint_path
 from verl.utils.config import omega_conf_to_dataclass, validate_config
 from verl.utils.dataset.rl_dataset import collate_fn
 from verl.utils.debug import marked_timer
@@ -716,27 +716,15 @@ class PPOTrainer:
     def _load_checkpoint(self):
         self.global_steps = 0
 
-        # 1. find latest checkpoint folder
-        if self.config.trainer.resume_mode == "disable":
+        global_step_folder = resolve_ppo_checkpoint_path(
+            default_local_dir=self.config.trainer.default_local_dir,
+            resume_mode=self.config.trainer.resume_mode,
+            resume_from_path=self.config.trainer.get("resume_from_path"),
+            bootstrap_from_path=self.config.trainer.get("bootstrap_from_path"),
+        )
+        if global_step_folder is None:
+            logger.info("Training from scratch")
             return
-        elif self.config.trainer.resume_mode == "auto":
-            checkpoint_folder = self.config.trainer.default_local_dir
-            if not os.path.isabs(checkpoint_folder):
-                working_dir = os.getcwd()
-                checkpoint_folder = os.path.join(working_dir, checkpoint_folder)
-            global_step_folder = find_latest_ckpt_path(checkpoint_folder)  # None if no latest
-            if global_step_folder is None:
-                logger.info("Training from scratch")
-                return
-        elif self.config.trainer.resume_mode == "resume_path":
-            assert isinstance(self.config.trainer.resume_from_path, str), "resume ckpt must be str type"
-            assert "global_step_" in self.config.trainer.resume_from_path, "resume ckpt must specify the global_steps"
-            global_step_folder = self.config.trainer.resume_from_path
-            if not os.path.isabs(global_step_folder):
-                working_dir = os.getcwd()
-                global_step_folder = os.path.join(working_dir, global_step_folder)
-        else:
-            logger.exception(f"Unknown resume mode {self.config.trainer.resume_mode}")
 
         # set global step
         self.global_steps = int(global_step_folder.split("global_step_")[-1])

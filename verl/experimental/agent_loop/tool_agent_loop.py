@@ -45,6 +45,7 @@ from verl.utils.debug.comprehensive_logging import (
     should_log_step,
     to_jsonable,
 )
+from verl.utils.forced_action_tags import build_forced_action_extra_args
 from verl.utils.profiler import simple_timer
 from verl.utils.response_display import apply_response_display_prefix, get_response_display_prefix
 from verl.utils.reward_score.math_verify_reward_type_multiturn_tool_calling_optional_think import (
@@ -53,11 +54,6 @@ from verl.utils.reward_score.math_verify_reward_type_multiturn_tool_calling_opti
     extract_answer_for_accuracy,
 )
 from verl.utils.rollout_trace import rollout_trace_op
-from verl.utils.forced_action_tags import (
-    FORCE_ACTION_AFTER_THINK_IDS_OPTIONS_KEY,
-    FORCE_ACTION_REQUIRED_TAG_KEY,
-    FORCE_ACTION_TAG_IDS_KEY,
-)
 from verl.workers.rollout.replica import TokenOutput
 
 logger = logging.getLogger(__file__)
@@ -167,6 +163,13 @@ class ToolAgentLoop(AgentLoopBase):
         multi_turn_config = self.rollout_config.multi_turn
         self.max_user_turns = multi_turn_config.max_user_turns
         self.max_assistant_turns = multi_turn_config.max_assistant_turns
+        self.max_assistant_tokens_per_turn = getattr(
+            multi_turn_config, "max_assistant_tokens_per_turn", None
+        )
+        if self.max_assistant_tokens_per_turn is not None:
+            self.max_assistant_tokens_per_turn = int(self.max_assistant_tokens_per_turn)
+            if self.max_assistant_tokens_per_turn <= 0:
+                raise ValueError("multi_turn.max_assistant_tokens_per_turn must be positive or null")
         self.max_parallel_calls = multi_turn_config.max_parallel_calls
         self.max_tool_response_length = multi_turn_config.max_tool_response_length
         self.tool_response_truncate_side = multi_turn_config.tool_response_truncate_side
@@ -184,6 +187,9 @@ class ToolAgentLoop(AgentLoopBase):
         self.tool_response_final_suffix = getattr(multi_turn_config, "tool_response_final_suffix", "")
         self.conditional_answer_retry_enabled = getattr(
             multi_turn_config, "conditional_answer_retry_enabled", False
+        )
+        self.conditional_answer_retry_enable_validation = bool(
+            getattr(multi_turn_config, "conditional_answer_retry_enable_validation", True)
         )
         self.conditional_answer_retry_force_next_tool_call = getattr(
             multi_turn_config, "conditional_answer_retry_force_next_tool_call", True
@@ -430,25 +436,13 @@ class ToolAgentLoop(AgentLoopBase):
         )
 
     def _with_forced_action_extra_args(self, sampling_params: dict[str, Any], required_tag: str) -> dict[str, Any]:
-        # The semantic tag passed to vLLM (and used for downstream validation) stays `required_tag`,
-        # but the actually-forced token sequence may extend past it. On the forced final turn we can
-        # additionally force a fixed answer prefix (e.g. "\n\\boxed{") right after the `<answer>` tag.
-        forced_text = f"\n{required_tag}"
-        if required_tag == "<answer>" and self.force_final_answer_prefix:
-            forced_text += self.force_final_answer_prefix
-        tag_ids = self.tokenizer.encode(forced_text, add_special_tokens=False)
-        if not tag_ids:
-            raise ValueError(f"required action tag encoded to no tokens: {required_tag}")
-
         extra_args = dict(sampling_params.get("extra_args") or {})
         extra_args.update(
-            {
-                FORCE_ACTION_REQUIRED_TAG_KEY: required_tag,
-                FORCE_ACTION_TAG_IDS_KEY: tag_ids,
-                FORCE_ACTION_AFTER_THINK_IDS_OPTIONS_KEY: [
-                    self.tokenizer.encode("</think>", add_special_tokens=False),
-                ],
-            }
+            build_forced_action_extra_args(
+                self.tokenizer,
+                required_tag,
+                forced_suffix=self.force_final_answer_prefix if required_tag == "<answer>" else "",
+            )
         )
         return {**sampling_params, "extra_args": extra_args}
 
@@ -460,6 +454,30 @@ class ToolAgentLoop(AgentLoopBase):
         if assistant_turn == self.tool_response_explore_turns:
             return self.tool_response_final_suffix or ""
         return ""
+
+    def _conditional_answer_retry_active(self, rollout_kwargs: Optional[dict[str, Any]]) -> bool:
+        if not getattr(self, "conditional_answer_retry_enabled", False):
+            return False
+        debug_trajectory = (rollout_kwargs or {}).get("_debug_trajectory", {}) or {}
+        is_validation = bool(debug_trajectory.get("validate"))
+        return not is_validation or getattr(self, "conditional_answer_retry_enable_validation", True)
+
+    def _with_assistant_turn_token_cap(
+        self,
+        sampling_params: dict[str, Any],
+        agent_data: AgentData,
+    ) -> dict[str, Any]:
+        turn_cap = getattr(self, "max_assistant_tokens_per_turn", None)
+        if turn_cap is None:
+            return sampling_params
+        remaining_budget = self.response_length - len(agent_data.response_mask)
+        if remaining_budget <= 0:
+            raise RuntimeError("assistant generation requested after the response budget was exhausted")
+        caps = [int(turn_cap), int(remaining_budget)]
+        existing_cap = sampling_params.get("max_tokens")
+        if existing_cap is not None:
+            caps.append(int(existing_cap))
+        return {**sampling_params, "max_tokens": min(caps)}
 
     @staticmethod
     def _append_text_suffix(text: str, suffix: str) -> str:
@@ -511,13 +529,14 @@ class ToolAgentLoop(AgentLoopBase):
         elif self.force_answer_on_final_turn and self._must_answer_now(agent_data):
             forced_required_tag = "<answer>"
             sampling_params = self._with_forced_action_extra_args(sampling_params, forced_required_tag)
-        elif getattr(self, "conditional_answer_retry_enabled", False) and agent_data.force_next_tool_call:
+        elif self._conditional_answer_retry_active(rollout_kwargs) and agent_data.force_next_tool_call:
             forced_required_tag = "<tool_call>"
             sampling_params = self._with_forced_action_extra_args(sampling_params, forced_required_tag)
             assistant_prefill_ids = self._append_conditional_retry_assistant_prefill(agent_data)
             agent_data.force_next_tool_call = False
         if forced_required_tag == "<answer>":
             assistant_prefill_ids = self._append_force_final_answer_think_prefill(agent_data)
+        sampling_params = self._with_assistant_turn_token_cap(sampling_params, agent_data)
 
         with simple_timer("generate_sequences", agent_data.metrics):
             output: TokenOutput = await self.server_manager.generate(
@@ -589,7 +608,7 @@ class ToolAgentLoop(AgentLoopBase):
                 return AgentState.TERMINATED
 
         if (
-            getattr(self, "conditional_answer_retry_enabled", False)
+            self._conditional_answer_retry_active(rollout_kwargs)
             and not agent_data.tool_calls
             and rollout_kwargs is not None
         ):

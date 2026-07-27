@@ -33,6 +33,7 @@ _JUDGE_TP="${VLLM_JUDGE_TENSOR_PARALLEL_SIZE:-1}"
 _JUDGE_TEMPLATE="${VLLM_JUDGE_CHAT_TEMPLATE:-$VERO_EVAL_DIR/prompts/qwen3_nonthinking.jinja}"
 _JUDGE_MEM="${VLLM_JUDGE_GPU_MEMORY_UTILIZATION:-0.9}"
 _JUDGE_MAXLEN="${VLLM_JUDGE_MAX_MODEL_LEN:-18432}"
+_JUDGE_MAX_NUM_SEQS="${VLLM_JUDGE_MAX_NUM_SEQS:-32}"
 _JUDGE_LOG="$VERO_EVAL_DIR/logs/vllm/judge_$(date '+%Y-%m-%d_%H-%M-%S')_port${_JUDGE_PORT}.txt"
 mkdir -p "$(dirname "$_JUDGE_LOG")"
 
@@ -55,6 +56,7 @@ nohup env "${_cvd[@]}" VLLM_SERVER_DEV_MODE=1 vllm serve "$_JUDGE_MODEL_PATH" \
   --attention-config.flash_attn_version 2 \
   --tensor-parallel-size "$_JUDGE_TP" \
   --max-model-len "$_JUDGE_MAXLEN" \
+  --max-num-seqs "$_JUDGE_MAX_NUM_SEQS" \
   --enable-sleep-mode \
   --chat-template "$_JUDGE_TEMPLATE" \
   --api-key "$_JUDGE_API_KEY" \
@@ -67,6 +69,11 @@ echo "Waiting for judge server (log: $_JUDGE_LOG)..."
 _ok=0
 for _ in $(seq 1 90); do
   if curl --max-time 2 -s -o /dev/null "http://localhost:${_JUDGE_PORT}/v1/models"; then _ok=1; break; fi
+  if ! kill -0 "$VLLM_JUDGE_SERVER_PID" 2>/dev/null; then
+    echo "ERROR: judge server process exited during startup; see $_JUDGE_LOG" >&2
+    tail -n 80 "$_JUDGE_LOG" >&2 || true
+    return 1 2>/dev/null || exit 1
+  fi
   sleep 10
 done
 if [[ "$_ok" != 1 ]]; then

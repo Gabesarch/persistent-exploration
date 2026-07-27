@@ -77,6 +77,9 @@ class MultiTurnConfig(BaseConfig):
 
     enable: bool = False
     max_assistant_turns: Optional[int] = None
+    # Maximum number of model-generated tokens in one assistant turn.
+    # None leaves the per-turn generation budget uncapped.
+    max_assistant_tokens_per_turn: Optional[int] = None
     tool_config_path: Optional[str] = None
     max_user_turns: Optional[int] = None
     max_parallel_calls: int = 1
@@ -111,6 +114,8 @@ class MultiTurnConfig(BaseConfig):
         "The maximum amount of tool calling has been reached. Please output a final answer in the next turn."
     )
     conditional_answer_retry_enabled: bool = False
+    # Whether GT-based answer retry is allowed during validation rollouts.
+    conditional_answer_retry_enable_validation: bool = True
     conditional_answer_retry_force_next_tool_call: bool = True
     conditional_answer_retry_suffix: str = (
         "You have not gathered enough information yet. In your next turn, keep exploring rather than answering "

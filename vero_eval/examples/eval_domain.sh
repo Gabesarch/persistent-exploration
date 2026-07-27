@@ -18,6 +18,7 @@ set -euo pipefail
 # ── account config (caches, conda env, offline flags, PORT, ...) ──────
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERO_EVAL_DIR="$(cd "$SELF/.." && pwd)"
+export PYTHONPATH="$(cd "$VERO_EVAL_DIR/.." && pwd)${PYTHONPATH:+:$PYTHONPATH}"
 set +u
 if [[ -f "$VERO_EVAL_DIR/set_paths.sh" ]]; then
   source "$VERO_EVAL_DIR/set_paths.sh"

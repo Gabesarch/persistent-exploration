@@ -13,11 +13,6 @@ from typing import Dict, List, Optional, Tuple
 
 from accelerate import Accelerator, DistributedType
 from dotenv import load_dotenv
-from loguru import logger as eval_logger
-from openai import AsyncOpenAI
-from tqdm import tqdm
-from transformers import AutoTokenizer
-
 from lmms_eval.api.instance import GenerationResult, Instance, TokenCounts
 from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model
@@ -36,6 +31,12 @@ from lmms_eval.models.model_utils.usage_metrics import (
     log_usage,
 )
 from lmms_eval.protocol import ChatMessages
+from loguru import logger as eval_logger
+from openai import AsyncOpenAI
+from tqdm import tqdm
+from transformers import AutoTokenizer
+
+from verl.utils.forced_action_tags import build_forced_action_openai_extra_body
 
 VideoReader, _ = optional_import("decord", "VideoReader")
 cpu, _ = optional_import("decord", "cpu")
@@ -46,10 +47,8 @@ cpu, _ = optional_import("decord", "cpu")
 _TOOL_SAVED_IMAGE_RE = re.compile(r"Saved drawn image to:\s*(\S+)")
 _HIDDEN_TOOL_ARGS = {"image_path"}
 _IMAGE_REGISTRY_ENV = "LMMS_EVAL_IMAGE_REGISTRY"
-_FORCE_ACTION_REQUIRED_TAG_KEY = "verl_force_action_tag_after_think_required_tag"
-_FORCE_ACTION_TAG_IDS_KEY = "verl_force_action_tag_after_think_tag_ids"
-_FORCE_ACTION_AFTER_THINK_IDS_OPTIONS_KEY = "verl_force_action_tag_after_think_after_think_ids_options"
 _ASSISTANT_THINK_PREFIX = "<think>\n"
+_ANSWER_BLOCK_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL)
 
 # Env var carrying the per-call image registry (img_idx -> file path) to the MCP
 # tool subprocess, so tools resolve img_idx the way training does. Keep in sync
@@ -92,6 +91,10 @@ def _get_forced_action_tokenizer(name: str):
         trust_remote_code=trust_remote_code,
         local_files_only=_hf_tokenizer_local_files_only(),
     )
+
+
+class ForcedFinalAnswerError(RuntimeError):
+    """Raised when evaluation cannot obtain a structurally valid forced final answer."""
 
 
 def _composite_zoom_to_original(image_provenance, img_idx, bbox):
@@ -238,6 +241,17 @@ class AsyncOpenAIChat(lmms):
             force_final_answer_think_prefill = os.getenv("FORCE_FINAL_ANSWER_THINK_PREFILL", "")
         self.force_final_answer_think_prefill = force_final_answer_think_prefill or ""
         self._forced_action_tokenizer = None
+        self._forced_final_stats = {
+            "primary_attempts": 0,
+            "primary_successes": 0,
+            "fallback_attempts": 0,
+            "fallback_successes": 0,
+            "primary_input_tokens": 0,
+            "primary_output_tokens": 0,
+            "fallback_input_tokens": 0,
+            "fallback_output_tokens": 0,
+        }
+        self._forced_final_failures: dict[str, int] = {}
         self._tool_functions = None
         self._task_tools_cache = {}
         self._task_system_prompt_cache = {}
@@ -302,23 +316,11 @@ class AsyncOpenAIChat(lmms):
         if self._forced_action_tokenizer is None:
             self._forced_action_tokenizer = _get_forced_action_tokenizer(tokenizer_name)
 
-        forced_text = f"\n{required_tag}"
-        if required_tag == "<answer>" and self.force_final_answer_prefix:
-            forced_text += self.force_final_answer_prefix
-        tag_ids = self._forced_action_tokenizer.encode(forced_text, add_special_tokens=False)
-        after_think_ids = self._forced_action_tokenizer.encode("</think>", add_special_tokens=False)
-        if not tag_ids:
-            raise ValueError(f"required action tag encoded to no tokens: {required_tag}")
-        if not after_think_ids:
-            raise ValueError("forced action after-think marker encoded to no tokens: </think>")
-
-        return {
-            "extra_args": {
-                _FORCE_ACTION_REQUIRED_TAG_KEY: required_tag,
-                _FORCE_ACTION_TAG_IDS_KEY: tag_ids,
-                _FORCE_ACTION_AFTER_THINK_IDS_OPTIONS_KEY: [after_think_ids],
-            }
-        }
+        return build_forced_action_openai_extra_body(
+            self._forced_action_tokenizer,
+            required_tag,
+            forced_suffix=self.force_final_answer_prefix if required_tag == "<answer>" else "",
+        )
 
     def _with_forced_action_extra_body(self, payload: dict, required_tag: str) -> dict:
         payload = dict(payload)
@@ -327,19 +329,124 @@ class AsyncOpenAIChat(lmms):
         payload["extra_body"] = extra_body
         return payload
 
-    def _with_final_answer_think_prefill(self, payload: dict) -> tuple[dict, str]:
+    def _with_final_answer_think_prefill(self, payload: dict, *, close_think: bool = False) -> tuple[dict, str]:
         if not self.force_final_answer_think_prefill:
             return payload, ""
 
         payload = dict(payload)
         messages = list(payload.get("messages") or [])
         prefill_content = f"{_ASSISTANT_THINK_PREFIX}{self.force_final_answer_think_prefill}"
+        if close_think:
+            prefill_content += "\n</think>"
         messages.append({"role": "assistant", "content": prefill_content})
         payload["messages"] = messages
         extra_body = dict(payload.get("extra_body") or {})
         extra_body.update({"continue_final_message": True, "add_generation_prompt": False})
         payload["extra_body"] = extra_body
         return payload, prefill_content
+
+    def _forced_final_answer_request(self, payload: dict, *, hard_fallback: bool) -> tuple[dict, str]:
+        request_payload = dict(payload)
+        # vLLM retains the tool schemas in the rendered prompt by default while
+        # disabling OpenAI/Hermes tool-call extraction for this request.
+        request_payload["tool_choice"] = "none"
+        request_payload = self._with_forced_action_extra_body(request_payload, "<answer>")
+        return self._with_final_answer_think_prefill(request_payload, close_think=hard_fallback)
+
+    @staticmethod
+    def _forced_final_answer_failure(response) -> Optional[str]:
+        choice = response.choices[0]
+        message = choice.message
+        if getattr(message, "tool_calls", None):
+            return "unexpected_message_tool_calls"
+        content = message.content or ""
+        if "<tool_call>" in content or "</tool_call>" in content:
+            return "textual_tool_call"
+        if content.count("<answer>") == 0:
+            return "missing_answer_tag"
+        if content.count("<answer>") != 1:
+            return "multiple_answer_tags"
+        if content.count("</answer>") == 0:
+            return "missing_answer_close"
+        if content.count("</answer>") != 1:
+            return "multiple_answer_closes"
+        matches = _ANSWER_BLOCK_RE.findall(content)
+        if len(matches) != 1:
+            return "malformed_answer_block"
+        if not matches[0].strip():
+            return "empty_answer"
+        return None
+
+    def _record_forced_final_failure(self, reason: str) -> None:
+        self._forced_final_failures[reason] = self._forced_final_failures.get(reason, 0) + 1
+
+    @staticmethod
+    def _response_token_counts(response) -> tuple[int, int, int]:
+        if not getattr(response, "usage", None):
+            return 0, 0, 0
+        input_tokens = getattr(response.usage, "prompt_tokens", 0) or 0
+        output_tokens = getattr(response.usage, "completion_tokens", 0) or 0
+        reasoning_tokens = 0
+        details = getattr(response.usage, "completion_tokens_details", None)
+        if details:
+            reasoning_tokens = getattr(details, "reasoning_tokens", 0) or 0
+        return input_tokens, output_tokens, reasoning_tokens
+
+    @staticmethod
+    def _tool_call_diagnostic(response) -> str:
+        tool_calls = getattr(response.choices[0].message, "tool_calls", None) or []
+        rendered = []
+        for call in tool_calls:
+            function = getattr(call, "function", None)
+            rendered.append(
+                {
+                    "name": getattr(function, "name", None),
+                    "arguments": getattr(function, "arguments", None),
+                }
+            )
+        return json.dumps(rendered, ensure_ascii=False)
+
+    async def _obtain_forced_final_answer(self, payload: dict, request_idx: int):
+        self._forced_final_stats["primary_attempts"] += 1
+        primary_payload, primary_prefill = self._forced_final_answer_request(
+            payload,
+            hard_fallback=False,
+        )
+        primary_response = await self.client.chat.completions.create(**primary_payload)
+        responses_for_usage = [("primary", primary_response)]
+        primary_failure = self._forced_final_answer_failure(primary_response)
+        if primary_failure is None:
+            self._forced_final_stats["primary_successes"] += 1
+            return primary_response, primary_prefill, responses_for_usage
+
+        self._record_forced_final_failure(f"primary_{primary_failure}")
+        eval_logger.warning(
+            "Forced final-answer primary request failed "
+            f"for request {request_idx}: reason={primary_failure} "
+            f"finish_reason={primary_response.choices[0].finish_reason} "
+            f"tool_calls={self._tool_call_diagnostic(primary_response)} "
+            f"content={repr((primary_response.choices[0].message.content or '')[-1000:])}"
+        )
+        self._forced_final_stats["fallback_attempts"] += 1
+        fallback_payload, fallback_prefill = self._forced_final_answer_request(
+            payload,
+            hard_fallback=True,
+        )
+        fallback_response = await self.client.chat.completions.create(**fallback_payload)
+        responses_for_usage.append(("fallback", fallback_response))
+        fallback_failure = self._forced_final_answer_failure(fallback_response)
+        if fallback_failure is not None:
+            self._record_forced_final_failure(f"fallback_{fallback_failure}")
+            raise ForcedFinalAnswerError(
+                "Hard forced final-answer retry failed "
+                f"for request {request_idx}: reason={fallback_failure}, "
+                f"finish_reason={fallback_response.choices[0].finish_reason}, "
+                f"tool_calls={self._tool_call_diagnostic(fallback_response)}, "
+                f"content={repr((fallback_response.choices[0].message.content or '')[-1000:])}"
+            )
+
+        self._forced_final_stats["fallback_successes"] += 1
+        return fallback_response, fallback_prefill, responses_for_usage
 
     def _rewrite_tool_schemas_for_model(self, tool_list):
         rewritten = []
@@ -766,7 +873,12 @@ class AsyncOpenAIChat(lmms):
                 if pending_user_images:
                     messages.append({"role": "user", "content": pending_user_images + [{"type": "text", "text": "Above are the tool-returned image(s)."}]})
 
-                force_final_answer_now = self.force_answer_after_max_tool_iterations and tool_iteration >= self.max_tool_iterations
+                final_turn_due = (
+                    self.force_answer_after_max_tool_iterations
+                    and tool_iteration >= self.max_tool_iterations
+                )
+                force_final_answer_now = final_turn_due and not terminal_tools
+                force_terminal_answer_now = final_turn_due and bool(terminal_tools)
 
                 # Once the image budget is spent, stop offering image-producing tools
                 # so the model answers. Terminal (answer-protocol) tools stay offered:
@@ -781,33 +893,45 @@ class AsyncOpenAIChat(lmms):
                         payload.pop("tool_choice", None)
 
                 payload["messages"] = messages
+                if force_terminal_answer_now:
+                    payload["tools"] = [
+                        function
+                        for function in payload.get("tools", [])
+                        if function["function"]["name"] in terminal_tools
+                    ]
+                    payload["tool_choice"] = "auto"
                 request_payload = payload
                 response_prefill = ""
+                forced_final_answer_valid = False
+                responses_for_usage = []
                 if force_final_answer_now:
                     forced_final_answer_requested = True
                     eval_logger.info(f"Forcing final answer on final allowed assistant turn for request {idx}")
-                    request_payload = self._with_forced_action_extra_body(payload, "<answer>")
-                    request_payload, response_prefill = self._with_final_answer_think_prefill(request_payload)
-                response = await self.client.chat.completions.create(**request_payload)
-                input_tokens = 0
-                output_tokens = 0
-                reasoning_tokens = 0
-                if hasattr(response, "usage") and response.usage:
-                    input_tokens = getattr(response.usage, "prompt_tokens", 0) or 0
-                    output_tokens = getattr(response.usage, "completion_tokens", 0) or 0
-                    if hasattr(response.usage, "completion_tokens_details") and response.usage.completion_tokens_details:
-                        reasoning_tokens = getattr(response.usage.completion_tokens_details, "reasoning_tokens", 0) or 0
-                total_input_tokens += input_tokens
-                total_output_tokens += output_tokens
-                total_reasoning_tokens += reasoning_tokens
-                log_usage(
-                    model_name=self.model_version,
-                    task_name=task if "task" in locals() else None,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    reasoning_tokens=reasoning_tokens,
-                    source="model",
-                )
+                    response, response_prefill, responses_for_usage = await self._obtain_forced_final_answer(
+                        payload,
+                        idx,
+                    )
+                    forced_final_answer_valid = True
+                else:
+                    response = await self.client.chat.completions.create(**request_payload)
+                    responses_for_usage.append(("primary", response))
+
+                for force_stage, usage_response in responses_for_usage:
+                    input_tokens, output_tokens, reasoning_tokens = self._response_token_counts(usage_response)
+                    total_input_tokens += input_tokens
+                    total_output_tokens += output_tokens
+                    total_reasoning_tokens += reasoning_tokens
+                    if force_final_answer_now:
+                        self._forced_final_stats[f"{force_stage}_input_tokens"] += input_tokens
+                        self._forced_final_stats[f"{force_stage}_output_tokens"] += output_tokens
+                    log_usage(
+                        model_name=self.model_version,
+                        task_name=task if "task" in locals() else None,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        reasoning_tokens=reasoning_tokens,
+                        source="model",
+                    )
                 last_response = response.choices[0].message.content or ""
                 try:
                     if response_prefill:
@@ -815,9 +939,15 @@ class AsyncOpenAIChat(lmms):
                     all_response += last_response
                 except Exception as e:
                     all_response += str(e)
+                if force_terminal_answer_now:
+                    for call in response.choices[0].message.tool_calls or []:
+                        all_response += f"<tool_call>{call.function.name} {call.function.arguments}</tool_call>"
+                        if call.function.name in terminal_tools:
+                            terminal_tool_called = True
+                            break
 
             if tool_iteration >= self.max_tool_iterations and not terminal_tool_called:
-                if forced_final_answer_requested and response.choices[0].finish_reason != "tool_calls":
+                if forced_final_answer_requested and forced_final_answer_valid:
                     eval_logger.info(f"Final answer was forced on max tool turn for request {idx}")
                 else:
                     eval_logger.warning(f"Max tool iterations ({self.max_tool_iterations}) reached for request {idx}")
@@ -866,6 +996,8 @@ class AsyncOpenAIChat(lmms):
                         elapsed = time.time() - started_at
                         return content, original_idx, token_counts, True, rate_limited, elapsed
                     except Exception as exc:
+                        if isinstance(exc, ForcedFinalAnswerError):
+                            raise
                         error_msg = str(exc)
                         last_error_msg = error_msg
                         rate_limited = rate_limited or is_rate_limit_error(error_msg)
@@ -965,6 +1097,12 @@ class AsyncOpenAIChat(lmms):
             maybe_update_concurrency(force=True)
 
             pbar.close()
+            if self._forced_final_stats["primary_attempts"]:
+                eval_logger.info(
+                    "Forced final-answer summary: "
+                    f"stats={json.dumps(self._forced_final_stats, sort_keys=True)} "
+                    f"failures={json.dumps(self._forced_final_failures, sort_keys=True)}"
+                )
             return res
 
         eval_results = asyncio.run(run())

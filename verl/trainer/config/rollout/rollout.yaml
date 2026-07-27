@@ -179,6 +179,9 @@ multi_turn:
   # null for no limit (default max_length // 3)
   max_user_turns: null
 
+  # null for no per-turn generation cap
+  max_assistant_tokens_per_turn: null
+
   # max parallel call for tools in single turn
   max_parallel_calls: 1
 
@@ -241,6 +244,10 @@ multi_turn:
   # are removed, the previous user/tool message receives this suffix, and the
   # next assistant turn can be forced to make a tool call.
   conditional_answer_retry_enabled: False
+
+  # Permit GT-based answer retry during validation; disable for inference-faithful validation.
+  conditional_answer_retry_enable_validation: True
+
   conditional_answer_retry_force_next_tool_call: True
   conditional_answer_retry_suffix: "You have not gathered enough information yet. In your next turn, keep exploring rather than answering prematurely: use more tool calls to broaden the search, test alternative hypotheses, look for disconfirming evidence, and dig deeper into the most likely explanations. Finalize only when the evidence clearly supports a conclusion."
   conditional_answer_retry_assistant_prefill: ""

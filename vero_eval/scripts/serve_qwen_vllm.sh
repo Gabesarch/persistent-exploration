@@ -98,7 +98,17 @@ disown
 echo "Waiting for vLLM to be ready (up to 5 min)..."
 for _ in $(seq 1 60); do
   if curl --max-time 2 -s -o /dev/null "http://localhost:${PORT}/v1/models"; then
-    echo "vLLM is up at http://localhost:${PORT}"; exit 0
+    echo "vLLM is up at http://localhost:${PORT}"
+    case "${FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS,,}" in
+      1|true|yes|on)
+        "${PYTHON:-python}" "$VERO_EVAL_DIR/scripts/probe_forced_final_answer.py" \
+          --base-url "http://localhost:${PORT}/v1" \
+          --api-key "$API_KEY" \
+          --model "$MODEL_NAME" \
+          --tokenizer "${LMMS_EVAL_HF_TOKENIZER:-$CHECKPOINT_PATH}"
+        ;;
+    esac
+    exit 0
   fi
   sleep 5
 done

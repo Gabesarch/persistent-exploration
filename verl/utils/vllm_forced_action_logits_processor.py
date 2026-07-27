@@ -19,6 +19,7 @@ from verl.utils.forced_action_tags import (
     FORCE_ACTION_REQUIRED_TAG_KEY,
     FORCE_ACTION_TAG_IDS_KEY,
     ForceActionTagAfterThinkRequestProcessor,
+    decode_after_think_ids_options,
     validate_forced_action_payload,
 )
 
@@ -63,6 +64,8 @@ class ForceActionTagAfterThinkLogitsProcessor(AdapterLogitsProcessor):
 
         self.validate_params(params)
         return ForceActionTagAfterThinkRequestProcessor(
-            after_think_ids_options=extra_args[FORCE_ACTION_AFTER_THINK_IDS_OPTIONS_KEY],
+            after_think_ids_options=decode_after_think_ids_options(
+                extra_args[FORCE_ACTION_AFTER_THINK_IDS_OPTIONS_KEY]
+            ),
             tag_ids=extra_args[FORCE_ACTION_TAG_IDS_KEY],
         )
