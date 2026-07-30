@@ -33,6 +33,7 @@ from .model import HFModelConfig
 from .optimizer import OptimizerConfig
 
 __all__ = [
+    "BranchSubsamplingConfig",
     "BranchLossStrataConfig",
     "PolicyLossConfig",
     "RouterReplayConfig",
@@ -44,6 +45,24 @@ __all__ = [
     "TorchTitanActorConfig",
     "MindSpeedActorConfig",
 ]
+
+
+@dataclass
+class BranchSubsamplingConfig(BaseConfig):
+    """Configuration for deterministic branch-row subsampling before training."""
+
+    enabled: bool = False
+    max_branches_per_parent: Optional[int] = None
+    seed: int = 42
+
+    def __post_init__(self):
+        if self.enabled and (self.max_branches_per_parent is None or int(self.max_branches_per_parent) <= 0):
+            raise ValueError(
+                "policy_loss.branch_strata.subsampling.max_branches_per_parent must be a positive integer "
+                "when subsampling is enabled."
+            )
+        if int(self.seed) < 0:
+            raise ValueError("policy_loss.branch_strata.subsampling.seed must be nonnegative.")
 
 
 @dataclass
@@ -85,6 +104,7 @@ class BranchLossStrataConfig(BaseConfig):
     parent_balance: bool = True
     branch_indicator_key: str = "is_conditional_answer_retry_branch"
     parent_id_key: str = "request_id"
+    subsampling: BranchSubsamplingConfig = field(default_factory=BranchSubsamplingConfig)
 
     def __post_init__(self):
         if not 0.0 <= float(self.branch_fraction) < 1.0:
@@ -95,6 +115,8 @@ class BranchLossStrataConfig(BaseConfig):
             raise ValueError("policy_loss.branch_strata.branch_indicator_key must be nonempty.")
         if not str(self.parent_id_key).strip():
             raise ValueError("policy_loss.branch_strata.parent_id_key must be nonempty.")
+        if self.subsampling.enabled and not self.enabled:
+            raise ValueError("policy_loss.branch_strata.subsampling.enabled requires branch strata to be enabled.")
 
 
 @dataclass

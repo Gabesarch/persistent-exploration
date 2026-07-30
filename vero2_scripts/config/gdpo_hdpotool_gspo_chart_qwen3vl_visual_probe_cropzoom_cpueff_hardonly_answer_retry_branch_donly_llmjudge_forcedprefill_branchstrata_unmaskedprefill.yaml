@@ -29,7 +29,7 @@ algorithm:
 
 data:
   train_files: /scratch/gpfs/ZHUANGL/gs1693/vero2_datasets/train_rl_datasets/chart_search_counting_visual_probe_train_rollout_score_leq05_all.verl.jsonl
-  val_files: /scratch/gpfs/ZHUANGL/gs1693/vero2_datasets/train_rl_datasets/chart_search_counting_visual_probe_val.verl.jsonl
+  val_files: /scratch/gpfs/ZHUANGL/gs1693/vero2/datasets/visual_probe_easy_medium_hard_validation/visual_probe_easy_medium_hard_val.verl.jsonl
   filter_overlong_prompts_workers: 64
   image_root: ${oc.env:IMAGE_ROOT}
   system_prompt: ${oc.env:VERL_ROOT}/vero2_scripts/prompts/system_prompt_chatting_tool_calling.txt
@@ -248,10 +248,12 @@ actor_rollout_ref:
       # Normal rollout first; incorrect answers are removed and followed by a forced tool-call retry.
       force_tool_calls_until_final_turn: false
       force_answer_on_final_turn: true
+      force_answer_on_final_turn_validation: true
       force_final_answer_think_prefill: "This is the final turn, so I need to answer from the evidence gathered so far."
       force_final_answer_think_prefill_trainable: true
       final_answer_token_margin: 2048
       conditional_answer_retry_enabled: true
+      conditional_answer_retry_enable_validation: false
       conditional_answer_retry_force_next_tool_call: true
       conditional_answer_retry_suffix: ""
       conditional_answer_retry_assistant_prefill: "Let’s see. I still don’t have decisive evidence, so I should inspect a substantially different region. If one area looks especially promising, I can examine it more closely, but I should look elsewhere once further zooming stops revealing new evidence."

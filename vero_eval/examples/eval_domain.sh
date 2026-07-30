@@ -62,41 +62,61 @@ if [[ -z "$TASKS" ]]; then
 fi
 
 # ── judge backend (set up ONLY when the run contains a judge-based task; inert for
-#    exact_match tasks like countqa). DEFAULT = a dedicated Qwen3-32B judge on a 2nd
-#    GPU (the strong, reportable judge, like reason-vlm-eval). On a single GPU it
-#    falls back to reusing the policy model as judge (Qwen3-VL-8B) with a loud warning,
-#    so 8B-self-judge numbers are never reported by accident. ────────────────────
+#    exact_match tasks like countqa). DEFAULT = an in-process local vLLM judge on the
+#    policy GPU. The async_openai driver coordinates policy sleep/wake across policy
+#    generation and judge postprocessing; the judge remains cached for the process.
+#    Hosted API_TYPE=openai|azure judges do not manage the local policy lifecycle. The old
+#    dedicated judge server remains available explicitly with JUDGE_BACKEND=server
+#    and needs two GPUs unless policy self-judging is deliberately requested. ─────
 _JUDGE_STEMS="visual_probe simplevqa mathvista mathvision charxiv mmvetv2 mia_bench mm_mt_bench mmifeval fvqa chartmuseum"
 RUN_HAS_JUDGE=0
+MANAGE_VLLM_SERVER_LIFECYCLE=false
 for _t in ${TASKS//,/ }; do
   for _s in $_JUDGE_STEMS; do [[ "$_t" == ${_s}* ]] && RUN_HAS_JUDGE=1; done
 done
 
 if [[ "$RUN_HAS_JUDGE" == 1 ]]; then
   export VLLM_WORKER_MULTIPROC_METHOD=spawn
-  JUDGE_BACKEND="${JUDGE_BACKEND:-server}"
+  JUDGE_BACKEND="${JUDGE_BACKEND:-engine}"
   if [[ "$JUDGE_BACKEND" == "engine" ]]; then
-    # In-process vLLM judge (Qwen3-32B). Needs its own GPU memory — use a 2-GPU alloc.
-    export JUDGE_MODEL_PATH="${JUDGE_MODEL_PATH:-$HF_HOME/Qwen/Qwen3-32B}"
-    export CHARXIV_JUDGE_GPU_MEMORY_UTILIZATION="${CHARXIV_JUDGE_GPU_MEMORY_UTILIZATION:-0.9}"
-    export CHARXIV_JUDGE_TENSOR_PARALLEL_SIZE="${CHARXIV_JUDGE_TENSOR_PARALLEL_SIZE:-1}"
-    export CHARXIV_JUDGE_MAX_MODEL_LEN="${CHARXIV_JUDGE_MAX_MODEL_LEN:-18432}"
-    export VLLM_JUDGE_MAX_NUM_SEQS="${VLLM_JUDGE_MAX_NUM_SEQS:-32}"
-    unset VLLM_SERVER_JUDGE VLLM_JUDGE_BASE_URL VLLM_JUDGE_PORT VLLM_JUDGE_MODEL_PATH 2>/dev/null || true
+    export API_TYPE="${API_TYPE:-vllm}"
+    if [[ "$API_TYPE" == "vllm" ]]; then
+      # Sequential one-GPU path: policy generation -> deep sleep -> in-process judging.
+      # The judge stays cached until process exit; a later generation phase wakes policy.
+      export JUDGE_MODEL_PATH="${JUDGE_MODEL_PATH:-${VLLM_JUDGE_MODEL_PATH:-$HF_HOME/Qwen/Qwen3-32B}}"
+      export CHARXIV_JUDGE_GPU_MEMORY_UTILIZATION="${CHARXIV_JUDGE_GPU_MEMORY_UTILIZATION:-0.9}"
+      export CHARXIV_JUDGE_TENSOR_PARALLEL_SIZE="${CHARXIV_JUDGE_TENSOR_PARALLEL_SIZE:-1}"
+      export CHARXIV_JUDGE_MAX_MODEL_LEN="${CHARXIV_JUDGE_MAX_MODEL_LEN:-18432}"
+      export VLLM_JUDGE_MAX_NUM_SEQS="${VLLM_JUDGE_MAX_NUM_SEQS:-32}"
+      unset VLLM_SERVER_JUDGE VLLM_JUDGE_BASE_URL VLLM_JUDGE_PORT 2>/dev/null || true
+      MANAGE_VLLM_SERVER_LIFECYCLE=true
+    elif [[ "$API_TYPE" == "openai" || "$API_TYPE" == "azure" ]]; then
+      # Hosted judges do not own, sleep, or wake the local policy server.
+      MANAGE_VLLM_SERVER_LIFECYCLE=false
+    else
+      echo "ERROR: unknown API_TYPE '$API_TYPE' (use vllm|openai|azure)" >&2
+      exit 1
+    fi
   elif [[ "$JUDGE_BACKEND" == "server" ]]; then
     export VLLM_SERVER_JUDGE=1
     _NGPU="$(nvidia-smi -L 2>/dev/null | wc -l || echo 1)"
-    if [[ "${START_VLLM_JUDGE_SERVER:-auto}" != "0" && "${_NGPU:-1}" -ge 2 ]]; then
-      # DEFAULT: dedicated Qwen3-32B judge on the last GPU (reuse-aware: launched once).
+    if [[ "${START_VLLM_JUDGE_SERVER:-1}" != "0" ]]; then
+      if [[ "${_NGPU:-1}" -lt 2 ]]; then
+        echo "ERROR: JUDGE_BACKEND=server requires 2 GPUs for separate policy and judge servers." >&2
+        echo "       Use the one-GPU default JUDGE_BACKEND=engine, or explicitly set" >&2
+        echo "       START_VLLM_JUDGE_SERVER=0 for a non-reportable policy self-judge." >&2
+        exit 1
+      fi
+      # Explicit legacy path: dedicated Qwen3-32B judge on the last GPU.
       export VLLM_JUDGE_MODEL_PATH="${VLLM_JUDGE_MODEL_PATH:-$HF_HOME/Qwen/Qwen3-32B}"
       export VLLM_JUDGE_CUDA_VISIBLE_DEVICES="${VLLM_JUDGE_CUDA_VISIBLE_DEVICES:-$((_NGPU - 1))}"
       source "$VERO_EVAL_DIR/scripts/serve_judge_vllm.sh"   # exports VLLM_JUDGE_BASE_URL
     else
-      # Fallback: reuse the policy server as judge (Qwen3-VL-8B judging itself).
+      # Deliberate fallback: reuse the policy server as judge.
       export VLLM_JUDGE_BASE_URL="${VLLM_JUDGE_BASE_URL:-http://localhost:${PORT}/v1}"
       export VLLM_JUDGE_MODEL_PATH="qwen_vllm"
-      echo "WARNING: judge = the policy model (Qwen3-VL-8B reusing itself), NOT a 32B judge." >&2
-      echo "         For reportable numbers request gpu:2 (a 2nd GPU auto-launches a dedicated Qwen3-32B judge)." >&2
+      echo "WARNING: NON-REPORTABLE SELF-JUDGE: the policy model is judging its own outputs." >&2
+      echo "         Use JUDGE_BACKEND=engine for reportable one-GPU local judging." >&2
     fi
     export JUDGE_MODEL_PATH="${JUDGE_MODEL_PATH:-${VLLM_JUDGE_MODEL_PATH:-qwen_vllm}}"
   else
@@ -107,6 +127,7 @@ fi
 
 # ── build model_args ──────────────────────────────────────────────────
 MODEL_ARGS="model_version=${MODEL_VERSION},base_url=http://localhost:${PORT}/v1,api_key=${API_KEY},max_tool_iterations=${MAX_TOOL_ITERATIONS},max_tool_images=${MAX_TOOL_IMAGES}"
+[[ "$MANAGE_VLLM_SERVER_LIFECYCLE" == true ]] && MODEL_ARGS="${MODEL_ARGS},manage_vllm_server_lifecycle=true"
 [[ -n "$MCP_SERVER_PATH" ]] && MODEL_ARGS="${MODEL_ARGS},mcp_server_path=${MCP_SERVER_PATH}"
 [[ -n "$SYSTEM_PROMPT"   ]] && MODEL_ARGS="${MODEL_ARGS},system_prompt=${SYSTEM_PROMPT}"
 case "${FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS,,}" in

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Submit one eval job per tool-calling task, each with its own PORT so several
-# can share a node safely. Judge tasks (visual_probe, simplevqa, ...) get a 2nd
-# GPU for the Qwen3-32B judge; exact-match tasks (screenspotpro, ...) get one.
+# can share a node safely. Judge tasks sequentially share one GPU between the
+# sleeping policy server and the in-process judge.
 #
 # Usage (run from anywhere; the script cd's to the repo root):
 #   bash vero_eval/examples/submit_tool_evals.sh                 # the 4 default tasks
@@ -12,7 +12,8 @@
 # Env knobs:
 #   MODEL (qwen3vl) · TOOLS (on) · TASKS (4 zoom/draw tasks) · LIMIT (full split)
 #   PARTITION (pli) · ACCOUNT (vlmrl) · GPU_TYPE (h100) · BASE_PORT (9001)
-#   TIME_JUDGE (04:00:00) · TIME_PLAIN (10:00:00) · DRY_RUN (0)
+#   JUDGE_BACKEND (engine; server selects 2 GPUs) · TIME_JUDGE (04:00:00)
+#   TIME_PLAIN (10:00:00) · DRY_RUN (0)
 #   For the ailab/H200 partition:  PARTITION=ailab ACCOUNT=zhuangl GPU_TYPE=h200
 set -euo pipefail
 
@@ -27,31 +28,31 @@ GPU_TYPE="${GPU_TYPE:-h100}"
 BASE_PORT="${BASE_PORT:-9001}"
 LIMIT="${LIMIT:-}"
 DRY_RUN="${DRY_RUN:-0}"
+JUDGE_BACKEND="${JUDGE_BACKEND:-engine}"
 TASKS="${TASKS:-visual_probe_hard_qwen3_zoom visual_probe_hard_qwen3_draw screenspotpro_point_in_box_qwen3_zoom screenspotpro_point_in_box_qwen3_draw}"
 
-# Task name stems that trigger the LLM judge (=> need a 2nd GPU). Mirrors the
-# _JUDGE_STEMS list in examples/eval_domain.sh.
+# Task name stems that trigger the LLM judge (used only to select a time limit).
+# Mirrors the _JUDGE_STEMS list in examples/eval_domain.sh.
 JUDGE_STEMS="visual_probe simplevqa mathvista mathvision charxiv mmvetv2 mia_bench mm_mt_bench mmifeval fvqa chartmuseum"
 
 i=0
 for TASK in $TASKS; do
   PORT=$((BASE_PORT + i))
-  JUDGE_PORT=$((8001 + i))
-  GPUS=1
+  if [[ "$JUDGE_BACKEND" == "server" ]]; then GPUS=2; else GPUS=1; fi
   TLIMIT="${TIME_PLAIN:-10:00:00}"
   for stem in $JUDGE_STEMS; do
-    if [[ "$TASK" == ${stem}* ]]; then GPUS=2; TLIMIT="${TIME_JUDGE:-04:00:00}"; break; fi
+    if [[ "$TASK" == ${stem}* ]]; then TLIMIT="${TIME_JUDGE:-04:00:00}"; break; fi
   done
   OUT="$REPO_ROOT/vero_eval/results/eval_${TASK}"
 
-  EXPORTS="ALL,MODEL=${MODEL},TOOLS=${TOOLS},TASKS=${TASK},PORT=${PORT},VLLM_JUDGE_PORT=${JUDGE_PORT},OUTPUT_ROOT=${OUT}"
+  EXPORTS="ALL,MODEL=${MODEL},TOOLS=${TOOLS},TASKS=${TASK},PORT=${PORT},JUDGE_BACKEND=${JUDGE_BACKEND},OUTPUT_ROOT=${OUT}"
   [[ -n "$LIMIT" ]] && EXPORTS="${EXPORTS},LIMIT=${LIMIT}"
 
   CMD=(sbatch -p "$PARTITION" --gres="gpu:${GPU_TYPE}:${GPUS}" --cpus-per-task="$((GPUS * 8))" --time="$TLIMIT")
   [[ -n "$ACCOUNT" ]] && CMD+=(--account="$ACCOUNT")
   CMD+=(--export="$EXPORTS" vero_eval/run_eval.sbatch)
 
-  echo "[$TASK] gpus=${GPU_TYPE}:${GPUS} port=${PORT} judge_port=${JUDGE_PORT} -> ${OUT}"
+  echo "[$TASK] gpus=${GPU_TYPE}:${GPUS} port=${PORT} judge=${JUDGE_BACKEND} -> ${OUT}"
   if [[ "$DRY_RUN" == "1" ]]; then
     printf '  '; printf '%q ' "${CMD[@]}"; printf '\n'
   else

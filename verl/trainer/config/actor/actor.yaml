@@ -99,6 +99,21 @@ policy_loss:
     # Non-tensor batch key shared by each canonical row and its branches.
     parent_id_key: request_id
 
+    # Uniformly subsample branch rows per parent before training.
+    subsampling:
+
+      # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+      _target_: verl.workers.config.BranchSubsamplingConfig
+
+      # Enable branch-row subsampling.
+      enabled: false
+
+      # Maximum number of branch rows retained for each parent.
+      max_branches_per_parent: null
+
+      # Base seed combined with the global training step for deterministic sampling.
+      seed: 42
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 

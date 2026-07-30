@@ -175,6 +175,9 @@ class ToolAgentLoop(AgentLoopBase):
         self.tool_response_truncate_side = multi_turn_config.tool_response_truncate_side
         self.force_tool_calls_until_final_turn = getattr(multi_turn_config, "force_tool_calls_until_final_turn", False)
         self.force_answer_on_final_turn = getattr(multi_turn_config, "force_answer_on_final_turn", False)
+        self.force_answer_on_final_turn_validation = getattr(
+            multi_turn_config, "force_answer_on_final_turn_validation", None
+        )
         self.final_answer_token_margin = getattr(multi_turn_config, "final_answer_token_margin", 2048)
         self.force_final_answer_think_prefill = getattr(multi_turn_config, "force_final_answer_think_prefill", "")
         self.force_final_answer_think_prefill_trainable = bool(
@@ -259,6 +262,13 @@ class ToolAgentLoop(AgentLoopBase):
         self.llm_judge_format_score = float(reward_kwargs.get("format_score", 0.5))
         self.llm_judge_tool_efficiency_score_weight = float(reward_kwargs.get("tool_efficiency_score_weight", 0.0))
         self.allow_unboxed_answer_for_accuracy = bool(reward_kwargs.get("allow_unboxed_answer_for_accuracy", True))
+        if bool(reward_kwargs.get("assistant_turn_overlong_enabled", False)):
+            reward_max_turns = reward_kwargs.get("assistant_turn_overlong_max_turns")
+            if reward_max_turns != self.max_assistant_turns:
+                raise ValueError(
+                    "assistant_turn_overlong_max_turns must match multi_turn.max_assistant_turns when enabled, "
+                    f"got {reward_max_turns!r} != {self.max_assistant_turns!r}."
+                )
         tool_config_path = multi_turn_config.tool_config_path
         tool_list = initialize_tools_from_config(tool_config_path) if tool_config_path else []
         self.tools = {tool.name: tool for tool in tool_list}
@@ -386,6 +396,7 @@ class ToolAgentLoop(AgentLoopBase):
         output.extra_fields.update(
             {
                 "request_id": agent_data.request_id,
+                "assistant_turns": agent_data.assistant_turns,
                 "turn_scores": agent_data.turn_scores,
                 "tool_rewards": agent_data.tool_rewards,
                 CROP_IMAGE_REFS_KEY: agent_data.crop_image_refs,
@@ -462,6 +473,14 @@ class ToolAgentLoop(AgentLoopBase):
         is_validation = bool(debug_trajectory.get("validate"))
         return not is_validation or getattr(self, "conditional_answer_retry_enable_validation", True)
 
+    def _force_answer_on_final_turn_active(self, rollout_kwargs: Optional[dict[str, Any]]) -> bool:
+        debug_trajectory = (rollout_kwargs or {}).get("_debug_trajectory", {}) or {}
+        if debug_trajectory.get("validate"):
+            validation_override = getattr(self, "force_answer_on_final_turn_validation", None)
+            if validation_override is not None:
+                return bool(validation_override)
+        return bool(getattr(self, "force_answer_on_final_turn", False))
+
     def _with_assistant_turn_token_cap(
         self,
         sampling_params: dict[str, Any],
@@ -526,7 +545,7 @@ class ToolAgentLoop(AgentLoopBase):
         if self.force_tool_calls_until_final_turn:
             forced_required_tag = "<answer>" if self._must_answer_now(agent_data) else "<tool_call>"
             sampling_params = self._with_forced_action_extra_args(sampling_params, forced_required_tag)
-        elif self.force_answer_on_final_turn and self._must_answer_now(agent_data):
+        elif self._force_answer_on_final_turn_active(rollout_kwargs) and self._must_answer_now(agent_data):
             forced_required_tag = "<answer>"
             sampling_params = self._with_forced_action_extra_args(sampling_params, forced_required_tag)
         elif self._conditional_answer_retry_active(rollout_kwargs) and agent_data.force_next_tool_call:
@@ -816,6 +835,7 @@ class ToolAgentLoop(AgentLoopBase):
             extra_fields={
                 **TERMINAL_TOOL_EXTRA_FIELD_DEFAULTS,
                 "request_id": agent_data.request_id,
+                "assistant_turns": agent_data.assistant_turns,
                 "is_conditional_answer_retry_branch": True,
                 baseline_key: 0.0,
                 "conditional_answer_retry_branch_mask_mode": self.conditional_answer_retry_branch_mask_mode,
@@ -895,7 +915,9 @@ class ToolAgentLoop(AgentLoopBase):
     ) -> dict[str, Any]:
         reward_model = rollout_kwargs.get("reward_model") or {}
         ground_truth = reward_model.get("ground_truth") if isinstance(reward_model, dict) else None
-        extra_info = rollout_kwargs.get("extra_info")
+        raw_extra_info = rollout_kwargs.get("extra_info")
+        extra_info = dict(raw_extra_info) if isinstance(raw_extra_info, dict) else {}
+        extra_info["assistant_turns"] = agent_data.assistant_turns
         base_result = self.conditional_answer_retry_reward_fn(
             data_source=rollout_kwargs.get("data_source", "unknown"),
             solution_str=solution_str,

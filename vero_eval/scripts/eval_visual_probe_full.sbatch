@@ -5,7 +5,7 @@
 #SBATCH --time=8:00:00
 #SBATCH --mem=120G
 #SBATCH --cpus-per-task=12
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:1
 #SBATCH --partition=pli
 #SBATCH --account=vlmrl
 #SBATCH --output=vero_eval/logs/eval_vprobe_full_%j.out
@@ -21,7 +21,7 @@
 #                        image_indexing: training_faithful)
 #       MODEL=qwen3vl -> visual_probe_<probe>_qwen3_zoom       (base Qwen3-VL-Instruct:
 #                        temp 1.0 / top_p 1.0 / top_k 40 / presence_penalty 2.0)
-#   * judge = a dedicated Qwen3-32B server on GPU1 (the reportable judge; needs gpu:2).
+#   * judge = in-process Qwen3-32B, sequentially sharing one GPU with the policy.
 #
 # Submit from the repo ROOT (so SLURM_SUBMIT_DIR resolves vero_eval/):
 #   # Vero RL checkpoint (training-faithful):
@@ -32,13 +32,13 @@
 #   # easy/medium, or all three difficulties:
 #   sbatch --export=ALL,MODEL=vero,CHECKPOINT_PATH=...,PROBE=all \
 #          vero_eval/scripts/eval_visual_probe_full.sbatch
-#   # quick smoke on a single GPU (8B self-judge, NOT reportable):
-#   sbatch --gres=gpu:1 --export=ALL,MODEL=qwen3vl,LIMIT=10,START_VLLM_JUDGE_SERVER=0 \
+#   # quick smoke with the reportable one-GPU judge:
+#   sbatch --export=ALL,MODEL=qwen3vl,LIMIT=10 \
 #          vero_eval/scripts/eval_visual_probe_full.sbatch
 # ----------------------------------------------------------------------------
 # Env: MODEL(qwen3vl) | vero | vero-thinking | <abs ckpt path>; CHECKPOINT_PATH(req for
 #      vero/abs); PROBE(hard) easy|medium|hard|all; MM_MAX_PIXELS(10000000); MM_MIN_PIXELS;
-#      LIMIT; PORT(9001); NUM_GPUS(1, policy TP); JUDGE_BACKEND(server); TASK(override).
+#      LIMIT; PORT(9001); NUM_GPUS(1, policy TP); JUDGE_BACKEND(engine); TASK(override).
 # ============================================================================
 set -euo pipefail
 
@@ -52,8 +52,8 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 MODEL="${MODEL:-qwen3vl}"; PROBE="${PROBE:-hard}"
 export MM_MAX_PIXELS="${MM_MAX_PIXELS:-10000000}"   # the full-setting resolution (serve-time)
 PORT="${PORT:-9001}"; API_KEY="${API_KEY:-qwen}"
-export NUM_GPUS="${NUM_GPUS:-1}"                     # policy on GPU0; the 32B judge takes GPU1
-export JUDGE_BACKEND="${JUDGE_BACKEND:-server}"
+export NUM_GPUS="${NUM_GPUS:-1}"                     # policy TP; judge reuses GPU sequentially
+export JUDGE_BACKEND="${JUDGE_BACKEND:-engine}"
 
 # ── MODEL -> CHECKPOINT_PATH + per-model zoom suffix + chat-template / system-prompt policy ──
 case "$MODEL" in
@@ -99,6 +99,6 @@ bash scripts/serve_qwen_vllm.sh
 curl --max-time 5 -s -o /dev/null -H "Authorization: Bearer ${API_KEY}" "http://localhost:${PORT}/v1/models" \
   || { echo "ERROR: vLLM policy not up on :$PORT"; exit 1; }
 
-# ── eval (eval_domain.sh auto-launches the dedicated Qwen3-32B judge on GPU1 for visual_probe) ──
+# ── eval (wake for generation, then deep-sleep before in-process judge postprocessing) ──
 OUTPUT_PATH="$OUTPUT_PATH" bash examples/eval_domain.sh --tasks "$TASKS" ${LIMIT:+--limit "$LIMIT"}
 echo "=== Done. Results under: $OUTPUT_PATH ==="

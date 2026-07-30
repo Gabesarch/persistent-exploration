@@ -6,6 +6,8 @@ import re
 import shutil
 import tempfile
 import time
+import urllib.parse
+import urllib.request
 import uuid
 from functools import lru_cache
 from multiprocessing import cpu_count
@@ -49,6 +51,12 @@ _HIDDEN_TOOL_ARGS = {"image_path"}
 _IMAGE_REGISTRY_ENV = "LMMS_EVAL_IMAGE_REGISTRY"
 _ASSISTANT_THINK_PREFIX = "<think>\n"
 _ANSWER_BLOCK_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL)
+_VLLM_ADMIN_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+class VLLMServerLifecycleError(RuntimeError):
+    """Raised when the policy server cannot complete a required lifecycle transition."""
+
 
 # Env var carrying the per-call image registry (img_idx -> file path) to the MCP
 # tool subprocess, so tools resolve img_idx the way training does. Keep in sync
@@ -91,10 +99,6 @@ def _get_forced_action_tokenizer(name: str):
         trust_remote_code=trust_remote_code,
         local_files_only=_hf_tokenizer_local_files_only(),
     )
-
-
-class ForcedFinalAnswerError(RuntimeError):
-    """Raised when evaluation cannot obtain a structurally valid forced final answer."""
 
 
 def _composite_zoom_to_original(image_provenance, img_idx, bbox):
@@ -182,6 +186,7 @@ class AsyncOpenAIChat(lmms):
         force_answer_after_max_tool_iterations: bool = False,
         force_final_answer_prefix: str = "",
         force_final_answer_think_prefill: Optional[str] = None,
+        manage_vllm_server_lifecycle: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -237,6 +242,7 @@ class AsyncOpenAIChat(lmms):
         self.tool_image_as_user_turn = parse_bool(tool_image_as_user_turn)
         self.force_answer_after_max_tool_iterations = parse_bool(force_answer_after_max_tool_iterations)
         self.force_final_answer_prefix = force_final_answer_prefix or ""
+        self.manage_vllm_server_lifecycle = parse_bool(manage_vllm_server_lifecycle)
         if force_final_answer_think_prefill is None:
             force_final_answer_think_prefill = os.getenv("FORCE_FINAL_ANSWER_THINK_PREFILL", "")
         self.force_final_answer_think_prefill = force_final_answer_think_prefill or ""
@@ -301,6 +307,103 @@ class AsyncOpenAIChat(lmms):
             self._world_size = self.accelerator.num_processes
 
         self.device = self.accelerator.device
+
+    def _vllm_server_root(self) -> str:
+        if not self.base_url:
+            raise RuntimeError(
+                "manage_vllm_server_lifecycle requires an OpenAI-compatible base_url"
+            )
+        server_root = str(self.base_url).rstrip("/")
+        if server_root.endswith("/v1"):
+            server_root = server_root[:-3]
+        return server_root
+
+    def _is_local_vllm_server(self) -> bool:
+        if not self.base_url:
+            return False
+        hostname = urllib.parse.urlparse(str(self.base_url)).hostname
+        return hostname in {"localhost", "127.0.0.1", "::1"}
+
+    def _post_vllm_admin(self, action: str, *, level: Optional[int] = None) -> None:
+        params = {}
+        if level is not None:
+            params["level"] = str(level)
+        query = f"?{urllib.parse.urlencode(params)}" if params else ""
+        url = f"{self._vllm_server_root()}/{action}{query}"
+        request = urllib.request.Request(url, method="POST")
+        request_timeout = max(0.1, min(float(self.timeout), 30.0))
+        with _VLLM_ADMIN_OPENER.open(request, timeout=request_timeout):
+            pass
+
+    def _vllm_is_sleeping(self, request_timeout_s: Optional[float] = None) -> bool:
+        url = f"{self._vllm_server_root()}/is_sleeping"
+        if request_timeout_s is None:
+            request_timeout_s = 10.0
+        request_timeout = max(
+            0.001,
+            min(float(self.timeout), 10.0, float(request_timeout_s)),
+        )
+        with _VLLM_ADMIN_OPENER.open(url, timeout=request_timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if isinstance(payload, bool):
+            return payload
+        if isinstance(payload, dict):
+            for key in ("is_sleeping", "sleeping"):
+                value = payload.get(key)
+                if isinstance(value, bool):
+                    return value
+        raise RuntimeError(f"Unexpected response from vLLM /is_sleeping: {payload!r}")
+
+    def _wait_for_vllm_sleep_state(
+        self,
+        *,
+        expected_sleeping: bool,
+        timeout_s: float = 300.0,
+    ) -> None:
+        deadline = time.monotonic() + timeout_s
+        last_observation = "no response"
+        while True:
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                state = "sleeping" if expected_sleeping else "awake"
+                raise TimeoutError(
+                    f"Timed out after {timeout_s:g}s waiting for vLLM server to become "
+                    f"{state}; last observation: {last_observation}"
+                )
+            try:
+                sleeping = self._vllm_is_sleeping(request_timeout_s=remaining_s)
+                last_observation = f"is_sleeping={sleeping}"
+                if sleeping is expected_sleeping:
+                    return
+            except Exception as exc:
+                last_observation = f"{type(exc).__name__}: {exc}"
+            time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
+
+    def _wake_vllm_server(self) -> None:
+        try:
+            if not self._vllm_is_sleeping():
+                return
+        except Exception:
+            pass
+        self._post_vllm_admin("wake_up")
+        self._wait_for_vllm_sleep_state(expected_sleeping=False)
+
+    def _sleep_vllm_server(self) -> None:
+        try:
+            if self._vllm_is_sleeping():
+                return
+        except Exception:
+            pass
+        self._post_vllm_admin("sleep", level=2)
+        self._wait_for_vllm_sleep_state(expected_sleeping=True)
+
+    def _sleep_vllm_server_best_effort(self, context: str) -> None:
+        try:
+            self._sleep_vllm_server()
+        except BaseException as exc:
+            eval_logger.error(
+                f"Best-effort vLLM deep-sleep cleanup failed after {context}: {exc}"
+            )
 
     @property
     def model(self):
@@ -437,13 +540,20 @@ class AsyncOpenAIChat(lmms):
         fallback_failure = self._forced_final_answer_failure(fallback_response)
         if fallback_failure is not None:
             self._record_forced_final_failure(f"fallback_{fallback_failure}")
-            raise ForcedFinalAnswerError(
+            eval_logger.error(
                 "Hard forced final-answer retry failed "
                 f"for request {request_idx}: reason={fallback_failure}, "
                 f"finish_reason={fallback_response.choices[0].finish_reason}, "
                 f"tool_calls={self._tool_call_diagnostic(fallback_response)}, "
                 f"content={repr((fallback_response.choices[0].message.content or '')[-1000:])}"
             )
+            # Treat a malformed forced answer as a bad sample, not a bad run.
+            # Replacing the response also prevents permissive task parsers from
+            # extracting a plausible-looking answer from malformed content.
+            fallback_response.choices[0].message.content = (
+                f"[LMMS_EVAL_FORCED_FINAL_ANSWER_FAILED: {fallback_failure}]"
+            )
+            return fallback_response, "", responses_for_usage
 
         self._forced_final_stats["fallback_successes"] += 1
         return fallback_response, fallback_prefill, responses_for_usage
@@ -911,7 +1021,7 @@ class AsyncOpenAIChat(lmms):
                         payload,
                         idx,
                     )
-                    forced_final_answer_valid = True
+                    forced_final_answer_valid = self._forced_final_answer_failure(response) is None
                 else:
                     response = await self.client.chat.completions.create(**request_payload)
                     responses_for_usage.append(("primary", response))
@@ -996,8 +1106,6 @@ class AsyncOpenAIChat(lmms):
                         elapsed = time.time() - started_at
                         return content, original_idx, token_counts, True, rate_limited, elapsed
                     except Exception as exc:
-                        if isinstance(exc, ForcedFinalAnswerError):
-                            raise
                         error_msg = str(exc)
                         last_error_msg = error_msg
                         rate_limited = rate_limited or is_rate_limit_error(error_msg)
@@ -1105,7 +1213,35 @@ class AsyncOpenAIChat(lmms):
                 )
             return res
 
-        eval_results = asyncio.run(run())
+        manage_lifecycle = self.manage_vllm_server_lifecycle and bool(requests)
+        if manage_lifecycle and not self._is_local_vllm_server():
+            eval_logger.warning(
+                "Ignoring manage_vllm_server_lifecycle for non-local base_url "
+                f"{self.base_url!r}; vLLM admin endpoints are restricted to localhost"
+            )
+            manage_lifecycle = False
+        if manage_lifecycle:
+            try:
+                self._wake_vllm_server()
+            except BaseException:
+                self._sleep_vllm_server_best_effort("wake failure")
+                raise
+        try:
+            eval_results = asyncio.run(run())
+        except BaseException:
+            if manage_lifecycle:
+                self._sleep_vllm_server_best_effort("generation failure")
+            raise
+        if manage_lifecycle:
+            # A successful generation is not safe to hand to the judge until the
+            # shared vLLM server has released weights and KV cache.
+            try:
+                self._sleep_vllm_server()
+            except Exception as exc:
+                raise VLLMServerLifecycleError(
+                    "Policy generation succeeded, but the managed vLLM server did not "
+                    "confirm level-2 deep sleep; refusing to initialize the judge"
+                ) from exc
         eval_results.sort(key=lambda x: x[1])  # Sort by index to restore original
         results = results + [content for content, _ in eval_results]
         if self.mcp_client is not None:

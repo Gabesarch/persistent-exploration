@@ -329,6 +329,126 @@ class TestRayTrainerBranchPaddingOnCPU(unittest.TestCase):
         )
 
 
+class TestRayTrainerBranchSubsamplingOnCPU(unittest.TestCase):
+    def setUp(self):
+        self.trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+        self.trainer.global_steps = 17
+        self.trainer.config = OmegaConf.create(
+            {
+                "algorithm": {
+                    "gdpo_baseline_weight_key": "gdpo_baseline_weight",
+                    "gdpo_reward_keys": [],
+                },
+                "actor_rollout_ref": {
+                    "actor": {
+                        "ppo_mini_batch_size": 4,
+                        "policy_loss": {
+                            "loss_mode": "gspo",
+                            "branch_strata": {
+                                "enabled": True,
+                                "branch_fraction": 0.2,
+                                "cap_by_parent_prevalence": True,
+                                "parent_balance": True,
+                                "branch_indicator_key": "is_branch",
+                                "parent_id_key": "request_id",
+                                "subsampling": {
+                                    "enabled": True,
+                                    "max_branches_per_parent": 1,
+                                    "seed": 42,
+                                },
+                            },
+                        },
+                        "loss_agg_mode": "seq-mean-token-mean",
+                    }
+                }
+            }
+        )
+        self.trainer.actor_rollout_wg = object()
+        self.trainer._get_dp_size = lambda *_args, **_kwargs: 2
+
+    @staticmethod
+    def _batch():
+        return DataProto(
+            batch=TensorDict(
+                {
+                    "row_id": torch.arange(8),
+                    "response_mask": torch.ones(8, 2, dtype=torch.long),
+                },
+                batch_size=8,
+            ),
+            non_tensor_batch={
+                "is_branch": np.array([False, False, False, True, True, True, True, True], dtype=object),
+                "request_id": np.array(["a", "b", "c", "a", "a", "a", "b", "b"], dtype=object),
+                "payload": np.array(["c-a", "c-b", "c-c", "a-1", "a-2", "a-3", "b-1", "b-2"], dtype=object),
+                "gdpo_baseline_weight": np.array([1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=object),
+            },
+        )
+
+    def test_subsampling_preserves_canonical_rows_alignment_and_metrics(self):
+        metrics = {}
+        sampled = self.trainer._subsample_branch_training_rows(self._batch(), metrics)
+
+        self.assertEqual(len(sampled), 5)
+        self.assertEqual(sampled.batch["row_id"][:3].tolist(), [0, 1, 2])
+        self.assertEqual(sampled.non_tensor_batch["payload"][:3].tolist(), ["c-a", "c-b", "c-c"])
+        self.assertEqual(sampled.non_tensor_batch["is_branch"].tolist().count(True), 2)
+        retained_branch_mask = np.asarray(sampled.non_tensor_batch["is_branch"], dtype=bool)
+        self.assertEqual(
+            set(sampled.non_tensor_batch["request_id"][retained_branch_mask].tolist()),
+            {"a", "b"},
+        )
+        self.assertEqual(metrics["branch_strata/subsampling/input_branch_rows"], 5)
+        self.assertEqual(metrics["branch_strata/subsampling/retained_branch_rows"], 2)
+        self.assertEqual(metrics["branch_strata/subsampling/dropped_branch_rows"], 3)
+        self.assertEqual(metrics["branch_strata/subsampling/retention_rate"], 0.4)
+        self.assertEqual(metrics["branch_strata/subsampling/branch_parents"], 2)
+        self.assertEqual(metrics["branch_strata/subsampling/input_parent_branch_count_mean"], 2.5)
+        self.assertEqual(metrics["branch_strata/subsampling/input_parent_branch_count_max"], 3)
+
+    def test_subsampling_is_reproducible_for_same_global_step(self):
+        first = self.trainer._subsample_branch_training_rows(self._batch(), {})
+        resumed = RayPPOTrainer.__new__(RayPPOTrainer)
+        resumed.global_steps = self.trainer.global_steps
+        resumed.config = self.trainer.config
+        second = resumed._subsample_branch_training_rows(self._batch(), {})
+
+        self.assertEqual(first.batch["row_id"].tolist(), second.batch["row_id"].tolist())
+
+    def test_subsampling_no_branch_batch_is_unchanged(self):
+        batch = self._batch().select_idxs(np.array([0, 1, 2]))
+        metrics = {}
+        sampled = self.trainer._subsample_branch_training_rows(batch, metrics)
+
+        self.assertIs(sampled, batch)
+        self.assertEqual(metrics["branch_strata/subsampling/input_branch_rows"], 0)
+        self.assertEqual(metrics["branch_strata/subsampling/retained_branch_rows"], 0)
+        self.assertEqual(metrics["branch_strata/subsampling/dropped_branch_rows"], 0)
+        self.assertEqual(metrics["branch_strata/subsampling/retention_rate"], 1.0)
+
+    def test_subsampling_precedes_branch_batch_padding(self):
+        metrics = {}
+        sampled = self.trainer._subsample_branch_training_rows(self._batch(), metrics)
+        padded = self.trainer._pad_branch_expanded_training_batch(sampled, metrics)
+
+        self.assertEqual(len(sampled), 5)
+        self.assertEqual(len(padded), 8)
+        self.assertEqual(metrics["branch_strata/subsampling/retained_branch_rows"], 2)
+        self.assertEqual(metrics["gdpo/padding_rows/added"], 3)
+        self.assertEqual(padded.batch["response_mask"][5:].sum().item(), 0)
+        self.assertEqual(padded.non_tensor_batch["gdpo_baseline_weight"][5:].tolist(), [0.0, 0.0, 0.0])
+
+    def test_post_subsampling_weights_preserve_eighty_twenty_loss_share(self):
+        sampled = self.trainer._subsample_branch_training_rows(self._batch(), {})
+        metrics = {}
+        self.trainer._attach_branch_strata_loss_weights(sampled, metrics)
+
+        weights = sampled.batch["branch_policy_loss_weight"]
+        is_branch = sampled.batch["branch_policy_loss_is_branch"]
+        self.assertAlmostEqual(weights[~is_branch].sum().item() / len(sampled), 0.8)
+        self.assertAlmostEqual(weights[is_branch].sum().item() / len(sampled), 0.2)
+        self.assertEqual(metrics["branch_strata/parent_branch_count_max"], 1.0)
+
+
 class TestRayTrainerValidationShapeGuardOnCPU(unittest.TestCase):
     def test_validation_row_count_guard_reports_branch_rows(self):
         branch_flags = np.array([False, True, False], dtype=object)

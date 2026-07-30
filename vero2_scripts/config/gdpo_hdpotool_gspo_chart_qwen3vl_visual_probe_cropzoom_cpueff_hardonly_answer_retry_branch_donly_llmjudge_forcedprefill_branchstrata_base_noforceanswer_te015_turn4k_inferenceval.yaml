@@ -8,8 +8,8 @@ hydra:
 
 algorithm:
   adv_estimator: gdpo
-  gdpo_reward_keys: [accuracy, format, tool_efficiency, tool_repeat_overlap]
-  gdpo_reward_weights: [0.8, 0.2, 0.2, 0.2]
+  gdpo_reward_keys: [accuracy, format, tool_efficiency, tool_repeat_overlap, assistant_turn_overlong]
+  gdpo_reward_weights: [0.8, 0.2, 0.2, 0.2, 0.2]
   gdpo_reward_eligibility:
     tool_efficiency:
       key: accuracy
@@ -27,7 +27,7 @@ algorithm:
 
 data:
   train_files: /scratch/gpfs/ZHUANGL/gs1693/vero2_datasets/train_rl_datasets/chart_search_counting_visual_probe_train_rollout_score_leq05_all.verl.jsonl
-  val_files: /scratch/gpfs/ZHUANGL/gs1693/vero2_datasets/train_rl_datasets/chart_search_counting_visual_probe_val.verl.jsonl
+  val_files: /scratch/gpfs/ZHUANGL/gs1693/vero2/datasets/visual_probe_easy_medium_hard_validation/visual_probe_easy_medium_hard_val.verl.jsonl
   filter_overlong_prompts_workers: 64
   image_root: ${oc.env:IMAGE_ROOT}
   system_prompt: ${oc.env:VERL_ROOT}/vero2_scripts/prompts/system_prompt_chatting_tool_calling.txt
@@ -200,6 +200,10 @@ actor_rollout_ref:
         parent_balance: true
         branch_indicator_key: is_conditional_answer_retry_branch
         parent_id_key: request_id
+        subsampling:
+          enabled: true
+          max_branches_per_parent: 1
+          seed: 42
     use_kl_loss: false
     kl_loss_coef: 0.0
     kl_loss_type: low_var_kl
@@ -247,6 +251,7 @@ actor_rollout_ref:
       # Normal rollout first; incorrect answers are removed and followed by a forced tool-call retry.
       force_tool_calls_until_final_turn: false
       force_answer_on_final_turn: false
+      force_answer_on_final_turn_validation: true
       force_final_answer_think_prefill: "This is the final turn, so I need to answer from the evidence gathered so far."
       final_answer_token_margin: 2048
       conditional_answer_retry_enabled: true
@@ -255,7 +260,7 @@ actor_rollout_ref:
       conditional_answer_retry_suffix: ""
       conditional_answer_retry_assistant_prefill: "Let’s see. I still don’t have decisive evidence, so I should inspect a substantially different region. If one area looks especially promising, I can examine it more closely, but I should look elsewhere once further zooming stops revealing new evidence."
       conditional_answer_retry_correct_accuracy_threshold: 0.0
-      conditional_answer_retry_max_retries: null
+      conditional_answer_retry_max_retries: 4
       conditional_answer_retry_branch_enabled: true
       conditional_answer_retry_branch_enable_validation: false
       conditional_answer_retry_branch_mask_mode: divergence_only
@@ -338,6 +343,10 @@ reward:
       tool_repeat_overlap_free_depth_refinements: 2
       tool_repeat_overlap_depth_containment_threshold: 0.95
       tool_repeat_overlap_excess_depth_weight: 0.5
+      assistant_turn_overlong_enabled: true
+      assistant_turn_overlong_max_turns: 11
+      assistant_turn_overlong_buffer_turns: 2
+      assistant_turn_overlong_penalty_factor: 1.0
       allow_unboxed_answer_for_accuracy: true
       require_boxed_answer_for_full_format: true
       unboxed_answer_format_score: 0.5

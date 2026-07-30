@@ -17,7 +17,7 @@ set -u
 source "$VERO_EVAL_DIR/examples/_domain_map.sh"
 
 TRAIN_DIR=""; DOMAIN=""; SUFFIX="reasoning"; RUN_ID=""; MAX_CKPTS=0; EVERY=0
-NUM_GPUS="${NUM_GPUS:-1}"; JUDGE_BACKEND="${JUDGE_BACKEND:-server}"; LIMIT="${LIMIT:-}"
+NUM_GPUS="${NUM_GPUS:-1}"; JUDGE_BACKEND="${JUDGE_BACKEND:-engine}"; LIMIT="${LIMIT:-}"
 ARRAY_CHUNK=""; DRYRUN=0; SBATCH_OPTS=()
 while [[ $# -gt 0 ]]; do case "$1" in
   --train-dir) TRAIN_DIR="$2"; shift 2;; --domain) DOMAIN="$2"; shift 2;;
@@ -62,7 +62,15 @@ submit_one() {
   local env_list=(CHECKPOINT_INDEX_PATH="$index" DOMAIN="$domain" MODEL_SUFFIX="$SUFFIX"
                   RUN_ROOT="$run_root" NUM_GPUS="$NUM_GPUS" JUDGE_BACKEND="$JUDGE_BACKEND")
   [[ -n "$LIMIT" ]] && env_list+=(LIMIT="$LIMIT")
-  local cmd=(sbatch "${SBATCH_OPTS[@]}" --array="$spec" --export=ALL
+  local resource_opts=()
+  local has_gres=0 opt
+  for opt in "${SBATCH_OPTS[@]}"; do
+    [[ "$opt" == "--gres" || "$opt" == --gres=* || "$opt" == --gpus=* ]] && has_gres=1
+  done
+  if [[ "$JUDGE_BACKEND" == "server" && "$has_gres" == 0 ]]; then
+    resource_opts+=(--gres=gpu:2)
+  fi
+  local cmd=(sbatch "${SBATCH_OPTS[@]}" "${resource_opts[@]}" --array="$spec" --export=ALL
              "$VERO_EVAL_DIR/scripts/eval_checkpoints_array.sbatch")
   if [[ "$DRYRUN" == 1 ]]; then
     echo "DRY-RUN: ( cd $REPO_ROOT_DIR && ${env_list[*]} ${cmd[*]} )"

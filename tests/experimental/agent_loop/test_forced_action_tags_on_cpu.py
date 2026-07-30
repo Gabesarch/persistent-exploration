@@ -317,6 +317,7 @@ def _make_loop(tokenizer: _FakeTokenizer, server_manager: _FakeServerManager, to
     loop = object.__new__(ToolAgentLoop)
     loop.force_tool_calls_until_final_turn = True
     loop.force_answer_on_final_turn = False
+    loop.force_answer_on_final_turn_validation = None
     loop.final_answer_token_margin = 2048
     loop.force_final_answer_think_prefill = ""
     loop.force_final_answer_think_prefill_trainable = False
@@ -345,6 +346,7 @@ def _make_conditional_retry_loop(
     loop = object.__new__(ToolAgentLoop)
     loop.force_tool_calls_until_final_turn = False
     loop.force_answer_on_final_turn = False
+    loop.force_answer_on_final_turn_validation = None
     loop.final_answer_token_margin = 4
     loop.force_final_answer_think_prefill = ""
     loop.force_final_answer_think_prefill_trainable = False
@@ -442,6 +444,7 @@ def test_tool_agent_loop_init_tolerates_missing_optional_multi_turn_keys(monkeyp
     assert loop.force_final_answer_think_prefill_trainable is False
     assert loop.force_tool_calls_until_final_turn is False
     assert loop.force_answer_on_final_turn is False
+    assert loop.force_answer_on_final_turn_validation is None
     assert loop.max_assistant_tokens_per_turn is None
     assert loop.conditional_answer_retry_enabled is False
     assert loop.conditional_answer_retry_enable_validation is True
@@ -605,6 +608,49 @@ def test_force_answer_on_final_turn_forces_only_final_turn_answer():
     assert server_manager.last_sampling_params["extra_args"][FORCE_ACTION_REQUIRED_TAG_KEY] == "<answer>"
     assert server_manager.last_sampling_params["extra_args"][FORCE_ACTION_TAG_IDS_KEY] == [2, 20, 21, 22]
     assert "forced_structure_error" not in agent_data.extra_fields
+
+
+def test_validation_final_answer_override_can_enable_forcing_independently():
+    loop = object.__new__(ToolAgentLoop)
+    loop.force_answer_on_final_turn = False
+    loop.force_answer_on_final_turn_validation = True
+
+    assert loop._force_answer_on_final_turn_active(None) is False
+    assert loop._force_answer_on_final_turn_active({"_debug_trajectory": {"validate": True}}) is True
+
+
+def test_validation_final_answer_override_can_disable_forcing_independently():
+    loop = object.__new__(ToolAgentLoop)
+    loop.force_answer_on_final_turn = True
+    loop.force_answer_on_final_turn_validation = False
+
+    assert loop._force_answer_on_final_turn_active(None) is True
+    assert loop._force_answer_on_final_turn_active({"_debug_trajectory": {"validate": True}}) is False
+
+
+def test_validation_final_answer_override_null_inherits_shared_setting():
+    loop = object.__new__(ToolAgentLoop)
+    loop.force_answer_on_final_turn_validation = None
+
+    loop.force_answer_on_final_turn = False
+    assert loop._force_answer_on_final_turn_active({"_debug_trajectory": {"validate": True}}) is False
+
+    loop.force_answer_on_final_turn = True
+    assert loop._force_answer_on_final_turn_active({"_debug_trajectory": {"validate": True}}) is True
+
+
+def test_validation_final_answer_override_does_not_force_early_turns():
+    loop = object.__new__(ToolAgentLoop)
+    loop.force_answer_on_final_turn = False
+    loop.force_answer_on_final_turn_validation = True
+    loop.max_assistant_turns = 11
+    loop.max_user_turns = 10
+    loop.final_answer_token_margin = 4
+    loop.response_length = 64
+    agent_data = _make_agent_data()
+
+    assert loop._force_answer_on_final_turn_active({"_debug_trajectory": {"validate": True}}) is True
+    assert loop._must_answer_now(agent_data) is False
 
 
 def test_forced_final_turn_forces_boxed_answer_prefix():
@@ -830,7 +876,8 @@ def test_validation_without_retry_still_forces_answer_on_final_turn():
             tool_parser,
             lambda **kwargs: {"accuracy": 0.0},
         )
-        loop.force_answer_on_final_turn = True
+        loop.force_answer_on_final_turn = False
+        loop.force_answer_on_final_turn_validation = True
         loop.conditional_answer_retry_enable_validation = False
         return await loop._handle_generating_state(
             agent_data,
@@ -898,6 +945,7 @@ def test_conditional_answer_retry_uses_llm_judge_for_search_answer():
     def reward_fn(**kwargs):
         calls["reward_fn"] += 1
         assert kwargs["solution_str"] == "<think>reason</think><answer>final</answer>"
+        assert kwargs["extra_info"]["assistant_turns"] == 1
         return {"score": 0.1, "accuracy": 0.0, "format": 1.0}
 
     async def run_test():
@@ -938,6 +986,7 @@ def test_final_llm_judge_score_uses_final_trajectory_without_mutating_tokens():
 
     def reward_fn(**kwargs):
         assert kwargs["solution_str"] == "<think>reason</think><answer>final</answer>"
+        assert kwargs["extra_info"]["assistant_turns"] == agent_data.assistant_turns
         return {"score": 0.1, "accuracy": 0.0, "format": 1.0}
 
     async def run_test():

@@ -4,6 +4,7 @@ import inspect
 import pytest
 
 from verl.utils.reward_score.math_verify_reward_type_multiturn_tool_calling_optional_think import (
+    assistant_turn_overlong_reward,
     async_compute_score_from_data_source,
     compute_score_from_data_source,
     extract_answer_for_accuracy,
@@ -17,6 +18,69 @@ def zoom_call(bbox, img_idx=0):
         "name": "image_zoom_in_tool",
         "arguments": {"bbox_2d": bbox, "label": "region", "img_idx": img_idx},
     }
+
+
+@pytest.mark.parametrize(
+    ("assistant_turns", "expected"),
+    [(0, 0.0), (9, 0.0), (10, -0.5), (11, -1.0)],
+)
+def test_assistant_turn_overlong_reward_ramps_over_final_two_turns(assistant_turns, expected):
+    assert assistant_turn_overlong_reward(
+        assistant_turns,
+        max_turns=11,
+        buffer_turns=2,
+        penalty_factor=1.0,
+    ) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"assistant_turns": 11.0, "max_turns": 11, "buffer_turns": 2},
+        {"assistant_turns": 12, "max_turns": 11, "buffer_turns": 2},
+        {"assistant_turns": 11, "max_turns": 0, "buffer_turns": 2},
+        {"assistant_turns": 11, "max_turns": 11, "buffer_turns": 0},
+        {"assistant_turns": 11, "max_turns": 2, "buffer_turns": 3},
+        {"assistant_turns": 11, "max_turns": 11, "buffer_turns": 2, "penalty_factor": 0.0},
+    ],
+)
+def test_assistant_turn_overlong_reward_rejects_invalid_inputs(kwargs):
+    with pytest.raises(ValueError):
+        assistant_turn_overlong_reward(**kwargs)
+
+
+def test_assistant_turn_overlong_component_requires_metadata_when_enabled():
+    with pytest.raises(ValueError, match="assistant_turns"):
+        compute_score_from_data_source(
+            data_source="unit",
+            solution_str="<think>done</think><answer>A</answer>",
+            ground_truth="A",
+            extra_info={"reward_type": "multiple_choice"},
+            assistant_turn_overlong_enabled=True,
+            assistant_turn_overlong_max_turns=11,
+            assistant_turn_overlong_buffer_turns=2,
+        )
+
+
+def test_assistant_turn_overlong_component_is_returned_without_changing_scalar_score():
+    kwargs = {
+        "data_source": "unit",
+        "solution_str": "<think>done</think><answer>A</answer>",
+        "ground_truth": "A",
+        "extra_info": {"reward_type": "multiple_choice", "assistant_turns": 10},
+        "assistant_turn_overlong_enabled": True,
+        "assistant_turn_overlong_max_turns": 11,
+        "assistant_turn_overlong_buffer_turns": 2,
+        "assistant_turn_overlong_penalty_factor": 1.0,
+    }
+
+    sync_result = compute_score_from_data_source(**kwargs)
+    async_result = asyncio.run(async_compute_score_from_data_source(**kwargs))
+
+    assert sync_result["assistant_turn_overlong"] == pytest.approx(-0.5)
+    assert async_result["assistant_turn_overlong"] == pytest.approx(-0.5)
+    assert sync_result["score"] == pytest.approx(1.0)
+    assert async_result["score"] == pytest.approx(1.0)
 
 
 def test_mandatory_think_accepts_think_wrapped_answer():

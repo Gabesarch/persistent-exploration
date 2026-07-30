@@ -14,6 +14,10 @@ from lmms_eval.tasks._task_utils.response_truncation import truncate_response_ta
 MODEL_HINT = os.getenv("JUDGE_MODEL_PATH", "")
 _PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "judge_prompt.txt"
 _PREFIXES = ("VisualProbe_Easy/", "VisualProbe_Medium/", "VisualProbe_Hard/", "VisualProbe_train/")
+_GENERATION_FAILURE_MARKERS = (
+    "[LMMS_EVAL_FORCED_FINAL_ANSWER_FAILED:",
+    "[LMMS_EVAL_REQUEST_FAILED",
+)
 _REPO_HINTS = {
     "easy": "Mini-o3/VisualProbe_Easy",
     "medium": "Mini-o3/VisualProbe_Medium",
@@ -266,7 +270,9 @@ def visual_probe_aggregate_judge_results(results: List[Dict[str, Any]]) -> float
     correct = 0
     details: Dict[str, Dict[str, Any]] = {}
     for idx, (meta, raw) in enumerate(zip(metadata, judge_outputs)):
-        is_equivalent = _parse_judge_output(raw)
+        raw_prediction = str(meta.get("raw_prediction") or "")
+        generation_failed = any(marker in raw_prediction for marker in _GENERATION_FAILURE_MARKERS)
+        is_equivalent = False if generation_failed else _parse_judge_output(raw)
         if is_equivalent:
             correct += 1
         resp_key = str(meta.get("resp_key") or f"sample_{idx}")
@@ -278,6 +284,7 @@ def visual_probe_aggregate_judge_results(results: List[Dict[str, Any]]) -> float
             "data_source": meta.get("data_source"),
             "judge_output": raw,
             "extracted_answer": meta.get("prediction", ""),
+            "generation_failed": generation_failed,
             "score": 1.0 if is_equivalent else 0.0,
         }
 

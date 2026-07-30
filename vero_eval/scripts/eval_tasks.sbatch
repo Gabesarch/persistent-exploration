@@ -70,11 +70,10 @@ OUTPUT_PATH="${OUTPUT_PATH:-$DEFAULT_OUTPUT}"
 WITH_TOOLS="${WITH_TOOLS:-1}"
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-}"
 MAX_TOOL_ITERATIONS="${MAX_TOOL_ITERS:-10}"
-# Use job-specific ports to avoid conflicts when multiple jobs land on the same node
+# Use a job-specific policy port to avoid conflicts when multiple jobs share a node.
 PORT="${PORT:-$((9000 + SLURM_JOB_ID % 1000))}"
-VLLM_JUDGE_PORT="${VLLM_JUDGE_PORT:-$((8000 + SLURM_JOB_ID % 1000))}"
-export VLLM_JUDGE_PORT
 API_KEY="${API_KEY:-qwen}"
+export JUDGE_BACKEND="${JUDGE_BACKEND:-engine}"
 export VLLM_USE_FLASHINFER_SAMPLER=0
 
 mkdir -p "$VERO_EVAL_DIR/logs" "$OUTPUT_PATH"

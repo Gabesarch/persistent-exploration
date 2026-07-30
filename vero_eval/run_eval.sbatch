@@ -5,7 +5,7 @@
 #SBATCH --time=4:00:00
 #SBATCH --mem=120G
 #SBATCH --cpus-per-task=12
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:1
 #SBATCH --output=logs/vero_eval_%j.out
 #SBATCH --error=logs/vero_eval_%j.err
 #
@@ -18,9 +18,8 @@
 #   sbatch --export=ALL,MODEL=vero,CHECKPOINT_PATH=/scratch/.../actor/huggingface,TASKS=all,TOOLS=on \
 #          run_eval.sbatch
 #
-#   # exact-match-only run (no judge) -> 1 GPU is enough:
-#   sbatch --gres=gpu:1 --export=ALL,MODEL=qwen3vl,TASKS=countqa_reasoning,TOOLS=on \
-#          run_eval.sbatch
+#   # judge and exact-match runs both default to one GPU:
+#   sbatch --export=ALL,MODEL=qwen3vl,TASKS=countqa_reasoning,TOOLS=on run_eval.sbatch
 # ----------------------------------------------------------------------------
 # MODEL  : vero | vero-thinking | qwen3vl | qwen3vl-thinking | qwen25vl | <abs ckpt path>
 #          Sets CHECKPOINT_PATH + the default task SUFFIX. For Vero the reasoning system
@@ -32,8 +31,8 @@
 # SUFFIX : override the per-task suffix for a DOMAIN run (default per MODEL)
 # Other  : LIMIT, MAX_TOOL_ITERATIONS (turns, default 10), JUDGE_BACKEND, SYSTEM_PROMPT, OUTPUT_ROOT
 #
-# Judge: a judge task auto-launches a dedicated Qwen3-32B judge on GPU1 (the reportable
-# judge). Submit with --gres=gpu:1 for exact-match-only runs (e.g. countqa).
+# Judge: judge tasks default to a reportable in-process Qwen3-32B judge. The policy
+# server sleeps while that judge uses the same GPU, so one GPU is sufficient.
 # ============================================================================
 set -euo pipefail
 
@@ -52,7 +51,7 @@ source "$VERO_EVAL_DIR/examples/_domain_map.sh"
 : "${TASKS:?set TASKS=<task1,task2,...> or a domain (e.g. TASKS=grounding_counting_search)}"
 MODEL="${MODEL:-qwen3vl}"; TOOLS="${TOOLS:-on}"; SUFFIX="${SUFFIX:-}"; LIMIT="${LIMIT:-}"
 PORT="${PORT:-9001}"; API_KEY="${API_KEY:-qwen}"
-export NUM_GPUS="${NUM_GPUS:-1}"   # policy uses 1 GPU; a judge task gets the 2nd
+export NUM_GPUS="${NUM_GPUS:-1}"   # policy TP; local judging reuses this GPU sequentially
 MERGE_BACKEND="${MERGE_BACKEND:-fsdp}"
 export FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS="${FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS:-false}"
 export FORCE_FINAL_ANSWER_PREFIX="${FORCE_FINAL_ANSWER_PREFIX:-}"

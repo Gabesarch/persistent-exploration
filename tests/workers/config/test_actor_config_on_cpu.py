@@ -19,6 +19,7 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.workers.config import (
     ActorConfig,
     BranchLossStrataConfig,
+    BranchSubsamplingConfig,
     FSDPActorConfig,
     McoreActorConfig,
     OptimizerConfig,
@@ -236,6 +237,23 @@ class TestActorConfig(unittest.TestCase):
                 use_dynamic_bsz=True,
                 loss_agg_mode="token-mean",
                 policy_loss=PolicyLossConfig(loss_mode="gspo", branch_strata=BranchLossStrataConfig(enabled=True)),
+            )
+
+    def test_branch_subsampling_config_validation(self):
+        subsampling = BranchSubsamplingConfig(enabled=True, max_branches_per_parent=1, seed=42)
+        config = BranchLossStrataConfig(enabled=True, subsampling=subsampling)
+        self.assertTrue(config.subsampling.enabled)
+        self.assertEqual(config.subsampling.max_branches_per_parent, 1)
+        self.assertEqual(config.subsampling.seed, 42)
+
+        for invalid_cap in (None, 0, -1):
+            with self.assertRaisesRegex(ValueError, "must be a positive integer"):
+                BranchSubsamplingConfig(enabled=True, max_branches_per_parent=invalid_cap)
+
+        with self.assertRaisesRegex(ValueError, "requires branch strata to be enabled"):
+            BranchLossStrataConfig(
+                enabled=False,
+                subsampling=BranchSubsamplingConfig(enabled=True, max_branches_per_parent=1),
             )
 
     def test_fsdp_actor_config_validation_exceptions(self):

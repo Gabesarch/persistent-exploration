@@ -400,6 +400,73 @@ class RayPPOTrainer:
         for name, value in diagnostics.items():
             metrics[f"branch_strata/{name}"] = value
 
+    def _subsample_branch_training_rows(self, batch: DataProto, metrics: dict) -> DataProto:
+        """Uniformly cap branch rows per parent while retaining every canonical row."""
+        strata = self._branch_strata_config()
+        subsampling = strata.get("subsampling", {}) if strata else {}
+        if not subsampling or not bool(subsampling.get("enabled", False)):
+            return batch
+
+        branch_key = str(strata.get("branch_indicator_key", "is_conditional_answer_retry_branch"))
+        parent_key = str(strata.get("parent_id_key", "request_id"))
+        if branch_key not in batch.non_tensor_batch:
+            raise ValueError(f"Branch subsampling requires non-tensor batch key {branch_key!r}.")
+        if parent_key not in batch.non_tensor_batch:
+            raise ValueError(f"Branch subsampling requires non-tensor batch key {parent_key!r}.")
+
+        branch_flags = np.asarray(batch.non_tensor_batch[branch_key], dtype=object)
+        parent_ids = np.asarray(batch.non_tensor_batch[parent_key], dtype=object)
+        if len(branch_flags) != len(batch) or len(parent_ids) != len(batch):
+            raise ValueError(
+                "Branch subsampling metadata must have one entry per response row: "
+                f"rows={len(batch)}, branch_flags={len(branch_flags)}, parent_ids={len(parent_ids)}."
+            )
+
+        branches_by_parent: dict[Any, list[int]] = defaultdict(list)
+        for row, flag in enumerate(branch_flags):
+            if not isinstance(flag, bool | np.bool_):
+                raise ValueError(f"Branch subsampling row {row} has non-boolean branch flag {flag!r}.")
+            if not bool(flag):
+                continue
+            parent = parent_ids[row]
+            if parent is None or (isinstance(parent, str) and not parent.strip()):
+                raise ValueError(f"Branch subsampling row {row} has an empty parent id.")
+            branches_by_parent[parent].append(row)
+
+        input_branch_rows = sum(len(rows) for rows in branches_by_parent.values())
+        input_counts = [len(rows) for rows in branches_by_parent.values()]
+        prefix = "branch_strata/subsampling"
+        metrics[f"{prefix}/input_branch_rows"] = input_branch_rows
+        metrics[f"{prefix}/branch_parents"] = len(branches_by_parent)
+        metrics[f"{prefix}/input_parent_branch_count_mean"] = (
+            float(np.mean(input_counts)) if input_counts else 0.0
+        )
+        metrics[f"{prefix}/input_parent_branch_count_max"] = max(input_counts, default=0)
+
+        if input_branch_rows == 0:
+            metrics[f"{prefix}/retained_branch_rows"] = 0
+            metrics[f"{prefix}/dropped_branch_rows"] = 0
+            metrics[f"{prefix}/retention_rate"] = 1.0
+            return batch
+
+        max_per_parent = int(subsampling.get("max_branches_per_parent"))
+        seed = int(subsampling.get("seed", 42))
+        rng = np.random.default_rng(np.random.SeedSequence([seed, int(self.global_steps)]))
+        keep = np.logical_not(np.asarray(branch_flags, dtype=bool))
+        retained_branch_rows = 0
+        for rows in branches_by_parent.values():
+            if len(rows) <= max_per_parent:
+                selected = rows
+            else:
+                selected = rng.choice(rows, size=max_per_parent, replace=False).tolist()
+            keep[np.asarray(selected, dtype=np.int64)] = True
+            retained_branch_rows += len(selected)
+
+        metrics[f"{prefix}/retained_branch_rows"] = retained_branch_rows
+        metrics[f"{prefix}/dropped_branch_rows"] = input_branch_rows - retained_branch_rows
+        metrics[f"{prefix}/retention_rate"] = retained_branch_rows / input_branch_rows
+        return batch.select_idxs(np.flatnonzero(keep))
+
     def _gpu_memory_context(self, batch: DataProto | None = None, extra: Mapping[str, Any] | None = None) -> dict:
         context = {}
         if batch is not None:
@@ -1876,6 +1943,7 @@ class RayPPOTrainer:
                     if rollout_row_ids is not None:
                         batch = batch.select_idxs(np.asarray(rollout_row_ids, dtype=np.int64))
                     batch = batch.union(gen_batch_output)
+                    batch = self._subsample_branch_training_rows(batch, metrics)
                     batch = self._pad_branch_expanded_training_batch(batch, metrics)
                     if self._should_compute_teacher_colocate(batch):
                         with marked_timer("teacher", timing_raw, color="cyan"):

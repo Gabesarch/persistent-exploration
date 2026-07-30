@@ -118,6 +118,27 @@ class TestConfigOnCPU(unittest.TestCase):
             self.assertTrue(cfg.actor_rollout_ref.actor.policy_loss.branch_strata.parent_balance)
             self.assertEqual(cfg.trainer.use_legacy_worker_impl, "enable")
 
+    def test_noforceanswer_recipe_caps_retries_and_subsamples_branches(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        config_name = (
+            "gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_cropzoom_cpueff_hardonly_"
+            "answer_retry_branch_donly_llmjudge_forcedprefill_branchstrata_base_"
+            "noforceanswer_te015_turn4k_inferenceval.yaml"
+        )
+        cfg = OmegaConf.load(repo_root / "vero2_scripts" / "config" / config_name)
+
+        self.assertEqual(cfg.actor_rollout_ref.rollout.multi_turn.conditional_answer_retry_max_retries, 4)
+        strata = cfg.actor_rollout_ref.actor.policy_loss.branch_strata
+        self.assertEqual(strata.branch_fraction, 0.2)
+        self.assertTrue(strata.subsampling.enabled)
+        self.assertEqual(strata.subsampling.max_branches_per_parent, 1)
+        self.assertEqual(strata.subsampling.seed, 42)
+        reward_kwargs = cfg.reward.custom_reward_function.reward_kwargs
+        self.assertTrue(reward_kwargs.assistant_turn_overlong_enabled)
+        self.assertEqual(reward_kwargs.assistant_turn_overlong_max_turns, 11)
+        self.assertEqual(reward_kwargs.assistant_turn_overlong_buffer_turns, 2)
+        self.assertEqual(reward_kwargs.assistant_turn_overlong_penalty_factor, 1.0)
+
 
 class TestPrintCfgCommand(unittest.TestCase):
     """Test suite for the print_cfg.py command-line tool."""

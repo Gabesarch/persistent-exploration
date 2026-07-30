@@ -59,6 +59,7 @@ def test_wrong_answer_branch_uses_divergence_only_mask_and_zero_components():
     assert branch.response_mask == [0, 0, 0, 0, 1]
     assert branch.response_logprobs == [-0.1, -0.2, 0.0, 0.0, -0.3]
     assert branch.reward_score == 0.0
+    assert branch.extra_fields["assistant_turns"] == 2
     assert branch.extra_fields["is_conditional_answer_retry_branch"] is True
     assert branch.extra_fields["gdpo_baseline_weight"] == 0.0
     reward_extra_info = branch.extra_fields["reward_extra_info"]

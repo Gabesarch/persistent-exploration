@@ -781,6 +781,29 @@ def test_stable_gdpo_rejects_invalid_stability_config(override, message):
         )
 
 
+def test_gdpo_uses_assistant_turn_overlong_as_an_independent_component():
+    response_mask = torch.ones((2, 2), dtype=torch.float32)
+    config = _stable_gdpo_config(
+        gdpo_reward_keys=["accuracy", "assistant_turn_overlong"],
+        gdpo_reward_weights=[0.8, 0.2],
+    )
+    advantages, _ = compute_gdpo_outcome_advantage(
+        token_level_rewards=torch.zeros_like(response_mask),
+        response_mask=response_mask,
+        index=np.array(["prompt-a", "prompt-a"], dtype=object),
+        config=config,
+        non_tensor_batch={
+            "accuracy": np.asarray([1.0, 1.0], dtype=np.float32),
+            "assistant_turn_overlong": np.asarray([0.0, -1.0], dtype=np.float32),
+            "gdpo_baseline_weight": np.asarray([1.0, 1.0], dtype=np.float32),
+        },
+        batch=_make_gdpo_test_batch(num_rows=2, response_len=2),
+    )
+
+    response_advantages = _response_advantages(advantages, response_mask)
+    assert response_advantages[0] > response_advantages[1]
+
+
 def test_stable_gdpo_randomized_branch_heavy_batches_are_finite_and_bounded():
     rng = np.random.default_rng(1234)
     for _ in range(20):

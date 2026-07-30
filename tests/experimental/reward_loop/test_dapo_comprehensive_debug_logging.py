@@ -14,6 +14,11 @@ class _FakeTokenizer:
         return "decoded response"
 
 
+class _InlineExecutorLoop:
+    async def run_in_executor(self, _executor, function):
+        return function()
+
+
 def test_dapo_reward_manager_logs_reward_assignment_without_changing_reward(tmp_path):
     config = OmegaConf.create(
         {
@@ -40,7 +45,10 @@ def test_dapo_reward_manager_logs_reward_assignment_without_changing_reward(tmp_
         }
     )
 
-    async def compute_score(**_kwargs):
+    received_kwargs = {}
+
+    async def compute_score(**kwargs):
+        received_kwargs.update(kwargs)
         return {"score": 0.6, "accuracy": 0.5, "format": 1.0}
 
     manager = DAPORewardManager(config, _FakeTokenizer(), compute_score)
@@ -54,20 +62,20 @@ def test_dapo_reward_manager_logs_reward_assignment_without_changing_reward(tmp_
             "reward_model": np.array([{"ground_truth": "42"}], dtype=object),
             "extra_info": np.array([{"reward_type": "numeric", "tolerance": 0.01}], dtype=object),
             "uid": np.array(["sample-1"], dtype=object),
-            "tool_extra_fields": np.array([{"request_id": "req-1"}], dtype=object),
+            "tool_extra_fields": np.array([{"request_id": "req-1", "assistant_turns": 10}], dtype=object),
         },
     )
 
-    async def run_single_on_current_loop():
-        manager.loop = asyncio.get_running_loop()
-        return await manager.run_single(data)
-
-    result = asyncio.run(run_single_on_current_loop())
+    manager.loop = _InlineExecutorLoop()
+    result = asyncio.run(manager.run_single(data))
 
     assert result == {
         "reward_score": 0.6,
         "reward_extra_info": {"score": 0.6, "accuracy": 0.5, "format": 1.0},
     }
+    assert received_kwargs["extra_info"]["assistant_turns"] == 10
+    assert received_kwargs["extra_info"]["request_id"] == "req-1"
+    assert data.non_tensor_batch["extra_info"][0] == {"reward_type": "numeric", "tolerance": 0.01}
     log_path = tmp_path / "debug_logs" / "reward_assignments.jsonl"
     record = json.loads(log_path.read_text())
     assert record["event"] == "reward_assignment"

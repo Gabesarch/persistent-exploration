@@ -5,7 +5,7 @@
 #SBATCH --time=2:00:00
 #SBATCH --mem=80G
 #SBATCH --cpus-per-task=10
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:1
 #SBATCH --partition=pli
 #SBATCH --account=vlmrl
 #SBATCH --output=vero_eval/logs/eval_vprobe_%j.out
@@ -14,10 +14,11 @@
 # Demo / runner for a JUDGE-BASED task (visual_probe -> metric judge_accuracy).
 # Submit from the repo root:  sbatch vero_eval/scripts/eval_visual_probe.sbatch
 #
-# Default judge = JUDGE_BACKEND=server, which REUSES the policy vLLM server on
-# $PORT as the judge (judge == the Qwen3-VL policy, zero extra GPU). For a stronger
-# dedicated Qwen3-32B judge, request gpu:2 and set:
-#   START_VLLM_JUDGE_SERVER=1 VLLM_JUDGE_CUDA_VISIBLE_DEVICES=1   (see serve_judge_vllm.sh)
+# Default judge = JUDGE_BACKEND=engine: a reportable Qwen3-32B judge loads
+# in-process after the policy server sleeps and remains cached until process exit.
+# The legacy two-server layout remains explicit:
+#   sbatch --gres=gpu:2 --export=ALL,JUDGE_BACKEND=server \
+#     vero_eval/scripts/eval_visual_probe.sbatch
 
 set -euo pipefail
 
@@ -33,15 +34,15 @@ set -u
 TASK="${TASK:-visual_probe_easy_qwen3_zs}"
 LIMIT="${LIMIT:-20}"
 PORT="${PORT:-9001}"; API_KEY="${API_KEY:-qwen}"
-export JUDGE_BACKEND="${JUDGE_BACKEND:-server}"
+export JUDGE_BACKEND="${JUDGE_BACKEND:-engine}"
 OUTPUT_PATH="${OUTPUT_PATH:-$VERO_EVAL_DIR/results/${TASK}}"
 export VLLM_USE_FLASHINFER_SAMPLER=0
 
 mkdir -p "$VERO_EVAL_DIR/logs"
 cd "$VERO_EVAL_DIR"
 
-# Policy/tool server (reuse if already up). In server-judge mode this same server
-# is also the judge endpoint.
+# Policy/tool server (reuse if already up). The default local lifecycle wakes it
+# before generation and deep-sleeps it before in-process judge postprocessing.
 if curl --max-time 5 -s -o /dev/null -H "Authorization: Bearer ${API_KEY}" "http://localhost:${PORT}/v1/models"; then
   echo "=== Reusing existing vLLM server on :$PORT ==="
 else

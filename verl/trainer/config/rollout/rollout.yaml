@@ -223,6 +223,10 @@ multi_turn:
   # assistant turn or final-answer token margin is reached.
   force_answer_on_final_turn: False
 
+  # Validation-only override for force_answer_on_final_turn. Null inherits the
+  # shared setting for backward compatibility; true/false controls validation independently.
+  force_answer_on_final_turn_validation: null
+
   # Token headroom reserved for the final <answer> turn; if remaining response budget
   # drops below this, switch to forcing an answer to avoid an answerless overflow.
   final_answer_token_margin: 2048

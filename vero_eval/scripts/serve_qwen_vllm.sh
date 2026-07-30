@@ -1,12 +1,15 @@
 #!/bin/bash
 # Serve the policy/tool model via vLLM (OpenAI-compatible) with the Qwen3-VL
-# tool-calling flags. Config comes from set_paths.sh: CHECKPOINT_PATH, PORT,
-# MODEL_NAME, API_KEY, NUM_GPUS.
+# tool-calling flags and sleep-mode lifecycle API. Config comes from set_paths.sh:
+# CHECKPOINT_PATH, PORT, MODEL_NAME, API_KEY, NUM_GPUS.
 set -euo pipefail
 
 # Disable FlashInfer sampling to avoid JIT compilation issues with missing curand.h
 # on cluster nodes. Uses PyTorch-native sampler instead (minimal performance impact).
 export VLLM_USE_FLASHINFER_SAMPLER=0
+# The sequential one-GPU judge path sleeps this server while its local in-process
+# judge owns the GPU, then wakes it for any remaining policy generations.
+export VLLM_SERVER_DEV_MODE=1
 
 # The variable VLLM_USE_FLASH_ATTN_V3 is not recognized by vLLM.
 # Use the official attention config flag below to force FlashAttention v2.
@@ -86,6 +89,7 @@ nohup vllm serve "$CHECKPOINT_PATH" \
   --no-enable-prefix-caching \
   --mm-processor-kwargs "$MM_PROCESSOR_KWARGS" \
   --api-key "$API_KEY" \
+  --enable-sleep-mode \
   --enable-auto-tool-choice \
   --tool-call-parser hermes \
   "${CHAT_TEMPLATE_ARGS[@]}" \

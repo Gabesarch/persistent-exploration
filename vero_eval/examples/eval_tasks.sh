@@ -8,7 +8,8 @@
 #
 # Env (from set_paths.sh, all overridable): CHECKPOINT_PATH, PORT (9001), API_KEY,
 # MODEL_VERSION/MODEL_NAME (qwen_vllm), SYSTEM_PROMPT (''=none), MCP_SERVER_PATH
-# (''=disable tools), MAX_TOOL_ITERATIONS (10), JUDGE_BACKEND (engine|server), KEEP_SERVER.
+# (''=disable tools), MAX_TOOL_ITERATIONS (10), JUDGE_BACKEND (engine by default;
+# server is the explicit two-GPU legacy path), KEEP_SERVER.
 set -euo pipefail
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; VERO_EVAL_DIR="$(cd "$SELF/.." && pwd)"

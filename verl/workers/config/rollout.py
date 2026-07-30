@@ -92,6 +92,9 @@ class MultiTurnConfig(BaseConfig):
     num_repeat_rollouts: Optional[int] = None
     force_tool_calls_until_final_turn: bool = False
     force_answer_on_final_turn: bool = False
+    # Validation-only override. None preserves the legacy behavior of inheriting
+    # force_answer_on_final_turn; a boolean controls validation independently.
+    force_answer_on_final_turn_validation: Optional[bool] = None
     final_answer_token_margin: int = 2048
     # Text appended inside the forced final turn's `<think>` block before generation.
     # Empty string leaves forced final-answer generation unchanged.

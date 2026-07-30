@@ -13,11 +13,12 @@ conventions (same `set_paths.sh`, task-yaml naming, judge) but serves the policy
 
 **One-time setup:** `cp set_paths.sh.example set_paths.sh` and edit it (conda env with
 vLLM ≥0.17 + `mcp` + `lmms_eval`, HF-cache paths, `CHECKPOINT_PATH`). Submit every
-`sbatch` **from the repo root**. Judge tasks (VisualProbe, MathVista, …) want **2 GPUs**
-(the 2nd auto-serves the reportable Qwen3-32B judge).
+`sbatch` **from the repo root**. Judge tasks (VisualProbe, MathVista, …) default to
+**1 GPU**: the policy server sleeps while the reportable Qwen3-32B judge runs
+in-process on that GPU.
 
 **VisualProbe-Hard, full setting — one command** (10 MP; training-faithful for Vero /
-native sampling for the base; dedicated 32B judge):
+native sampling for the base; sequential in-process 32B judge):
 ```bash
 # Vero RL checkpoint  -> runs visual_probe_hard_reasoning_zoom
 sbatch --export=ALL,MODEL=vero,CHECKPOINT_PATH=/scratch/.../actor/huggingface \
@@ -26,7 +27,7 @@ sbatch --export=ALL,MODEL=vero,CHECKPOINT_PATH=/scratch/.../actor/huggingface \
 sbatch --export=ALL,MODEL=qwen3vl vero_eval/scripts/eval_visual_probe_full.sbatch
 ```
 `PROBE=hard` (default) `| easy | medium | all`. Results land in `vero_eval/results/vprobe_full_*/`.
-1-GPU smoke (8B self-judge, not reportable): add `--gres=gpu:1 --export=...,LIMIT=10,START_VLLM_JUDGE_SERVER=0`.
+For a short smoke, add `LIMIT=10`; it still uses the reportable one-GPU judge.
 
 **Any other benchmark, with zoom** — pick the task by base model (`_reasoning_zoom` for
 Vero, `_qwen3_zoom` for the base; the same pair exists for *every* benchmark) and use the
@@ -86,12 +87,16 @@ cp set_paths.sh.example set_paths.sh   # edit REPO_ROOT / ROOT_PATH / conda env 
 
 **Which server.** The policy model is served **externally** by
 `scripts/serve_qwen_vllm.sh` →
-`vllm serve $CHECKPOINT_PATH --served-model-name $MODEL_NAME --port $PORT
+`VLLM_SERVER_DEV_MODE=1 vllm serve $CHECKPOINT_PATH --served-model-name $MODEL_NAME --port $PORT
 --enable-auto-tool-choice --tool-call-parser hermes --max-model-len 32768
---mm-processor-kwargs '{"max_pixels":...}' --api-key $API_KEY --enforce-eager`.
+--mm-processor-kwargs '{"max_pixels":...}' --api-key $API_KEY --enable-sleep-mode
+--enforce-eager`.
 It runs as a background daemon and the eval talks to it at `http://localhost:$PORT/v1`.
-The checkpoint is **baked in at launch** and the server holds 0.9 GPU util, so only one
-checkpoint can be served per GPU at a time. (This is the key difference from
+The checkpoint is **baked in at launch** and the awake server holds 0.9 GPU util, so only
+one checkpoint can be served per GPU at a time. For local judge tasks, the evaluator
+sleeps the policy server before judge postprocessing; the in-process judge is cached
+until that evaluator process exits, and the policy is woken before a later generation
+phase. (This is the key difference from
 reason-vlm-eval, which loads the policy *in-process* via `--model vllm`.)
 
 **Multi-turn / agentic loop.** Driven by the `async_openai` lmms_eval model
@@ -129,7 +134,7 @@ All set via env before any runner (consumed in `examples/eval_domain.sh`, forwar
 | Max tool images | (model_arg `max_tool_images`) | `8` | cap on returned images kept in context |
 | System prompt | `SYSTEM_PROMPT` | none | path to a `prompts/*.txt` (e.g. `prompts/countqa_system_prompt.txt`) |
 | Policy port | `PORT` | `9001` | vLLM server port |
-| Judge | `JUDGE_BACKEND` | auto | judge tasks → dedicated Qwen3-32B on a 2nd GPU (see §7) |
+| Judge | `JUDGE_BACKEND` | `engine` | judge tasks → sequential in-process Qwen3-32B on the policy GPU (see §7) |
 
 ```bash
 # tools OFF, single-turn:
@@ -183,7 +188,7 @@ Ready-made tasks (Qwen3-VL Instruct; same sampling/scorers as the `_qwen3_zs`
 baselines): `visual_probe_hard_qwen3_{zoom,draw}`,
 `screenspotpro_point_in_box_qwen3_{zoom,draw}`.
 
-**Submit all of them with one script** (judge-aware GRES, unique PORT per job):
+**Submit all of them with one script** (one GPU by default, unique PORT per job):
 ```bash
 bash vero_eval/examples/submit_tool_evals.sh                       # the 4 tasks
 TASKS="visual_probe_hard_qwen3_zoom screenspotpro_point_in_box_qwen3_draw" \
@@ -242,7 +247,8 @@ sbatch --export=ALL,MODEL=vero,CHECKPOINT_PATH=/scratch/.../actor/huggingface,TA
        vero_eval/run_eval.sbatch
 ```
 It serves the model, runs the tasks, and launches the judge (for judge tasks) in one job.
-`TASKS` accepts a comma-list **or** a domain name. Add `--gres=gpu:1` for exact-match-only runs.
+`TASKS` accepts a comma-list **or** a domain name; both judge and exact-match runs
+default to one GPU.
 
 ### The three underlying runner types
 All ultimately call `examples/eval_domain.sh`. Run interactive ones from the package root
@@ -255,7 +261,8 @@ bash examples/eval_tasks.sh --tasks countqa_reasoning,chartqa_reasoning,charxiv_
 ```
 Auto-serves `CHECKPOINT_PATH` if nothing is on `$PORT`, then forwards the comma-list to
 `eval_domain.sh`. Use any task name that exists under `lmms_eval/tasks/**` (the `task:`/
-`group:` field). Judge tasks need 2 GPUs for the dedicated Qwen3-32B judge (see §7).
+`group:` field). Judge tasks use the one-GPU sequential Qwen3-32B judge by default
+(see §7).
 
 ### TYPE 2 — an array of checkpoints on a domain (SLURM)
 ```bash
@@ -290,15 +297,16 @@ MM_MAX_PIXELS=10000000 bash vero_eval/examples/submit_eval_checkpoints.sh \
 cd vero_eval
 bash examples/eval_across_domains.sh --domains all --model-suffix reasoning --limit 50
 ```
-Serves `CHECKPOINT_PATH` **once**, then loops the domains (default `server` judge so judge
-tasks reuse the policy endpoint). Results go to `results/<model>_<ts>/<domain>/`.
+Serves `CHECKPOINT_PATH` **once**, then loops the domains. The default `engine` judge
+shares the GPU sequentially with the sleeping policy server. Results go to
+`results/<model>_<ts>/<domain>/`.
 `--domains chart_ocr,stem` to pick a subset.
 
 ### Visual Probe at the full setting (`scripts/eval_visual_probe_full.sbatch`)
 
 The canonical, reportable VisualProbe zoom configuration in one command:
 **`max_pixels = 10,000,000`** served at launch, the **per-model** zoom task + sampling, and
-the dedicated **Qwen3-32B** judge (needs `gpu:2`). Submit from the repo root:
+the sequential in-process **Qwen3-32B** judge (one GPU total). Submit from the repo root:
 
 ```bash
 # Vero RL checkpoint — TRAINING-FAITHFUL (forced-<think> chat template, temp 0.7/top_p 1/top_k -1,
@@ -310,9 +318,9 @@ sbatch --export=ALL,MODEL=vero,CHECKPOINT_PATH=/scratch/.../actor/huggingface \
 # runs visual_probe_hard_qwen3_zoom:
 sbatch --export=ALL,MODEL=qwen3vl vero_eval/scripts/eval_visual_probe_full.sbatch
 
-# all three difficulties; or a single-GPU smoke (8B self-judge, NOT reportable):
+# all three difficulties; or a short, still-reportable one-GPU smoke:
 sbatch --export=ALL,MODEL=vero,CHECKPOINT_PATH=...,PROBE=all vero_eval/scripts/eval_visual_probe_full.sbatch
-sbatch --gres=gpu:1 --export=ALL,MODEL=qwen3vl,LIMIT=10,START_VLLM_JUDGE_SERVER=0 \
+sbatch --export=ALL,MODEL=qwen3vl,LIMIT=10 \
        vero_eval/scripts/eval_visual_probe_full.sbatch
 ```
 
@@ -387,24 +395,30 @@ variant (e.g. charxiv has no `_qwen3_zs`). Edit this file to add/remove domain m
 
 ## 7. Judge (judge-based tasks: visual_probe, simplevqa, mathvista, charxiv, …)
 
-countqa is `exact_match` (no judge). Judge tasks are auto-detected; `eval_domain.sh` then
-sets up the judge **by default = a dedicated Qwen3-32B on a 2nd GPU** (the strong,
-reportable judge, like reason-vlm-eval — hence the runners default to `--gres=gpu:2`):
+countqa is `exact_match` (no judge). Judge tasks are auto-detected; `eval_domain.sh`
+defaults to `JUDGE_BACKEND=engine`, `API_TYPE=vllm`, tensor parallel size 1, and managed
+policy-server lifecycle. Policy generation finishes first, the server sleeps, and the
+reportable local judge runs in-process on the same GPU:
 
 | Situation | Judge used | GPU |
 |---|---|---|
-| **judge task + ≥2 GPUs** (default) | dedicated **Qwen3-32B** server on GPU1 | +1 GPU |
-| judge task + 1 GPU (fallback) | the **policy model (Qwen3-VL-8B)** judges itself — prints a **WARNING**; not for reporting | 0 extra |
-| `JUDGE_BACKEND=engine` (≥2 GPUs) | in-process **Qwen3-32B** | +1 GPU |
+| `JUDGE_BACKEND=engine`, `API_TYPE=vllm` (default) | in-process **Qwen3-32B**, policy server managed via sleep/wake | 1 GPU total |
+| `JUDGE_BACKEND=engine`, `API_TYPE=openai` or `azure` | configured hosted judge for task utilities that support it; no local lifecycle management | policy GPU only |
+| `JUDGE_BACKEND=server` | explicit legacy dedicated judge server | 2 GPUs total |
+| `JUDGE_BACKEND=server`, `START_VLLM_JUDGE_SERVER=0` | policy model judges itself; loud **NON-REPORTABLE** warning | 1 GPU total |
 | no judge task (countqa) | none set up | — |
 
 ```bash
-# Strong 32B judge is automatic on 2 GPUs:
+# Reportable default, one GPU:
 sbatch vero_eval/scripts/eval_visual_probe.sbatch
-# Quick 8B self-judge (single GPU, not reportable):
-sbatch --gres=gpu:1 --export=ALL,START_VLLM_JUDGE_SERVER=0 vero_eval/scripts/eval_visual_probe.sbatch
+# Explicit legacy two-server layout:
+sbatch --gres=gpu:2 --export=ALL,JUDGE_BACKEND=server vero_eval/scripts/eval_visual_probe.sbatch
+# Deliberate policy self-judge (not reportable):
+sbatch --export=ALL,JUDGE_BACKEND=server,START_VLLM_JUDGE_SERVER=0 \
+  vero_eval/scripts/eval_visual_probe.sbatch
 ```
-The 8B-self-judge is never silently the default — it only happens on a single GPU and warns.
+Policy self-judge is never an automatic fallback: it requires
+`START_VLLM_JUDGE_SERVER=0` and is labeled non-reportable.
 
 ---
 
@@ -433,6 +447,7 @@ The 8B-self-judge is never silently the default — it only happens on a single 
   `PORT`, `MCP_SERVER_PATH`, `MAX_TOOL_ITERATIONS`, `SYSTEM_PROMPT`, `JUDGE_BACKEND`).
 - **Serve only:** `bash scripts/serve_qwen_vllm.sh` (reads `CHECKPOINT_PATH`/`PORT`).
 - **async_openai model_args:** `model_version, base_url, api_key, mcp_server_path,
-  system_prompt, max_tool_iterations, max_tool_images, tool_image_as_user_turn`.
+  system_prompt, max_tool_iterations, max_tool_images, tool_image_as_user_turn,
+  manage_vllm_server_lifecycle`.
 - **Validate tool-image rendering for a new checkpoint:**
   `sbatch scripts/probe_tool_image.sbatch`.

@@ -6,6 +6,7 @@ import json
 import math
 import re
 from dataclasses import dataclass
+from numbers import Integral
 from typing import Any
 
 from verl.utils.reward_score.math_verify_reward_type_boxed import _counting_reward
@@ -24,6 +25,7 @@ __all__ = [
     "format_reward",
     "acc_reward",
     "extract_answer_for_accuracy",
+    "assistant_turn_overlong_reward",
     "tool_repeat_overlap_reward",
     "compute_score",
     "compute_score_from_data_source",
@@ -334,6 +336,42 @@ def tool_efficiency_reward(
     raise ValueError(f"Unsupported tool_efficiency_reward_mode: {mode}")
 
 
+def assistant_turn_overlong_reward(
+    assistant_turns: int,
+    *,
+    max_turns: int,
+    buffer_turns: int,
+    penalty_factor: float = 1.0,
+) -> float:
+    """Return a bounded linear penalty over the final assistant-turn buffer."""
+    if isinstance(assistant_turns, bool) or not isinstance(assistant_turns, Integral):
+        raise ValueError(f"assistant_turns must be an integer, got {assistant_turns!r}.")
+    if isinstance(max_turns, bool) or not isinstance(max_turns, Integral) or max_turns <= 0:
+        raise ValueError(f"assistant_turn_overlong_max_turns must be a positive integer, got {max_turns!r}.")
+    if isinstance(buffer_turns, bool) or not isinstance(buffer_turns, Integral) or buffer_turns <= 0:
+        raise ValueError(
+            "assistant_turn_overlong_buffer_turns must be a positive integer, "
+            f"got {buffer_turns!r}."
+        )
+    if buffer_turns > max_turns:
+        raise ValueError(
+            "assistant_turn_overlong_buffer_turns must not exceed "
+            f"assistant_turn_overlong_max_turns, got {buffer_turns} > {max_turns}."
+        )
+    factor = float(penalty_factor)
+    if not math.isfinite(factor) or factor <= 0.0:
+        raise ValueError(
+            "assistant_turn_overlong_penalty_factor must be finite and positive, "
+            f"got {penalty_factor!r}."
+        )
+    if assistant_turns < 0 or assistant_turns > max_turns:
+        raise ValueError(f"assistant_turns must be in [0, {max_turns}], got {assistant_turns}.")
+
+    expected_turns = max_turns - buffer_turns
+    raw_penalty = -(assistant_turns - expected_turns) / buffer_turns * factor
+    return max(-factor, min(raw_penalty, 0.0))
+
+
 def _extract_zoom_call_box(tool_call: dict[str, Any]) -> tuple[int, tuple[float, float, float, float]] | None:
     if tool_call.get("name") != "image_zoom_in_tool":
         return None
@@ -508,6 +546,10 @@ def compute_score(
     tool_repeat_overlap_free_depth_refinements: int = 2,
     tool_repeat_overlap_depth_containment_threshold: float = 0.95,
     tool_repeat_overlap_excess_depth_weight: float = 0.5,
+    assistant_turn_overlong_enabled: bool = False,
+    assistant_turn_overlong_max_turns: int | None = None,
+    assistant_turn_overlong_buffer_turns: int | None = None,
+    assistant_turn_overlong_penalty_factor: float = 1.0,
     allow_unboxed_answer_for_accuracy: bool = True,
     require_boxed_answer_for_full_format: bool = False,
     unboxed_answer_format_score: float = 0.0,
@@ -584,6 +626,25 @@ def compute_score(
         "tool_repeat_overlap": tool_repeat_overlap_score,
         "tool_call_bonus": tool_call_bonus_score,
     }
+    if assistant_turn_overlong_enabled:
+        if not isinstance(extra_info, dict) or "assistant_turns" not in extra_info:
+            raise ValueError(
+                "assistant_turns must be provided in extra_info when assistant-turn overlong reward is enabled."
+            )
+        if assistant_turn_overlong_max_turns is None:
+            raise ValueError(
+                "assistant_turn_overlong_max_turns must be provided when assistant-turn overlong reward is enabled."
+            )
+        if assistant_turn_overlong_buffer_turns is None:
+            raise ValueError(
+                "assistant_turn_overlong_buffer_turns must be provided when assistant-turn overlong reward is enabled."
+            )
+        result["assistant_turn_overlong"] = assistant_turn_overlong_reward(
+            extra_info["assistant_turns"],
+            max_turns=assistant_turn_overlong_max_turns,
+            buffer_turns=assistant_turn_overlong_buffer_turns,
+            penalty_factor=assistant_turn_overlong_penalty_factor,
+        )
     if require_boxed_answer_for_full_format:
         result["answer_has_boxed"] = answer_info.has_boxed
         result["answer_used_unboxed_fallback"] = answer_info.used_unboxed_fallback
@@ -613,6 +674,10 @@ def compute_score_from_data_source(
     tool_repeat_overlap_free_depth_refinements: int = 2,
     tool_repeat_overlap_depth_containment_threshold: float = 0.95,
     tool_repeat_overlap_excess_depth_weight: float = 0.5,
+    assistant_turn_overlong_enabled: bool = False,
+    assistant_turn_overlong_max_turns: int | None = None,
+    assistant_turn_overlong_buffer_turns: int | None = None,
+    assistant_turn_overlong_penalty_factor: float = 1.0,
     allow_unboxed_answer_for_accuracy: bool = True,
     require_boxed_answer_for_full_format: bool = False,
     unboxed_answer_format_score: float = 0.0,
@@ -640,6 +705,10 @@ def compute_score_from_data_source(
         tool_repeat_overlap_free_depth_refinements=tool_repeat_overlap_free_depth_refinements,
         tool_repeat_overlap_depth_containment_threshold=tool_repeat_overlap_depth_containment_threshold,
         tool_repeat_overlap_excess_depth_weight=tool_repeat_overlap_excess_depth_weight,
+        assistant_turn_overlong_enabled=assistant_turn_overlong_enabled,
+        assistant_turn_overlong_max_turns=assistant_turn_overlong_max_turns,
+        assistant_turn_overlong_buffer_turns=assistant_turn_overlong_buffer_turns,
+        assistant_turn_overlong_penalty_factor=assistant_turn_overlong_penalty_factor,
         allow_unboxed_answer_for_accuracy=allow_unboxed_answer_for_accuracy,
         require_boxed_answer_for_full_format=require_boxed_answer_for_full_format,
         unboxed_answer_format_score=unboxed_answer_format_score,
@@ -670,6 +739,10 @@ async def async_compute_score_from_data_source(
     tool_repeat_overlap_free_depth_refinements: int = 2,
     tool_repeat_overlap_depth_containment_threshold: float = 0.95,
     tool_repeat_overlap_excess_depth_weight: float = 0.5,
+    assistant_turn_overlong_enabled: bool = False,
+    assistant_turn_overlong_max_turns: int | None = None,
+    assistant_turn_overlong_buffer_turns: int | None = None,
+    assistant_turn_overlong_penalty_factor: float = 1.0,
     allow_unboxed_answer_for_accuracy: bool = True,
     require_boxed_answer_for_full_format: bool = False,
     unboxed_answer_format_score: float = 0.0,
@@ -698,6 +771,10 @@ async def async_compute_score_from_data_source(
         tool_repeat_overlap_free_depth_refinements=tool_repeat_overlap_free_depth_refinements,
         tool_repeat_overlap_depth_containment_threshold=tool_repeat_overlap_depth_containment_threshold,
         tool_repeat_overlap_excess_depth_weight=tool_repeat_overlap_excess_depth_weight,
+        assistant_turn_overlong_enabled=assistant_turn_overlong_enabled,
+        assistant_turn_overlong_max_turns=assistant_turn_overlong_max_turns,
+        assistant_turn_overlong_buffer_turns=assistant_turn_overlong_buffer_turns,
+        assistant_turn_overlong_penalty_factor=assistant_turn_overlong_penalty_factor,
         allow_unboxed_answer_for_accuracy=allow_unboxed_answer_for_accuracy,
         require_boxed_answer_for_full_format=require_boxed_answer_for_full_format,
         unboxed_answer_format_score=unboxed_answer_format_score,
