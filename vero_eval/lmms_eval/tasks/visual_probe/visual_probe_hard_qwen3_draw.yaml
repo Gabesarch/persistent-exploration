@@ -8,10 +8,9 @@ include:
 task: "visual_probe_hard_qwen3_draw"
 generation_kwargs:
   max_new_tokens: 16384
-  temperature: 1.0
-  top_p: 1.0
-  top_k: 40
-  presence_penalty: 2.0
+  temperature: 0.7
+  top_p: 0.8
+  top_k: 20
   do_sample: True
 lmms_eval_specific_kwargs:
   default:

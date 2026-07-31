@@ -84,6 +84,10 @@ class MultiTurnConfig(BaseConfig):
     max_user_turns: Optional[int] = None
     max_parallel_calls: int = 1
     max_tool_response_length: int = 256
+    # Per-turn generation cap: clamp each assistant turn's max_tokens to this (None = uncapped,
+    # i.e. a turn may run to the full response_length). Ported from tmp/training-files-main --
+    # the main lever that keeps multi-turn drawing rollouts from ballooning. See tool_agent_loop.
+    max_assistant_response_length: Optional[int] = None
     tool_response_truncate_side: str = "middle"
     interaction_config_path: Optional[str] = None
     use_inference_chat_template: bool = False

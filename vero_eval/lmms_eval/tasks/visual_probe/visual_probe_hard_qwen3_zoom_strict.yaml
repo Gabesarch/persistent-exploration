@@ -1,0 +1,23 @@
+# STRICT-JUDGE twin of visual_probe_hard_qwen3_zoom (the base-model zoom eval) —
+# same rollout config, judged with prompts/judge_prompt_strict.txt (lenient rubric
+# + the absence-claim rule). Mirrors visual_probe_hard_reasoning_zoom_strict so
+# base-vs-trained comparisons use identical judging on both sides. Strict scores
+# read LOWER than the lenient metric — never compare across judge variants.
+include:
+  - visual_probe_hard.yaml
+  - ../_tool_templates/_toolset_zoom_yaml
+task: "visual_probe_hard_qwen3_zoom_strict"
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 0.7
+  top_p: 0.8
+  top_k: 20
+  do_sample: True
+metric_list:
+  - metric: judge_accuracy
+    aggregation: !function utils.visual_probe_aggregate_judge_results_strict
+    higher_is_better: true
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: "You are given an image. Search the picture to answer the question. Your final answer should be a short, specific phrase. "
+    post_prompt: ""

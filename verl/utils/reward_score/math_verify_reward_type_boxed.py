@@ -933,41 +933,86 @@ _COUNTING_REL_SIGMA = 0.15
 # Floor on the decay width: keeps small counts near-exact (gt=1, pred=0 -> ~0.06)
 # without a division blow-up at gt=0.
 _COUNTING_MIN_SIGMA = 0.5
+# Exponent of the decay outside the band: 2 -> Gaussian exp(-x^2) (default),
+# 1 -> Laplacian exp(-x). Fatter tails (exp 1) reward near-misses on large counts
+# more generously; sharper tails (exp 2) concentrate credit near the band.
+_COUNTING_DECAY_EXP = 2.0
 
 
-def counting_reward_value(pred_count: int, truth_count: int, tolerance: float | None = None) -> float:
+def counting_reward_value(
+    pred_count: int,
+    truth_count: int,
+    tolerance: float | None = None,
+    *,
+    rel_tol: float | None = None,
+    rel_band_cap: float | None = None,
+    rel_sigma: float | None = None,
+    min_sigma: float | None = None,
+    decay_exp: float | None = None,
+    graded: bool = True,
+) -> float:
     """Scale-aware graded reward for counting answers.
 
-    Full credit within ``floor(_COUNTING_REL_TOL * |gt|)`` of the ground truth, a
-    band derived from the count itself so no per-row tolerance is needed: small
-    counts (gt < 20) must be exact while gt=100 accepts 95-105. A per-row absolute
-    ``tolerance`` may widen the band up to ``_COUNTING_REL_BAND_CAP * |gt|`` but can
-    never loosen small counts. Outside the band the reward decays as a Gaussian
-    over ``max(_COUNTING_MIN_SIGMA, _COUNTING_REL_SIGMA * |gt|)``: gt=100/pred=110
-    -> ~0.90 while gt=1/pred=0 -> ~0.06.
+    Full credit within ``floor(rel_tol * |gt|)`` of the ground truth, a band
+    derived from the count itself so no per-row tolerance is needed: small counts
+    (gt < 20) must be exact while gt=100 accepts 95-105. A per-row absolute
+    ``tolerance`` may widen the band up to ``rel_band_cap * |gt|`` but can never
+    loosen small counts. Outside the band the reward decays as
+    ``exp(-((d-band)/sigma) ** decay_exp)`` over
+    ``sigma = max(min_sigma, rel_sigma * |gt|)``: gt=100/pred=110 -> ~0.90 while
+    gt=1/pred=0 -> ~0.06.
+
+    The five ``rel_tol`` / ``rel_band_cap`` / ``rel_sigma`` / ``min_sigma`` /
+    ``decay_exp`` knobs default to ``None``, which falls back to the module
+    constants (``_COUNTING_REL_TOL`` etc.), so an unadorned call is identical to
+    the shipped reward. Training arms override them via
+    ``reward.custom_reward_function.reward_kwargs.counting_*`` (see
+    ``docs/vero2/counting-reward-formula.md``). ``graded=False`` collapses the decay to a
+    hard band (1.0 inside, 0.0 outside), isolating leniency from gradient signal.
     """
+    rel_tol = _COUNTING_REL_TOL if rel_tol is None else float(rel_tol)
+    rel_band_cap = _COUNTING_REL_BAND_CAP if rel_band_cap is None else float(rel_band_cap)
+    rel_sigma = _COUNTING_REL_SIGMA if rel_sigma is None else float(rel_sigma)
+    min_sigma = _COUNTING_MIN_SIGMA if min_sigma is None else float(min_sigma)
+    decay_exp = _COUNTING_DECAY_EXP if decay_exp is None else float(decay_exp)
+
     diff = abs(float(pred_count) - float(truth_count))
     if diff == 0.0:
         return 1.0
 
-    band = float(math.floor(_COUNTING_REL_TOL * abs(float(truth_count))))
+    band = float(math.floor(rel_tol * abs(float(truth_count))))
     if tolerance is not None and tolerance > 0:
-        band = max(band, min(float(tolerance), _COUNTING_REL_BAND_CAP * abs(float(truth_count))))
+        band = max(band, min(float(tolerance), rel_band_cap * abs(float(truth_count))))
     if diff <= band:
         return 1.0
 
-    sigma = max(_COUNTING_MIN_SIGMA, _COUNTING_REL_SIGMA * abs(float(truth_count)))
-    return math.exp(-(((diff - band) / sigma) ** 2))
+    if not graded:
+        return 0.0
+
+    sigma = max(min_sigma, rel_sigma * abs(float(truth_count)))
+    return math.exp(-(((diff - band) / sigma) ** decay_exp))
 
 
-def _counting_reward(stripped_predicted: str, truth: str, *, extra_info: Any | None = None, **_: Any) -> float:
+def _counting_reward(
+    stripped_predicted: str,
+    truth: str,
+    *,
+    extra_info: Any | None = None,
+    counting_reward_kwargs: dict | None = None,
+    **_: Any,
+) -> float:
     truth_count = _parse_simple_integer(truth)
     if truth_count is None:
         return _string_match_reward(stripped_predicted, truth)
     pred_count = _parse_simple_integer(stripped_predicted)
     if pred_count is None:
         return 0.0
-    return counting_reward_value(pred_count, truth_count, tolerance=_extract_tolerance(extra_info))
+    return counting_reward_value(
+        pred_count,
+        truth_count,
+        tolerance=_extract_tolerance(extra_info),
+        **(counting_reward_kwargs or {}),
+    )
 
 
 def _grounding_reward(stripped_predicted: str, truth: str, *, extra_info: Any | None = None, **_: Any) -> float:

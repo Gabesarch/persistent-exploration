@@ -179,6 +179,8 @@ class ToolAgentLoop(AgentLoopBase):
                 raise ValueError("multi_turn.max_assistant_tokens_per_turn must be positive or null")
         self.max_parallel_calls = multi_turn_config.max_parallel_calls
         self.max_tool_response_length = multi_turn_config.max_tool_response_length
+        # Per-turn generation cap (ported from tmp/training-files-main): clamp each turn's max_tokens.
+        self.max_assistant_response_length = getattr(multi_turn_config, "max_assistant_response_length", None)
         self.tool_response_truncate_side = multi_turn_config.tool_response_truncate_side
         self.force_tool_calls_until_final_turn = getattr(multi_turn_config, "force_tool_calls_until_final_turn", False)
         self.force_answer_on_final_turn = getattr(multi_turn_config, "force_answer_on_final_turn", False)
@@ -610,10 +612,21 @@ class ToolAgentLoop(AgentLoopBase):
 
         with simple_timer("generate_sequences", agent_data.metrics):
             generation_prompt_ids = agent_data.prompt_ids + teacher_only_prefill_ids
+            # Per-turn response cap (ported from tmp/training-files-main): clamp this turn's max_tokens
+            # to max_assistant_response_length so a single turn can't run out to the full response_length.
+            # Copy first so the forced-action extra args set above are preserved.
+            turn_sampling_params = sampling_params
+            if self.max_assistant_response_length is not None:
+                remaining_response_length = max(self.response_length - len(agent_data.response_mask), 0)
+                turn_sampling_params = dict(sampling_params)
+                turn_sampling_params["max_tokens"] = min(
+                    int(self.max_assistant_response_length),
+                    remaining_response_length,
+                )
             output: TokenOutput = await self.server_manager.generate(
                 request_id=agent_data.request_id,
                 prompt_ids=generation_prompt_ids,
-                sampling_params=sampling_params,
+                sampling_params=turn_sampling_params,
                 image_data=agent_data.image_data,
                 video_data=agent_data.video_data,
             )

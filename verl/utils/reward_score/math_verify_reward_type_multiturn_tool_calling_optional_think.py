@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from numbers import Integral
 from typing import Any
 
+from verl.utils.reward_score.hstar_strip_reward import hstar_strip_reward
 from verl.utils.reward_score.math_verify_reward_type_boxed import _counting_reward
 from verl.utils.reward_score.math_verify_reward_type_fixations_no_think_point_boxed import (
     _extract_reward_answer,
@@ -276,12 +277,44 @@ def format_reward(
     )
 
 
+def _build_counting_reward_kwargs(
+    *,
+    rel_tol: float | None = None,
+    rel_band_cap: float | None = None,
+    rel_sigma: float | None = None,
+    min_sigma: float | None = None,
+    decay_exp: float | None = None,
+    graded: bool = True,
+) -> dict[str, Any]:
+    """Collect non-default counting knobs into a kwargs dict for ``counting_reward_value``.
+
+    Returns ``{}`` when every knob is at its default, so the counting reward path is
+    bit-identical to the shipped behavior unless a training arm overrides a knob via
+    ``reward.custom_reward_function.reward_kwargs.counting_*``.
+    """
+    kwargs: dict[str, Any] = {}
+    if rel_tol is not None:
+        kwargs["rel_tol"] = float(rel_tol)
+    if rel_band_cap is not None:
+        kwargs["rel_band_cap"] = float(rel_band_cap)
+    if rel_sigma is not None:
+        kwargs["rel_sigma"] = float(rel_sigma)
+    if min_sigma is not None:
+        kwargs["min_sigma"] = float(min_sigma)
+    if decay_exp is not None:
+        kwargs["decay_exp"] = float(decay_exp)
+    if not graded:
+        kwargs["graded"] = False
+    return kwargs
+
+
 def acc_reward(
     predict_str: str,
     ground_truth: str,
     use_boxed: bool = False,  # noqa: ARG001
     extra_info=None,
     allow_unboxed_answer_for_accuracy: bool = True,
+    counting_reward_kwargs: dict[str, Any] | None = None,
 ) -> float:
     reward_type = _extract_reward_type(extra_info)
     if reward_type is None:
@@ -309,11 +342,15 @@ def acc_reward(
         "counting": _counting_reward,
         "search": search_string_reward,
         "grounding": _grounding_reward,
+        "hstar_strip": hstar_strip_reward,
     }
     handler = reward_handlers.get(reward_type)
     if handler is None:
         return 0.0
-    return handler(answer_info.prediction, truth, extra_info=extra_info)
+    handler_kwargs: dict[str, Any] = {"extra_info": extra_info}
+    if reward_type == "counting" and counting_reward_kwargs:
+        handler_kwargs["counting_reward_kwargs"] = counting_reward_kwargs
+    return handler(answer_info.prediction, truth, **handler_kwargs)
 
 
 def tool_efficiency_reward(
@@ -599,10 +636,25 @@ def compute_score(
     allow_unboxed_answer_for_accuracy: bool = True,
     require_boxed_answer_for_full_format: bool = False,
     unboxed_answer_format_score: float = 0.0,
+    counting_rel_tol: float | None = None,
+    counting_rel_band_cap: float | None = None,
+    counting_rel_sigma: float | None = None,
+    counting_min_sigma: float | None = None,
+    counting_decay_exp: float | None = None,
+    counting_graded: bool = True,
     extra_info=None,
 ) -> dict[str, Any]:
     predict_str = str(predict_str)
     ground_truth = str(ground_truth)
+
+    counting_reward_kwargs = _build_counting_reward_kwargs(
+        rel_tol=counting_rel_tol,
+        rel_band_cap=counting_rel_band_cap,
+        rel_sigma=counting_rel_sigma,
+        min_sigma=counting_min_sigma,
+        decay_exp=counting_decay_exp,
+        graded=counting_graded,
+    )
 
     is_valid, final_answer_text, tool_call_count, tool_calls = _parse_multiturn_tool_calling_output(predict_str)
     reward_type = _extract_reward_type(extra_info)
@@ -626,6 +678,7 @@ def compute_score(
             use_boxed=use_boxed,
             extra_info=extra_info,
             allow_unboxed_answer_for_accuracy=allow_unboxed_answer_for_accuracy,
+            counting_reward_kwargs=counting_reward_kwargs,
         )
 
     tool_call_bonus_score = 0.0
@@ -727,6 +780,12 @@ def compute_score_from_data_source(
     allow_unboxed_answer_for_accuracy: bool = True,
     require_boxed_answer_for_full_format: bool = False,
     unboxed_answer_format_score: float = 0.0,
+    counting_rel_tol: float | None = None,
+    counting_rel_band_cap: float | None = None,
+    counting_rel_sigma: float | None = None,
+    counting_min_sigma: float | None = None,
+    counting_decay_exp: float | None = None,
+    counting_graded: bool = True,
     **_: dict,
 ) -> dict[str, Any]:
     """Adapter for custom_reward_function configs that expect default signature."""
@@ -758,6 +817,12 @@ def compute_score_from_data_source(
         allow_unboxed_answer_for_accuracy=allow_unboxed_answer_for_accuracy,
         require_boxed_answer_for_full_format=require_boxed_answer_for_full_format,
         unboxed_answer_format_score=unboxed_answer_format_score,
+        counting_rel_tol=counting_rel_tol,
+        counting_rel_band_cap=counting_rel_band_cap,
+        counting_rel_sigma=counting_rel_sigma,
+        counting_min_sigma=counting_min_sigma,
+        counting_decay_exp=counting_decay_exp,
+        counting_graded=counting_graded,
         extra_info=extra_info,
     )
 
@@ -792,6 +857,12 @@ async def async_compute_score_from_data_source(
     allow_unboxed_answer_for_accuracy: bool = True,
     require_boxed_answer_for_full_format: bool = False,
     unboxed_answer_format_score: float = 0.0,
+    counting_rel_tol: float | None = None,
+    counting_rel_band_cap: float | None = None,
+    counting_rel_sigma: float | None = None,
+    counting_min_sigma: float | None = None,
+    counting_decay_exp: float | None = None,
+    counting_graded: bool = True,
     **_: dict,
 ) -> dict[str, Any]:
     """Async adapter for reward loops."""
@@ -824,5 +895,11 @@ async def async_compute_score_from_data_source(
         allow_unboxed_answer_for_accuracy=allow_unboxed_answer_for_accuracy,
         require_boxed_answer_for_full_format=require_boxed_answer_for_full_format,
         unboxed_answer_format_score=unboxed_answer_format_score,
+        counting_rel_tol=counting_rel_tol,
+        counting_rel_band_cap=counting_rel_band_cap,
+        counting_rel_sigma=counting_rel_sigma,
+        counting_min_sigma=counting_min_sigma,
+        counting_decay_exp=counting_decay_exp,
+        counting_graded=counting_graded,
         extra_info=extra_info,
     )

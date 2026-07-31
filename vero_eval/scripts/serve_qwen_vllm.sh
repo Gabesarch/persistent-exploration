@@ -78,11 +78,23 @@ esac
 echo "Starting vLLM server (log: $LOGFILE)..."
 CHAT_TEMPLATE_ARG=""
 [[ -n "$CUSTOM_CHAT_TEMPLATE" ]] && CHAT_TEMPLATE_ARG="--chat-template $CUSTOM_CHAT_TEMPLATE"
+# `--attention-config.flash_attn_version 2` is only understood by vLLM >= 0.22; older
+# stacks (e.g. the vero2 training env's vLLM 0.18) reject the unknown arg and refuse to
+# start. Gate it on the running vLLM version so serving works across env stacks; the
+# default (>= 0.22) behavior is unchanged.
+ATTN_ARGS=()
+if python - <<'PY' 2>/dev/null
+from importlib.metadata import version
+from packaging.version import Version
+raise SystemExit(0 if Version(version("vllm")) >= Version("0.22") else 1)
+PY
+then ATTN_ARGS=(--attention-config.flash_attn_version 2)
+else echo "vLLM < 0.22 detected -> omitting --attention-config.flash_attn_version (unsupported)"; fi
 nohup vllm serve "$CHECKPOINT_PATH" \
   --port "$PORT" \
   --served-model-name "$MODEL_NAME" \
   --gpu-memory-utilization 0.9 \
-  --attention-config.flash_attn_version 2 \
+  "${ATTN_ARGS[@]}" \
   --tensor-parallel-size "$NUM_GPUS" \
   --uvicorn-log-level info \
   --max-model-len "${MAX_MODEL_LEN:-32768}" \
@@ -99,8 +111,11 @@ nohup vllm serve "$CHECKPOINT_PATH" \
   > "$LOGFILE" 2>&1 &
 disown
 
-echo "Waiting for vLLM to be ready (up to 5 min)..."
-for _ in $(seq 1 60); do
+# Readiness wait: default 12 min (a Qwen3.5-9B merged ckpt measured 5m02s to first response
+# on an A100 — the old 5-min cap lost that race by seconds). Override with VLLM_WAIT_MIN.
+VLLM_WAIT_MIN="${VLLM_WAIT_MIN:-12}"
+echo "Waiting for vLLM to be ready (up to ${VLLM_WAIT_MIN} min)..."
+for _ in $(seq 1 $(( VLLM_WAIT_MIN * 12 ))); do
   if curl --max-time 2 -s -o /dev/null "http://localhost:${PORT}/v1/models"; then
     echo "vLLM is up at http://localhost:${PORT}"
     case "${FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS,,}" in
@@ -116,5 +131,5 @@ for _ in $(seq 1 60); do
   fi
   sleep 5
 done
-echo "vLLM did not respond after 5 minutes. Check logs: $LOGFILE" >&2
+echo "vLLM did not respond after ${VLLM_WAIT_MIN} minutes. Check logs: $LOGFILE" >&2
 exit 1

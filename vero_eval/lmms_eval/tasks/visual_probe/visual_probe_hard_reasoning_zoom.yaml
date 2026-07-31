@@ -1,7 +1,9 @@
-# Vero (RL thinking checkpoint) + ZOOM on VisualProbe-Hard — TRAINING-FAITHFUL REPLICATION.
+# CANONICAL Vero zoom eval on VisualProbe-Hard — the trustworthy cross-checkpoint config.
+# (Finalized 2026-07: qwen3 generation-config sampling + deterministic judge; strict-judge
+#  twin task: visual_probe_hard_reasoning_zoom_strict.)
 #
 # Reproduces the RL training INPUT word-by-word for image_zoom_in_tool (verified
-# byte-identical to the checkpoint's validation_data/403.jsonl turn-1 input):
+# byte-identical to training rollout inputs, validation_data/*.jsonl turn-1):
 #   - system prompt = training Layer A (system_vero_reasoning.txt, passed as the system
 #     message) + the served chat_template's appended "# Tools" block + tool schema.
 #   - tool schema = the EXACT training schema (via _toolset_zoom_vero_yaml's
@@ -10,6 +12,26 @@
 #   - image_indexing: training_faithful -> tool_response is exactly
 #     "Zoomed in on the image to the region [x1, y1, x2, y2] with label {label}." (the crop
 #      is registered internally but NOT announced; training used img_idx 0 in 581/581 calls).
+#
+# SAMPLING = the checkpoint generation_config defaults (temp 0.7 / top_p 0.8 / top_k 20),
+# NOT training-validation full-vocab (0.7 / 1.0 / -1). Measured exactly accuracy-equivalent
+# (answer_retry step152, n=3 means: 0.5409 vs 0.5409), but truncated sampling eliminates
+# the full-vocab runaway-repetition failure mode (observed once: a 16k-token <think> loop).
+# Params must be set explicitly: if omitted, async_openai defaults temperature to 0 (greedy).
+#
+# PROTOCOL for checkpoint comparison (do not deviate silently):
+#   - serve at MM_MAX_PIXELS=10000000 (the 8-13MP accuracy plateau; the default);
+#   - dedicated Qwen3-32B judge (gpu:2), decoded at temperature 0 (deterministic).
+#     THIS task uses the historical LENIENT rubric (prompts/judge_prompt.txt) —
+#     comparable with all previously reported visual_probe numbers. For the strict
+#     metric use visual_probe_hard_reasoning_zoom_strict (lenient rubric + the
+#     absence-claim rule, prompts/judge_prompt_strict.txt) — strict scores read
+#     LOWER; never compare across the two variants;
+#   - n=106 single runs still carry ~±3-5 pts from multi-turn trajectory chaos
+#     (batching nondeterminism) — ALWAYS compare means of >=3 runs, never single runs.
+# Also measured (step152): the "origcfg" family (no Layer-A + generic/multi-index toolset,
+# VISUAL_PROBE_REPORT.md) does NOT transfer — 0.5126 vs 0.5409 here — so this
+# training-faithful config is also the highest-scoring known configuration.
 #
 # IMPORTANT: the served chat_template.jinja renders the PASSED system message (Layer A),
 # then appends "# Tools" — it does NOT bake Layer A. So Layer A MUST be passed via
@@ -37,7 +59,7 @@ lmms_eval_specific_kwargs:
     # Training's user turn is "<image>\n{question}", which decodes to "user\n\n{question}".
     # The served chat template emits no newline after the image, so that separator newline
     # must live in the text. pre_prompt "\n" reproduces training's user turn byte-for-byte
-    # (verified against 403.jsonl). It does NOT add a final-answer instruction.
+    # (verified against training validation jsonl). It does NOT add a final-answer instruction.
     pre_prompt: "\n"
     post_prompt: ""
 metadata:

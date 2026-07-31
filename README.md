@@ -1,3 +1,19 @@
+# vero2
+
+Multi-turn **tool-use RL for vision-language models** (Qwen3-VL-8B), built on a fork of
+[verl](https://github.com/volcengine/verl). The model reasons in `<think>`, calls a visual tool —
+**zoom** (`image_zoom_in_tool` crops a bbox and feeds the crop back) or **drawing**
+(mark the image with points as a visual checklist) — and answers in `<answer>`, trained with GDPO
+advantage + GSPO loss on chart / search / counting data. Runs on Princeton Della (Slurm).
+
+| Where | What |
+|---|---|
+| [`vero2_scripts/`](vero2_scripts/README.md) | **the experiments** — launchers (`drawing/`, `zoom/`), configs, prompts; start at its README |
+| `verl/` | the RL engine (trainer, async tool rollout, tools, rewards) |
+| [`vero_eval/`](vero_eval/README.md) | evaluation harness (lmms_eval + MCP tools) |
+| `dataset_filter/` | Gemini ground-truth filter for datasets |
+| [`docs/vero2/`](docs/vero2/) | detailed docs (training pipeline, environment, forced-explore) |
+
 ## Quick Start
 
 ### Prerequisites
@@ -11,7 +27,7 @@ git clone https://github.com/gabesarch/vero2
 ```
 
 ### Create / Update Conda Environment
-We use a single environment matching `docker/Dockerfile.stable.vllm`:
+We use a single conda environment (`vero2`):
 ```bash
 conda create -n vero2 python=3.12 -y
 
@@ -61,19 +77,12 @@ cd ..
 
 ### Setup
 
-1. Copy set_paths.sh.example and rename it to set_paths.sh in the gaze-rl folder
+1. **Paths.** `set_paths.sh` (git-tracked) activates the conda env and exports `VERL_ROOT`,
+   `ROOT_PATH`, `HF_HOME`, `SAVE_PATH`, `IMAGE_ROOT`, …. Per-user overrides go in the git-ignored
+   `set_paths.local.sh` next to it (e.g. point `VERO2_CONDA_ENV` at your env). Every launcher
+   sources it from the repo root — **always submit jobs from the repo root**.
 
-2. Set all paths to data and caches in set_paths.sh and in run_scripts/model_runs/run_gspo_qwen3vl_instruct_condition_grounded_fixations_thinkaloud.sh
-
-examples:
-```bash
-export REPO_ROOT="/home/gs1693/repo/gaze-vlm/gaze-rl" # path to this gaze-rl part
-export ROOT_PATH="/scratch/gpfs/ZHUANGL/gs1693" # root path for cache and data (I have mine on scratch on della)
-export SAVE_PATH="/scratch/gpfs/ZHUANGL/gs1693/vigorl_gaze_datasets" (save path for checkpoints)
-export IMAGE_ROOT="/scratch/gpfs/ZHUANGL/gs1693/vigorl_gaze_datasets/cohen/raw" # root path for trial stimuli images (path to trail-stimuli images)
-```
-
-3. Cache the model to your HF directory:
+2. Cache the model to your HF directory:
 
 Set cache directory:
 ```bash
@@ -107,30 +116,18 @@ snapshot_download(
 print(f"Successfully cached to {os.environ.get('HF_HOME')}/{model_id}")
 ```
 
-4. (optional) Split train and val of jsonls Nick processed:
+3. **Train.** All launchers, configs, and instructions live in
+   [`vero2_scripts/README.md`](vero2_scripts/README.md) — the folder map (`drawing/` vs `zoom/`,
+   `vanilla/` vs `force_explore/`), how to change the training data, the config-knob glossary,
+   and the smoke → full launch workflow. Typical flow:
 
 ```bash
-python run_scripts/data_prep/split_gaze_jsonl.py \
-  --input-dir FOLDER_OF_ALL_JSONLS \
-  --output-dir OUTPUT_PATH \
-  --val-ratio 0.1 \
-  --seed 42 \
-  --overwrite
+# smoke on gpu-test first (small batch, 2 steps, <1 h):
+sbatch vero2_scripts/drawing/force_explore/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill_smoke.sh
+# then the full run — partition picked at submit time (plilc default | pli | ailab):
+bash vero2_scripts/drawing/force_explore/submit.sh
 ```
 
-5. Set `TRAIN_FILES` and `VAL_FILES` in run_scripts/model_runs/run_gspo_qwen3vl_instruct_condition_grounded_fixations_thinkaloud.sh to the jsonl paths you want to train.
+Full training needs a whole GPU node (8× H100 / A100-80GB) and ~700–900 GB CPU RAM.
 
-6. Run the script:
-
-Make sure you are inside the gaze-rl folder
-
-If in interactive node:
-```bash
-bash run_scripts/model_runs/run_gspo_qwen3vl_instruct_condition_grounded_fixations_thinkaloud.sh
-```
-
-To queue it up in slurm (adjust sbatch params as needed)
-```bash
-sbatch run_scripts/model_runs/run_gspo_qwen3vl_instruct_condition_grounded_fixations_thinkaloud.sh
-```
-Recommended atleast 8 H100s or 4 H200s (more the better). And atleast 700-900GB cpu memory.
+4. **Evaluate.** See [`vero_eval/README.md`](vero_eval/README.md) (served-vLLM + lmms_eval + MCP visual tools).

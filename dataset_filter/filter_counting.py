@@ -187,13 +187,16 @@ def _should_failover(err) -> bool:
 
 
 class FailoverClient:
-    """Thread-safe client shared across workers. On a quota/auth error it swaps to the
-    next key (the primary running out of monthly quota mid-run is the expected case)."""
+    """Thread-safe client shared across workers. On a quota/auth error it marks that key
+    'dead' and moves to the next live key. A capped key is skipped for the rest of the run
+    (so we don't keep wasting calls on it); if EVERY key looks dead we clear the set and
+    re-probe from the top — usage windows may have cleared. We never permanently give up:
+    a transient all-keys-limited burst just backs off and retries (rows stay retryable)."""
     def __init__(self, keys):
         self.keys = keys
         self.i = 0
         self._c = None
-        self.exhausted = False
+        self.dead = set()          # key indices that returned a usage/auth error
         self._lock = threading.Lock()
 
     def _client(self):
@@ -209,16 +212,20 @@ class FailoverClient:
         if not _should_failover(err):
             return
         with self._lock:
-            # Only advance for the key that actually failed. With many workers, a burst
-            # of simultaneous errors from key N must NOT skip past keys N+1, N+2, ...
+            # Only react to the key that actually failed; a burst of simultaneous errors
+            # from key N must not skip past the key another worker already moved us to.
             if used_i is not None and used_i != self.i:
                 return
-            if self.i + 1 < len(self.keys):
-                self.i += 1
-                self._c = None
-                print(f"[filter] key index {self.i - 1} usage/auth limit; failing over to key index {self.i}")
-            else:
-                self.exhausted = True  # all keys dead -> stop wasting time
+            self.dead.add(self.i)
+            n = len(self.keys)
+            nxt = next((j for step in range(1, n + 1)
+                        for j in [(self.i + step) % n] if j not in self.dead), None)
+            if nxt is None:                 # every key looks dead -> re-probe from the top
+                self.dead.clear()
+                nxt = 0
+            self.i = nxt
+            self._c = None
+            print(f"[filter] key usage/auth limit; dead={sorted(self.dead)} -> now on key {self.i}")
 
 
 def raw_chat(client, model, msgs, retries=6, reasoning_effort=None):
@@ -245,9 +252,7 @@ def raw_chat(client, model, msgs, retries=6, reasoning_effort=None):
         except Exception as err:
             last = err
             if on_error:
-                on_error(err, getattr(client, "i", None))  # fail over the failed key only
-            if getattr(client, "exhausted", False):
-                raise last  # all keys dead -> fail fast; these rows stay retryable
+                on_error(err, getattr(client, "i", None))  # mark the failed key dead, move to a live one
             if attempt == retries - 1:
                 raise
             time.sleep(min(30, 2 ** attempt))

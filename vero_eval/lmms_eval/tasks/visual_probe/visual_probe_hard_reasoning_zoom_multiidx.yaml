@@ -12,6 +12,8 @@ tag: visual_search
 generation_kwargs:
   max_new_tokens: 24576
   temperature: 0.7
+  top_p: 0.8
+  top_k: 20
   do_sample: True
 lmms_eval_specific_kwargs:
   default:

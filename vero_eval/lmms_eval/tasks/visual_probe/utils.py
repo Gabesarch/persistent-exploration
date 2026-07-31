@@ -13,6 +13,7 @@ from lmms_eval.tasks._task_utils.response_truncation import truncate_response_ta
 
 MODEL_HINT = os.getenv("JUDGE_MODEL_PATH", "")
 _PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "judge_prompt.txt"
+_STRICT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "judge_prompt_strict.txt"
 _PREFIXES = ("VisualProbe_Easy/", "VisualProbe_Medium/", "VisualProbe_Hard/", "VisualProbe_train/")
 _GENERATION_FAILURE_MARKERS = (
     "[LMMS_EVAL_FORCED_FINAL_ANSWER_FAILED:",
@@ -202,14 +203,15 @@ def visual_probe_process_results_json(doc: Dict[str, Any], results: List[str]) -
     return {"judge_accuracy": payload}
 
 
-@lru_cache(maxsize=1)
-def _load_judge_prompt() -> str:
-    with _PROMPT_PATH.open("r", encoding="utf-8") as handle:
+@lru_cache(maxsize=2)
+def _load_judge_prompt(strict: bool = False) -> str:
+    path = _STRICT_PROMPT_PATH if strict else _PROMPT_PATH
+    with path.open("r", encoding="utf-8") as handle:
         return handle.read()
 
 
-def _format_judge_prompt(question: str, reference: str, prediction: str) -> str:
-    template = _load_judge_prompt()
+def _format_judge_prompt(question: str, reference: str, prediction: str, strict: bool = False) -> str:
+    template = _load_judge_prompt(strict)
     prompt = template.replace("[QUESTION]", question or "")
     prompt = prompt.replace("[REFERENCE]", reference or "")
     prompt = prompt.replace("[PREDICTION]", prediction or "")
@@ -253,15 +255,28 @@ def _parse_judge_output(raw: Any) -> bool:
 
 
 def visual_probe_aggregate_judge_results(results: List[Dict[str, Any]]) -> float:
+    """Lenient judge (prompts/judge_prompt.txt) — the historical metric."""
+    return _aggregate_judge_results(results, visual_probe_aggregate_judge_results, strict=False)
+
+
+def visual_probe_aggregate_judge_results_strict(results: List[Dict[str, Any]]) -> float:
+    """Strict judge (prompts/judge_prompt_strict.txt): the lenient rubric plus the
+    absence-claim rule — answers asserting the target is absent/unobservable while the
+    reference states a visible fact are incorrect. Used by the *_strict task variants;
+    scores are NOT comparable to the lenient metric."""
+    return _aggregate_judge_results(results, visual_probe_aggregate_judge_results_strict, strict=True)
+
+
+def _aggregate_judge_results(results: List[Dict[str, Any]], target_fn, strict: bool) -> float:
     if not results:
-        visual_probe_aggregate_judge_results.details = []
-        visual_probe_aggregate_judge_results.individual_scores = {}
+        target_fn.details = []
+        target_fn.individual_scores = {}
         return 0.0
 
     prompts = []
     metadata = []
     for item in results:
-        prompts.append(_format_judge_prompt(item.get("question"), item.get("reference"), item.get("prediction")))
+        prompts.append(_format_judge_prompt(item.get("question"), item.get("reference"), item.get("prediction"), strict=strict))
         metadata.append(item)
 
     engine = get_judge_engine(MODEL_HINT)
@@ -288,7 +303,7 @@ def visual_probe_aggregate_judge_results(results: List[Dict[str, Any]]) -> float
             "score": 1.0 if is_equivalent else 0.0,
         }
 
-    visual_probe_aggregate_judge_results.details = list(details.values())
-    visual_probe_aggregate_judge_results.individual_scores = details
+    target_fn.details = list(details.values())
+    target_fn.individual_scores = details
     total = len(judge_outputs)
     return correct / total if total else 0.0

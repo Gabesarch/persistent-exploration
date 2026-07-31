@@ -1,0 +1,23 @@
+# Monitor RL training distribution with the same Vero zoom schema used at checkpoint eval.
+include:
+  - ../hstarbench_mixed_reasoning.yaml
+  - ../../_tool_templates/_toolset_zoom_vero_yaml
+dataset_kwargs:
+  data_files:
+    test: /scratch/gpfs/ZHUANGL/shared/Hstarbench/data/hstarbench_mixed_rl.jsonl
+task: "hstarbench_mixed_rl_reasoning_zoom"
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 0.7
+  do_sample: true
+doc_to_messages: !function utils.hstarbench_bbox_zoom_doc_to_messages_vero
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: "\n"
+    post_prompt: ""
+    use_panorama_strip: true
+    bbox_zoom_only: true
+    score_mode: zoom_align
+metadata:
+  image_indexing: training_faithful
+  description: "Hstar RL mixed split + Vero training-faithful zoom eval"

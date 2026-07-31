@@ -1,0 +1,39 @@
+# Drawing tools for training - mirrors vero_eval/lmms_eval/mcp/vero2_mcp.py exactly
+#
+# All coordinates use 0-1000 scale:
+#   - (0, 0) = top-left corner
+#   - (1000, 1000) = bottom-right corner
+#   - (500, 500) = center of image
+#
+# Image referencing:
+#   - Tools use img_idx (0-based) to reference images in the conversation
+#   - img_idx=0 is the original input image
+#   - Tool outputs are appended, so img_idx=1 would be the first tool output, etc.
+
+tools:
+  - class_name: verl.tools.image_drawing_tools.DrawPointsTool
+    config:
+      type: native
+    tool_schema:
+      type: function
+      function:
+        name: draw_points
+        description: "Draw one or more point markers on an image. Coordinates use 0-1000 scale where (0,0)=top-left and (1000,1000)=bottom-right. For a single point, pass [x, y]. For multiple points, pass [[x1, y1], [x2, y2], ...]. Example: draw_points(img_idx=0, points=[[500, 500], [600, 600]]) draws 2 points. For counting tasks, use this tool as a visual checklist: mark candidate target objects, inspect the returned annotated image, and continue from the latest img_idx if more objects remain. Do not redraw points already marked in earlier tool results. Use img_idx=0 for the original image only at the start; after a tool response says \"Registered image as img_idx N\", use img_idx=N to continue marking on the annotated image. Scan systematically by region, such as top-to-bottom or left-to-right, and mark only clearly visible target objects. Return exactly one valid JSON object in the tool_call block."
+        parameters:
+          type: object
+          properties:
+            img_idx:
+              type: integer
+              description: "Index of the image to draw on (0-based)."
+            points:
+              type: array
+              description: "Either [x, y] for a single point, or [[x1, y1], [x2, y2], ...] for multiple points. Coordinates use 0-1000 scale."
+            color:
+              type: string
+              description: "Color name for markers."
+              default: "lime"
+            radius:
+              type: integer
+              description: "Radius of the circle markers (0-1000, relative to image width)."
+              default: 15
+          required: ["img_idx", "points"]

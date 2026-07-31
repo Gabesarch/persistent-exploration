@@ -401,7 +401,14 @@ def _maybe_resize_zoom_bbox(bbox_2d: list[float], image_width: int, image_height
 )
 def image_zoom_in_tool(img_idx: int, bbox_2d: List[float], label: str) -> list:
     """Crop bbox_2d=[x1,y1,x2,y2] (0-1000 scale) out of image `img_idx` and resize the
-    crop into the training-time pixel budget. PIL-only (works offline)."""
+    crop into the training-time pixel budget. PIL-only (works offline).
+
+    bbox_2d accepts FLOATS (List[float], matching eval-vero-runs): the eval backend's
+    zoom remapping (`_composite_zoom_to_original` in async_openai.py) re-expresses the
+    model's integer 0-1000 bbox in the ORIGINAL image's 0-1000 frame via float math,
+    producing values like 444.99999999999994. With the old List[int] signature pydantic
+    rejected those (int_from_float), silently failing ~47% of ALL zoom calls in every
+    run and turning each doc into a crop lottery."""
     image = Image.open(_resolve_image_path(img_idx)).convert("RGB")
     w, h = image.size
     pixel_bbox = _normalized_zoom_bbox_to_pixels(bbox_2d, w, h)

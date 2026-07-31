@@ -39,11 +39,16 @@ except Exception:  # pragma: no cover
                 and row.get("verdict") not in NONTERMINAL_VERDICTS)
 
 
-def classify(d):
-    """-> 'keep' | 'drop' | 'undecided' for a decision row (or None if absent)."""
+def classify(d, keep_verdicts):
+    """-> 'keep' | 'drop' | 'undecided' for a decision row (or None if absent).
+
+    keep_verdicts = the set of verdicts that count as KEEP. Default {CORRECT, PLAUSIBLE}
+    reproduces `keep is True`; pass {CORRECT} for a strict correct-only dataset (PLAUSIBLE
+    then classifies as drop). Non-terminal rows (missing / ERROR / PARSE_ERROR) stay
+    undecided regardless."""
     if d is None or not is_terminal(d):
         return "undecided"
-    return "keep" if d["keep"] is True else "drop"
+    return "keep" if d.get("verdict") in keep_verdicts else "drop"
 
 
 def source_path(data_dir, split, local, dataset="combined_counting"):
@@ -65,7 +70,18 @@ def main():
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--allow-partial", action="store_true",
                     help="proceed even if some records are undecided (excluded + listed)")
+    ap.add_argument("--keep-verdicts", default="CORRECT,PLAUSIBLE",
+                    help="comma-separated verdicts to KEEP (default keeps CORRECT+PLAUSIBLE; "
+                         "use CORRECT for a strict correct-only dataset)")
+    ap.add_argument("--out-tag", default=None,
+                    help="basename tag for outputs (default 'filtered'); e.g. 'correct' -> "
+                         "<dataset>_<split>.correct.verl.jsonl")
     args = ap.parse_args()
+
+    keep_verdicts = {v.strip().upper() for v in args.keep_verdicts.split(",") if v.strip()}
+    if not keep_verdicts:
+        sys.exit("[apply] FATAL: --keep-verdicts is empty")
+    print(f"[apply] keep verdicts = {sorted(keep_verdicts)}")
 
     decisions = {}
     for line in open(args.decisions):
@@ -91,7 +107,7 @@ def main():
                     continue
                 rec = json.loads(line)
                 rid = rec.get("extra_info", {}).get("id")
-                cls = classify(decisions.get(rid))
+                cls = classify(decisions.get(rid), keep_verdicts)
                 counts[cls] += 1
                 rows.append((rec, rid, cls))
         grand_undecided += counts["undecided"]
@@ -107,8 +123,9 @@ def main():
 
     # ---- pass 2: write ----
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+    base = args.out_tag or "filtered"
     partial = bool(grand_undecided)  # only true when --allow-partial got us here
-    suffix = "filtered.partial" if partial else "filtered"
+    suffix = f"{base}.partial" if partial else base
     for split, src, rows, counts in plans:
         out_path = os.path.join(args.out_dir, f"{args.dataset}_{split}.{suffix}.verl.jsonl")
         drop_path = os.path.join(args.out_dir, f"dropped_{split}.jsonl")
