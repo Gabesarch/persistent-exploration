@@ -471,6 +471,7 @@ def compute_branch_strata_loss_weights(
     branch_fraction: float,
     cap_by_parent_prevalence: bool = True,
     parent_balance: bool = True,
+    allow_inactive_canonical: bool = False,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Build globally normalized row weights for canonical/branch loss strata."""
     num_rows = int(response_mask.size(0))
@@ -495,7 +496,7 @@ def compute_branch_strata_loss_weights(
         flag = raw_flags[row]
         if not isinstance(flag, bool | np.bool_):
             raise ValueError(f"Non-padding branch-strata row {row} has non-boolean branch flag {flag!r}.")
-        if not active[row]:
+        if not active[row] and (bool(flag) or not allow_inactive_canonical):
             row_kind = "branch" if bool(flag) else "canonical"
             raise ValueError(
                 f"Non-padding {row_kind} row {row} has no active response tokens; "
@@ -503,15 +504,17 @@ def compute_branch_strata_loss_weights(
             )
         branch[row] = bool(flag)
 
-    canonical = active & ~padding & ~branch
+    canonical_anchors = ~padding & ~branch
+    canonical = active & canonical_anchors
     branch &= ~padding
     canonical_rows = np.flatnonzero(canonical)
+    canonical_anchor_rows = np.flatnonzero(canonical_anchors)
     branch_rows = np.flatnonzero(branch)
-    if len(canonical_rows) == 0:
+    if len(canonical_rows) == 0 and not allow_inactive_canonical:
         raise ValueError("Branch-stratified loss requires at least one active canonical row.")
 
     canonical_by_parent: dict[Any, list[int]] = defaultdict(list)
-    for row in canonical_rows:
+    for row in canonical_anchor_rows:
         canonical_by_parent[parents[row]].append(int(row))
 
     branches_by_parent: dict[Any, list[int]] = defaultdict(list)
@@ -522,7 +525,7 @@ def compute_branch_strata_loss_weights(
         matches = canonical_by_parent.get(parent, [])
         if len(matches) != 1:
             raise ValueError(
-                f"Branch parent {parent!r} must match exactly one active canonical row; found {len(matches)}."
+                f"Branch parent {parent!r} must match exactly one canonical row; found {len(matches)}."
             )
         branches_by_parent[parent].append(int(row))
 
@@ -530,13 +533,16 @@ def compute_branch_strata_loss_weights(
     num_branch = len(branch_rows)
     num_branch_parents = len(branches_by_parent)
     effective_fraction = branch_fraction if num_branch else 0.0
-    parent_prevalence = num_branch_parents / num_canonical
+    parent_prevalence = num_branch_parents / max(len(canonical_anchor_rows), 1)
+    if num_canonical == 0 and num_branch:
+        effective_fraction = 1.0
     if cap_by_parent_prevalence:
-        effective_fraction = min(effective_fraction, parent_prevalence)
+        effective_fraction = min(effective_fraction, parent_prevalence) if num_canonical else effective_fraction
 
     weights = torch.zeros(num_rows, dtype=torch.float32, device=response_mask.device)
-    canonical_weight = (1.0 - effective_fraction) * num_rows / num_canonical
-    weights[torch.as_tensor(canonical_rows, dtype=torch.long, device=weights.device)] = canonical_weight
+    if num_canonical:
+        canonical_weight = (1.0 - effective_fraction) * num_rows / num_canonical
+        weights[torch.as_tensor(canonical_rows, dtype=torch.long, device=weights.device)] = canonical_weight
 
     if num_branch:
         branch_mass = effective_fraction * num_rows
@@ -548,7 +554,7 @@ def compute_branch_strata_loss_weights(
         else:
             weights[torch.as_tensor(branch_rows, dtype=torch.long, device=weights.device)] = branch_mass / num_branch
 
-        if cap_by_parent_prevalence:
+        if cap_by_parent_prevalence and num_canonical:
             natural_row_scale = num_rows / num_canonical
             max_branch_weight = float(
                 weights[torch.as_tensor(branch_rows, dtype=torch.long, device=weights.device)].max().item()
@@ -570,6 +576,7 @@ def compute_branch_strata_loss_weights(
         "effective_fraction": effective_fraction,
         "parent_prevalence": parent_prevalence,
         "canonical_rows": float(num_canonical),
+        "inactive_canonical_rows": float(len(canonical_anchor_rows) - num_canonical),
         "branch_rows": float(num_branch),
         "branch_parents": float(num_branch_parents),
         "padding_rows": float(padding.sum()),

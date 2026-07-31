@@ -223,6 +223,8 @@ class AgentLoopOutput(BaseModel):
     """Response token ids including LLM generated token, tool response token."""
     response_mask: list[int]
     """Response mask, 1 for LLM generated token, 0 for tool response token."""
+    retry_sft_mask: Optional[list[int]] = None
+    """Response-aligned mask for teacher-only retry SFT targets."""
     response_logprobs: Optional[list[float]] = None
     """Log probabilities for the response tokens."""
     routed_experts: Optional[Any] = None
@@ -247,6 +249,9 @@ class AgentLoopOutput(BaseModel):
         output["prompts"] = torch.tensor(output.pop("prompt_ids"), dtype=torch.int64)
         output["responses"] = torch.tensor(output.pop("response_ids"), dtype=torch.int64)
         output["response_mask"] = torch.tensor(output.pop("response_mask"), dtype=torch.int64)
+        retry_sft_mask = output.pop("retry_sft_mask", None)
+        if retry_sft_mask is not None:
+            output["retry_sft_mask"] = torch.tensor(retry_sft_mask, dtype=torch.int64)
         output.pop("branch_outputs", None)
 
         response_logprobs = output.pop("response_logprobs", None)
@@ -282,6 +287,8 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded position ids."""
     response_mask: torch.Tensor
     """Padded response mask."""
+    retry_sft_mask: Optional[torch.Tensor] = None
+    """Padded teacher-only retry SFT mask."""
     attention_mask: torch.Tensor
     """Padded attention mask."""
     response_logprobs: Optional[torch.Tensor] = None
@@ -808,6 +815,17 @@ class AgentLoopWorker:
             position_ids=position_ids,
             kwargs=kwargs,
         )
+        retry_sft_mask_values = self._finalize_retry_sft_mask(output)
+        retry_sft_mask_output = self.tokenizer.pad(
+            {"input_ids": retry_sft_mask_values},
+            padding="max_length",
+            max_length=self.rollout_config.response_length,
+            return_tensors="pt",
+            return_attention_mask=False,
+        )
+        if retry_sft_mask_output["input_ids"].dim() == 1:
+            retry_sft_mask_output["input_ids"] = retry_sft_mask_output["input_ids"].unsqueeze(0)
+        retry_sft_mask = retry_sft_mask_output["input_ids"] * response_output["attention_mask"]
         await self._compute_teacher_logprobs(
             output,
             prompt_ids=output.prompt_ids,
@@ -838,6 +856,7 @@ class AgentLoopWorker:
             input_ids=input_ids,
             position_ids=position_ids,
             response_mask=response_mask,
+            retry_sft_mask=retry_sft_mask,
             attention_mask=attention_mask,
             response_logprobs=response_logprobs,
             routed_experts=routed_experts,
@@ -850,6 +869,64 @@ class AgentLoopWorker:
             metrics=output.metrics,
             extra_fields=output.extra_fields,
         )
+
+    def _finalize_retry_sft_mask(self, output: AgentLoopOutput) -> list[int]:
+        response_length = len(output.response_ids)
+        mask = [0] * response_length
+        candidates = output.extra_fields.pop("__agent_loop_retry_sft_candidates", []) or []
+        multi_turn = self.rollout_config.multi_turn
+        if not bool(getattr(multi_turn, "conditional_answer_retry_sft_enabled", False)):
+            output.extra_fields["retry_sft_eligible_count"] = 0
+            output.extra_fields["retry_sft_selected_count"] = 0
+            output.extra_fields["retry_sft_token_count"] = 0
+            return mask
+
+        final_grade = output.extra_fields.get("reward_extra_info")
+        final_accuracy = final_grade.get("accuracy") if isinstance(final_grade, dict) else None
+        eligible: list[dict[str, Any]] = []
+        rejection_counts: dict[str, int] = {}
+        for candidate in candidates:
+            reasons = list(candidate.get("static_rejection_reasons") or [])
+            if not candidate.get("tool_executed_successfully"):
+                reasons.append("tool_execution_failed")
+            rejected_accuracy = candidate.get("rejected_accuracy")
+            if not isinstance(final_accuracy, int | float) or isinstance(final_accuracy, bool):
+                reasons.append("missing_final_accuracy")
+            elif not isinstance(rejected_accuracy, int | float) or isinstance(rejected_accuracy, bool):
+                reasons.append("missing_rejected_accuracy")
+            elif not float(final_accuracy) > float(rejected_accuracy):
+                reasons.append("accuracy_not_improved")
+            if reasons:
+                for reason in set(reasons):
+                    rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+                continue
+            eligible.append(candidate)
+
+        selection = str(getattr(multi_turn, "conditional_answer_retry_sft_target_selection", "all"))
+        if selection == "all":
+            selected = eligible
+        elif selection == "first":
+            selected = eligible[:1]
+        elif selection == "last":
+            selected = eligible[-1:]
+        else:
+            raise ValueError(f"unsupported retry SFT target selection: {selection!r}")
+
+        selected_count = 0
+        for candidate in selected:
+            start = int(candidate["response_start"])
+            end = int(candidate["response_end"])
+            if start < 0 or end <= start or end > response_length:
+                rejection_counts["invalid_token_span"] = rejection_counts.get("invalid_token_span", 0) + 1
+                continue
+            mask[start:end] = [1] * (end - start)
+            selected_count += 1
+
+        output.extra_fields["retry_sft_eligible_count"] = len(eligible)
+        output.extra_fields["retry_sft_selected_count"] = selected_count
+        output.extra_fields["retry_sft_rejection_counts"] = rejection_counts
+        output.extra_fields["retry_sft_token_count"] = sum(mask)
+        return mask
 
     def _compute_multi_modal_inputs(self, output, input_ids) -> dict[str, torch.Tensor]:
         """Compute multi-modal inputs with image and video."""
@@ -971,6 +1048,15 @@ class AgentLoopWorker:
         prompt_ids = torch.cat([input.prompt_ids for input in inputs], dim=0)
         response_ids = torch.cat([input.response_ids for input in inputs], dim=0)
         response_mask = torch.cat([input.response_mask for input in inputs], dim=0)
+        retry_sft_mask = torch.cat(
+            [
+                input.retry_sft_mask
+                if input.retry_sft_mask is not None
+                else torch.zeros_like(input.response_mask)
+                for input in inputs
+            ],
+            dim=0,
+        )
         attention_mask = torch.cat([input.attention_mask for input in inputs], dim=0)
         input_ids = torch.cat([input.input_ids for input in inputs], dim=0)
         position_ids = torch.cat([input.position_ids for input in inputs], dim=0)
@@ -987,6 +1073,7 @@ class AgentLoopWorker:
                 "prompts": prompt_ids,  # [bsz, prompt_length]
                 "responses": response_ids,  # [bsz, response_length]
                 "response_mask": response_mask,  # [bsz, response_length]
+                "retry_sft_mask": retry_sft_mask,  # [bsz, response_length]
                 "input_ids": input_ids,  # [bsz, prompt_length + response_length]
                 "attention_mask": attention_mask,  # [bsz, prompt_length + response_length]
                 # position_ids: [bsz, 3, prompt_length + response_length] or [bsz, prompt_length + response_length]
@@ -1060,6 +1147,11 @@ class AgentLoopWorker:
             "conditional_answer_retry_branch_retry_count",
             "conditional_answer_retry_branch_grade",
             "conditional_answer_retry_branch_removed_assistant_text",
+            "retry_sft_candidate_count",
+            "retry_sft_eligible_count",
+            "retry_sft_selected_count",
+            "retry_sft_rejection_counts",
+            "retry_sft_token_count",
             "turn_scores",
             "tool_rewards",
             "min_global_steps",

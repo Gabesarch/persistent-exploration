@@ -35,6 +35,7 @@ from .optimizer import OptimizerConfig
 __all__ = [
     "BranchSubsamplingConfig",
     "BranchLossStrataConfig",
+    "RetrySFTLossConfig",
     "PolicyLossConfig",
     "RouterReplayConfig",
     "ActorConfig",
@@ -120,6 +121,21 @@ class BranchLossStrataConfig(BaseConfig):
 
 
 @dataclass
+class RetrySFTLossConfig(BaseConfig):
+    """Teacher-only answer-retry supervised-loss stratum."""
+
+    enabled: bool = False
+    loss_fraction: float = 0.05
+
+    def __post_init__(self):
+        if not 0.0 <= float(self.loss_fraction) < 1.0:
+            raise ValueError(
+                "policy_loss.retry_sft.loss_fraction must satisfy 0 <= value < 1, "
+                f"got {self.loss_fraction!r}."
+            )
+
+
+@dataclass
 class PolicyLossConfig(BaseConfig):
     """Configuration for policy loss computation.
 
@@ -143,6 +159,7 @@ class PolicyLossConfig(BaseConfig):
     ppo_kl_coef: float = 0.1
     rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
     branch_strata: BranchLossStrataConfig = field(default_factory=BranchLossStrataConfig)
+    retry_sft: RetrySFTLossConfig = field(default_factory=RetrySFTLossConfig)
 
 
 @dataclass
@@ -267,6 +284,8 @@ class ActorConfig(BaseConfig):
                 raise ValueError("policy_loss.branch_strata.enabled requires policy_loss.loss_mode='gspo'.")
             if self.loss_agg_mode != "seq-mean-token-mean":
                 raise ValueError("policy_loss.branch_strata.enabled requires loss_agg_mode='seq-mean-token-mean'.")
+        if self.policy_loss.retry_sft.enabled and self.policy_loss.loss_mode != "gspo":
+            raise ValueError("policy_loss.retry_sft.enabled requires policy_loss.loss_mode='gspo'.")
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""

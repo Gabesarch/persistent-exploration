@@ -9,6 +9,7 @@ from verl.utils.reward_score.math_verify_reward_type_multiturn_tool_calling_opti
     compute_score_from_data_source,
     extract_answer_for_accuracy,
     format_reward,
+    tool_repeat_overlap_call_diagnostics,
     tool_repeat_overlap_reward,
 )
 
@@ -655,6 +656,10 @@ def test_tool_repeat_overlap_allows_two_depth_refinements_then_penalizes_excess(
 
     assert tool_repeat_overlap_reward(two_refinements) == 0.0
     assert tool_repeat_overlap_reward(three_refinements) == pytest.approx(-0.5 / 4.0)
+
+    diagnostics = tool_repeat_overlap_call_diagnostics(three_refinements)
+    assert [item["is_excess_depth"] for item in diagnostics] == [False, False, False, True]
+    assert diagnostics[-1]["has_penalty"] is True
 
 
 def test_tool_repeat_overlap_depth_run_resets_after_breadth_switch():

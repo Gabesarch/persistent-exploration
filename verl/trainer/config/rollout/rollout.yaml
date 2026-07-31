@@ -260,6 +260,15 @@ multi_turn:
   # Keep false for normal on-policy rollouts; true uses recomputed old-policy likelihoods.
   conditional_answer_retry_assistant_prefill_trainable: False
 
+  # Use the retry prefill only in the temporary teacher generation prompt.
+  conditional_answer_retry_teacher_only_prefill: False
+
+  # Mark eligible teacher-only retry suffixes for supervised loss.
+  conditional_answer_retry_sft_enabled: False
+
+  # Eligible target selection: all, first, or last.
+  conditional_answer_retry_sft_target_selection: all
+
   conditional_answer_retry_correct_accuracy_threshold: 0.0
   conditional_answer_retry_max_retries: null
   conditional_answer_retry_branch_enabled: False

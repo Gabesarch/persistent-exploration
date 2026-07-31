@@ -1,6 +1,13 @@
+from types import SimpleNamespace
+
 import torch
 
-from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics, AgentLoopWorker, _InternalAgentLoopOutput
+from verl.experimental.agent_loop.agent_loop import (
+    AgentLoopMetrics,
+    AgentLoopOutput,
+    AgentLoopWorker,
+    _InternalAgentLoopOutput,
+)
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, ToolAgentLoop
 from verl.protocol import DataProto
 
@@ -233,3 +240,57 @@ def test_rollout_row_id_survives_async_reward_postprocess_for_branch_rows():
 
     assert len(output) == 3
     assert output.non_tensor_batch["__rollout_row_id"].tolist() == [0, 0, 1]
+
+
+def _finalize_sft_mask(selection: str, final_accuracy=1.0):
+    worker = object.__new__(AgentLoopWorker)
+    worker.rollout_config = SimpleNamespace(
+        multi_turn=SimpleNamespace(
+            conditional_answer_retry_sft_enabled=True,
+            conditional_answer_retry_sft_target_selection=selection,
+        )
+    )
+    candidates = [
+        {
+            "response_start": 1,
+            "response_end": 3,
+            "rejected_accuracy": 0.0,
+            "static_rejection_reasons": [],
+            "tool_executed_successfully": True,
+        },
+        {
+            "response_start": 5,
+            "response_end": 8,
+            "rejected_accuracy": 0.0,
+            "static_rejection_reasons": [],
+            "tool_executed_successfully": True,
+        },
+    ]
+    output = AgentLoopOutput(
+        prompt_ids=[1],
+        response_ids=list(range(10)),
+        response_mask=[1] * 10,
+        metrics=AgentLoopMetrics(),
+        extra_fields={
+            "__agent_loop_retry_sft_candidates": candidates,
+            "reward_extra_info": {"accuracy": final_accuracy},
+        },
+    )
+    return worker._finalize_retry_sft_mask(output), output
+
+
+def test_retry_sft_target_selection_defaults_support_all_first_and_last():
+    all_mask, _ = _finalize_sft_mask("all")
+    first_mask, _ = _finalize_sft_mask("first")
+    last_mask, _ = _finalize_sft_mask("last")
+
+    assert all_mask == [0, 1, 1, 0, 0, 1, 1, 1, 0, 0]
+    assert first_mask == [0, 1, 1, 0, 0, 0, 0, 0, 0, 0]
+    assert last_mask == [0, 0, 0, 0, 0, 1, 1, 1, 0, 0]
+
+
+def test_retry_sft_final_accuracy_must_strictly_improve():
+    mask, output = _finalize_sft_mask("all", final_accuracy=0.0)
+
+    assert mask == [0] * 10
+    assert output.extra_fields["retry_sft_rejection_counts"] == {"accuracy_not_improved": 2}

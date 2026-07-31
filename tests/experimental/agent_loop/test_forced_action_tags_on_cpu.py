@@ -61,6 +61,10 @@ class _FakeTokenizer:
             30: "<think>",
             31: "reason",
             40: '{"name":"image_zoom_in_tool","arguments":{}}',
+            41: (
+                '{"name":"image_zoom_in_tool","arguments":'
+                '{"label":"shelf","bbox_2d":[100,100,500,500],"img_idx":0}}'
+            ),
             50: "final",
             60: "\\boxed",
             61: "{",
@@ -369,6 +373,9 @@ def _make_conditional_retry_loop(
     loop.conditional_answer_retry_suffix = "retry suffix"
     loop.conditional_answer_retry_assistant_prefill = ""
     loop.conditional_answer_retry_assistant_prefill_trainable = False
+    loop.conditional_answer_retry_teacher_only_prefill = False
+    loop.conditional_answer_retry_sft_enabled = False
+    loop.conditional_answer_retry_sft_target_selection = "all"
     loop.conditional_answer_retry_correct_accuracy_threshold = 0.0
     loop.conditional_answer_retry_max_retries = None
     loop.conditional_answer_retry_reward_fn = reward_fn
@@ -385,6 +392,10 @@ def _make_conditional_retry_loop(
     loop.llm_judge_assistant_prefill = "{"
     loop.llm_judge_format_score = 0.1
     loop.llm_judge_tool_efficiency_score_weight = 0.0
+    loop.tool_repeat_overlap_iou_threshold = 0.9
+    loop.tool_repeat_overlap_small_crop_area_threshold = 0.0002
+    loop.tool_repeat_overlap_free_depth_refinements = 2
+    loop.tool_repeat_overlap_depth_containment_threshold = 0.95
     loop._debug_enabled_for_agent = lambda agent_data: False
 
     async def apply_chat_template(
@@ -1105,6 +1116,82 @@ def test_conditional_answer_retry_assistant_prefill_is_masked_and_in_prompt():
     assert agent_data.response_mask == [0, 0] + [1] * 7
     assert agent_data.response_logprobs == [0.0, 0.0] + [0.0] * 7
     assert agent_data.prompt_ids[-9:] == [70, 71, 30, 31, 1, 2, 10, 40, 11]
+
+
+def test_teacher_only_retry_prefill_is_not_stored_or_seen_by_later_student():
+    tokenizer = _FakeTokenizer()
+    server_manager = _SequencedFakeServerManager(
+        [
+            [30, 31, 1, 2, 20, 21, 22, 50],
+            [31, 1, 2, 10, 41, 11],
+            [30, 31, 1, 2, 20, 21, 22, 23],
+        ]
+    )
+    tool_parser = _SequencedFakeToolParser(
+        [
+            [],
+            [
+                FunctionCall(
+                    name="image_zoom_in_tool",
+                    arguments='{"label":"shelf","bbox_2d":[100,100,500,500],"img_idx":0}',
+                )
+            ],
+            [],
+        ]
+    )
+    agent_data = _make_agent_data()
+
+    async def run_test():
+        loop = _make_conditional_retry_loop(
+            tokenizer,
+            server_manager,
+            tool_parser,
+            lambda **kwargs: {"accuracy": 0.0, "score": 0.0},
+        )
+        loop.response_display_prefix = "<think>\n"
+        loop.conditional_answer_retry_assistant_prefill = "retry prefill"
+        loop.conditional_answer_retry_teacher_only_prefill = True
+        loop.conditional_answer_retry_sft_enabled = True
+        first_state = await loop._handle_generating_state(
+            agent_data,
+            {"temperature": 1.0},
+            rollout_kwargs={"data_source": "unit", "reward_model": {"ground_truth": "ok"}, "extra_info": {}},
+        )
+        teacher_state = await loop._handle_generating_state(
+            agent_data,
+            {"temperature": 1.0},
+            rollout_kwargs={"data_source": "unit", "reward_model": {"ground_truth": "ok"}, "extra_info": {}},
+        )
+        # Simulate the tool-response prompt tokens. Later student generation must
+        # use the stored suffix, never the teacher-only prefill.
+        agent_data.prompt_ids += [90]
+        agent_data.response_mask += [0]
+        agent_data.retry_sft_mask += [0]
+        loop.conditional_answer_retry_enabled = False
+        student_state = await loop._handle_generating_state(
+            agent_data,
+            {"temperature": 1.0},
+            rollout_kwargs={"data_source": "unit", "reward_model": {"ground_truth": "ok"}, "extra_info": {}},
+        )
+        return first_state, teacher_state, student_state
+
+    first_state, teacher_state, student_state = asyncio.run(run_test())
+
+    assert first_state == AgentState.GENERATING
+    assert teacher_state == AgentState.PROCESSING_TOOLS
+    assert student_state == AgentState.TERMINATED
+    assert server_manager.prompt_ids_by_call[1][-2:] == [70, 71]
+    assert 70 not in server_manager.prompt_ids_by_call[2]
+    assert 71 not in server_manager.prompt_ids_by_call[2]
+    assert 70 not in agent_data.prompt_ids
+    assert 71 not in agent_data.prompt_ids
+    teacher_len = 6
+    assert agent_data.response_mask[:teacher_len] == [0] * teacher_len
+    assert agent_data.response_mask[-8:] == [1] * 8
+    candidate = agent_data.retry_sft_candidates[0]
+    assert candidate["static_rejection_reasons"] == []
+    assert candidate["response_start"] == 0
+    assert candidate["response_end"] == teacher_len
 
 
 def test_conditional_answer_retry_assistant_prefill_is_trainable_when_enabled():

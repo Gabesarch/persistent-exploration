@@ -111,6 +111,10 @@ actor_rollout_ref:
           enabled: false
           max_branches_per_parent: null
           seed: 42
+      retry_sft:
+        _target_: verl.workers.config.RetrySFTLossConfig
+        enabled: false
+        loss_fraction: 0.05
     clip_ratio_c: 3.0
     loss_agg_mode: token-mean
     loss_scale_factor: null
@@ -361,6 +365,9 @@ actor_rollout_ref:
         when the evidence clearly supports a conclusion.'
       conditional_answer_retry_assistant_prefill: ''
       conditional_answer_retry_assistant_prefill_trainable: false
+      conditional_answer_retry_teacher_only_prefill: false
+      conditional_answer_retry_sft_enabled: false
+      conditional_answer_retry_sft_target_selection: all
       conditional_answer_retry_correct_accuracy_threshold: 0.0
       conditional_answer_retry_max_retries: null
       conditional_answer_retry_branch_enabled: false

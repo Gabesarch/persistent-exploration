@@ -48,6 +48,7 @@ from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
+from verl.workers.utils.losses import combine_retry_sft_loss, masked_sft_nll
 
 __all__ = ["DataParallelPPOActor"]
 
@@ -603,6 +604,11 @@ class DataParallelPPOActor(BasePPOActor):
                 if key not in data.batch.keys():
                     raise ValueError(f"Enabled branch-stratified policy loss requires tensor batch key {key!r}.")
                 select_keys.append(key)
+        retry_sft_enabled = bool(self.config.policy_loss.retry_sft.enabled)
+        if retry_sft_enabled:
+            if "retry_sft_mask" not in data.batch.keys():
+                raise ValueError("Enabled retry SFT requires tensor batch key 'retry_sft_mask'.")
+            select_keys.append("retry_sft_mask")
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = []
@@ -628,9 +634,28 @@ class DataParallelPPOActor(BasePPOActor):
         metrics = {
             "actor/pg_loss": 0.0,
             "actor/kl_loss": 0.0,
+            "actor/retry_sft_loss": 0.0,
+            "actor/retry_sft_weighted_loss": 0.0,
+            "actor/combined_policy_loss": 0.0,
         }
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
+                dp_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+                global_retry_sft_tokens = 0
+                global_rl_tokens = 0
+                if retry_sft_enabled:
+                    token_counts = torch.tensor(
+                        [
+                            int(mini_batch.batch["retry_sft_mask"].sum().item()),
+                            int(mini_batch.batch["response_mask"].sum().item()),
+                        ],
+                        dtype=torch.long,
+                        device=get_device_id(),
+                    )
+                    if torch.distributed.is_initialized():
+                        torch.distributed.all_reduce(token_counts, op=torch.distributed.ReduceOp.SUM)
+                    global_retry_sft_tokens = int(token_counts[0].item())
+                    global_rl_tokens = int(token_counts[1].item())
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(
@@ -649,6 +674,11 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
                     response_mask = model_inputs["response_mask"]
+                    retry_sft_mask = model_inputs.get("retry_sft_mask", None)
+                    if retry_sft_mask is not None and torch.any(
+                        response_mask.to(dtype=torch.bool) & retry_sft_mask.to(dtype=torch.bool)
+                    ):
+                        raise ValueError("response_mask and retry_sft_mask must be disjoint")
                     old_log_prob = model_inputs["old_log_probs"]
                     advantages = model_inputs["advantages"]
 
@@ -744,17 +774,45 @@ class DataParallelPPOActor(BasePPOActor):
                         metrics["actor/kl_loss"] += kl_loss.detach().item() * loss_scale_factor
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
-                    if self.config.use_dynamic_bsz:
-                        # relative to the dynamic bsz
-                        loss = policy_loss * loss_scale_factor
+                    rl_loss_for_backward = policy_loss * loss_scale_factor
+                    retry_sft_loss = log_prob.sum() * 0.0
+                    if retry_sft_enabled and global_retry_sft_tokens > 0:
+                        retry_sft_loss = masked_sft_nll(
+                            log_prob,
+                            retry_sft_mask.to(dtype=torch.bool),
+                            batch_num_tokens=global_retry_sft_tokens,
+                            dp_size=dp_size,
+                        )
+                        retry_sft_fraction = float(self.config.policy_loss.retry_sft.loss_fraction)
+                        loss = combine_retry_sft_loss(
+                            rl_loss_for_backward,
+                            retry_sft_loss,
+                            loss_fraction=retry_sft_fraction,
+                            has_rl=global_rl_tokens > 0,
+                            has_retry_sft=True,
+                        )
                     else:
-                        loss = policy_loss * loss_scale_factor
+                        retry_sft_fraction = 0.0
+                        loss = combine_retry_sft_loss(
+                            rl_loss_for_backward,
+                            retry_sft_loss,
+                            loss_fraction=float(self.config.policy_loss.retry_sft.loss_fraction)
+                            if retry_sft_enabled
+                            else 0.0,
+                            has_rl=global_rl_tokens > 0 if retry_sft_enabled else True,
+                            has_retry_sft=False,
+                        )
                     if self.scaler is not None:
                         self.scaler.scale(loss).backward()
                     else:
                         loss.backward()
 
                     metrics["actor/pg_loss"] += pg_loss.detach().item() * loss_scale_factor
+                    metrics["actor/retry_sft_loss"] += retry_sft_loss.detach().item()
+                    metrics["actor/retry_sft_weighted_loss"] += (
+                        retry_sft_loss.detach().item() * retry_sft_fraction
+                    )
+                    metrics["actor/combined_policy_loss"] += loss.detach().item()
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()

@@ -24,6 +24,7 @@ from verl.workers.config import (
     McoreActorConfig,
     OptimizerConfig,
     PolicyLossConfig,
+    RetrySFTLossConfig,
 )
 
 
@@ -255,6 +256,21 @@ class TestActorConfig(unittest.TestCase):
                 enabled=False,
                 subsampling=BranchSubsamplingConfig(enabled=True, max_branches_per_parent=1),
             )
+
+    def test_retry_sft_config_validation(self):
+        retry_sft = RetrySFTLossConfig(enabled=True, loss_fraction=0.05)
+        config = ActorConfig(
+            strategy="fsdp",
+            rollout_n=1,
+            use_dynamic_bsz=True,
+            loss_agg_mode="seq-mean-token-mean",
+            policy_loss=PolicyLossConfig(loss_mode="gspo", retry_sft=retry_sft),
+        )
+        self.assertTrue(config.policy_loss.retry_sft.enabled)
+        self.assertEqual(config.policy_loss.retry_sft.loss_fraction, 0.05)
+
+        with self.assertRaisesRegex(ValueError, "0 <= value < 1"):
+            RetrySFTLossConfig(enabled=True, loss_fraction=1.0)
 
     def test_fsdp_actor_config_validation_exceptions(self):
         """Test that FSDPActorConfig.validate() raises appropriate validation exceptions."""

@@ -114,6 +114,18 @@ policy_loss:
       # Base seed combined with the global training step for deterministic sampling.
       seed: 42
 
+  # Teacher-only answer-retry supervised-loss stratum.
+  retry_sft:
+
+    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+    _target_: verl.workers.config.RetrySFTLossConfig
+
+    # Enable retry SFT alongside the configured policy loss.
+    enabled: false
+
+    # Fraction of total loss assigned to retry SFT when eligible targets exist.
+    loss_fraction: 0.05
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 

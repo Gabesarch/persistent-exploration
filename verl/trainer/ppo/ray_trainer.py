@@ -345,6 +345,7 @@ class RayPPOTrainer:
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
         self._validate_branch_strata_config()
+        self._validate_retry_sft_config()
         self._validate_lazy_multi_modal_inputs_config()
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
@@ -365,6 +366,15 @@ class RayPPOTrainer:
             raise ValueError("policy_loss.branch_strata requires policy_loss.loss_mode='gspo'.")
         if self.config.actor_rollout_ref.actor.loss_agg_mode != "seq-mean-token-mean":
             raise ValueError("policy_loss.branch_strata requires loss_agg_mode='seq-mean-token-mean'.")
+
+    def _validate_retry_sft_config(self) -> None:
+        retry_sft = self.config.actor_rollout_ref.actor.get("policy_loss", {}).get("retry_sft", {})
+        if not retry_sft or not bool(retry_sft.get("enabled", False)):
+            return
+        if self.use_legacy_worker_impl == "disable":
+            raise ValueError("policy_loss.retry_sft currently requires trainer.use_legacy_worker_impl != 'disable'.")
+        if self.config.actor_rollout_ref.actor.policy_loss.loss_mode != "gspo":
+            raise ValueError("policy_loss.retry_sft requires policy_loss.loss_mode='gspo'.")
 
     def _attach_branch_strata_loss_weights(self, batch: DataProto, metrics: dict) -> None:
         strata = self._branch_strata_config()
@@ -387,6 +397,11 @@ class RayPPOTrainer:
             branch_fraction=float(strata.get("branch_fraction", 0.2)),
             cap_by_parent_prevalence=bool(strata.get("cap_by_parent_prevalence", True)),
             parent_balance=bool(strata.get("parent_balance", True)),
+            allow_inactive_canonical=bool(
+                self.config.actor_rollout_ref.actor.get("policy_loss", {})
+                .get("retry_sft", {})
+                .get("enabled", False)
+            ),
         )
         batch.batch["branch_policy_loss_weight"] = weights
         branch_flags = np.asarray(batch.non_tensor_batch[branch_key], dtype=object)
@@ -1635,6 +1650,8 @@ class RayPPOTrainer:
 
         if "response_mask" in batch.batch:
             batch.batch["response_mask"][pad_slice] = 0
+        if "retry_sft_mask" in batch.batch:
+            batch.batch["retry_sft_mask"][pad_slice] = 0
         if "rm_scores" in batch.batch:
             batch.batch["rm_scores"][pad_slice] = 0
 
@@ -2216,6 +2233,31 @@ class RayPPOTrainer:
                             metrics["gdpo/baseline_weight/mean"] = float(np.mean(metric_weights))
                             metrics["gdpo/baseline_weight/min"] = float(np.min(metric_weights))
                             metrics["gdpo/baseline_weight/max"] = float(np.max(metric_weights))
+                    for key in (
+                        "retry_sft_candidate_count",
+                        "retry_sft_eligible_count",
+                        "retry_sft_selected_count",
+                        "retry_sft_token_count",
+                    ):
+                        if key not in batch.non_tensor_batch:
+                            continue
+                        values = [
+                            float(value)
+                            for value in batch.non_tensor_batch[key]
+                            if isinstance(value, int | float | np.integer | np.floating)
+                            and not isinstance(value, bool | np.bool_)
+                        ]
+                        if values:
+                            metrics[f"retry_sft/{key.removeprefix('retry_sft_')}/sum"] = float(np.sum(values))
+                            metrics[f"retry_sft/{key.removeprefix('retry_sft_')}/mean"] = float(np.mean(values))
+                    if "retry_sft_rejection_counts" in batch.non_tensor_batch:
+                        rejection_totals: dict[str, int] = defaultdict(int)
+                        for counts in batch.non_tensor_batch["retry_sft_rejection_counts"]:
+                            if isinstance(counts, dict):
+                                for reason, count in counts.items():
+                                    rejection_totals[str(reason)] += int(count)
+                        for reason, count in rejection_totals.items():
+                            metrics[f"retry_sft/rejected/{reason}"] = count
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()

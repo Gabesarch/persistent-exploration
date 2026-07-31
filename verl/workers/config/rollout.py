@@ -130,6 +130,11 @@ class MultiTurnConfig(BaseConfig):
     # Include injected retry-prefill tokens in the policy-loss mask.
     # These counterfactual tokens require recomputed old-policy likelihoods.
     conditional_answer_retry_assistant_prefill_trainable: bool = False
+    # Use the assistant prefill only for retry-teacher generation. The live
+    # canonical trajectory stores only the generated suffix.
+    conditional_answer_retry_teacher_only_prefill: bool = False
+    conditional_answer_retry_sft_enabled: bool = False
+    conditional_answer_retry_sft_target_selection: str = "all"
     conditional_answer_retry_correct_accuracy_threshold: float = 0.0
     conditional_answer_retry_max_retries: Optional[int] = None
     conditional_answer_retry_branch_enabled: bool = False

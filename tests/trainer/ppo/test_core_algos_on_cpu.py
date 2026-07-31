@@ -1053,10 +1053,26 @@ def test_branch_strata_weights_reject_branch_without_divergence_tokens():
         )
 
 
+def test_branch_strata_allows_sft_only_canonical_anchor_when_enabled():
+    weights, metrics = compute_branch_strata_loss_weights(
+        response_mask=torch.tensor([[0, 0], [1, 1], [1, 0]], dtype=torch.float32),
+        branch_flags=np.asarray([False, True, False], dtype=object),
+        parent_ids=np.asarray(["sft-parent", "sft-parent", "active-parent"], dtype=object),
+        padding_mask=np.zeros(3, dtype=bool),
+        branch_fraction=0.2,
+        allow_inactive_canonical=True,
+    )
+
+    assert weights[0].item() == 0.0
+    assert weights[1].item() > 0.0
+    assert weights[2].item() > 0.0
+    assert metrics["inactive_canonical_rows"] == 1.0
+
+
 @pytest.mark.parametrize("parent_ids", [["a", "b", "missing"], ["a", "a", "a"]])
 def test_branch_strata_weights_reject_missing_or_duplicate_parent(parent_ids):
     response_mask = torch.ones((3, 2), dtype=torch.float32)
-    with pytest.raises(ValueError, match="exactly one active canonical"):
+    with pytest.raises(ValueError, match="exactly one canonical"):
         compute_branch_strata_loss_weights(
             response_mask=response_mask,
             branch_flags=np.asarray([False, False, True], dtype=object),

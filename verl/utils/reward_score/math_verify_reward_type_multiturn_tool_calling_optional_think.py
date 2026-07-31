@@ -26,6 +26,7 @@ __all__ = [
     "acc_reward",
     "extract_answer_for_accuracy",
     "assistant_turn_overlong_reward",
+    "tool_repeat_overlap_call_diagnostics",
     "tool_repeat_overlap_reward",
     "compute_score",
     "compute_score_from_data_source",
@@ -473,30 +474,73 @@ def tool_repeat_overlap_reward(
 ) -> float:
     """Return a normalized composite crop-quality penalty under the existing key."""
     del penalty_per_repeat, max_penalty
-    parsed_calls = [parsed for call in tool_calls if (parsed := _extract_zoom_call_box(call)) is not None]
-    num_calls = len(parsed_calls)
+    diagnostics = tool_repeat_overlap_call_diagnostics(
+        tool_calls,
+        iou_threshold=iou_threshold,
+        small_crop_area_threshold=small_crop_area_threshold,
+        free_depth_refinements=free_depth_refinements,
+        depth_containment_threshold=depth_containment_threshold,
+    )
+    valid_diagnostics = [item for item in diagnostics if item["valid"]]
+    num_calls = len(valid_diagnostics)
     if num_calls == 0:
         return 0.0
 
+    repeat_count = sum(bool(item["is_repeat"]) for item in valid_diagnostics)
+    small_crop_count = sum(bool(item["is_small_crop"]) for item in valid_diagnostics)
+    excess_depth_count = sum(bool(item["is_excess_depth"]) for item in valid_diagnostics)
+    repeat_fraction = repeat_count / num_calls
+    small_crop_fraction = small_crop_count / num_calls
+    excess_depth_fraction = excess_depth_count / num_calls
+    return -(
+        max(float(repeat_weight), 0.0) * repeat_fraction
+        + max(float(small_crop_weight), 0.0) * small_crop_fraction
+        + max(float(excess_depth_weight), 0.0) * excess_depth_fraction
+    )
+
+
+def tool_repeat_overlap_call_diagnostics(
+    tool_calls: list[dict[str, Any]],
+    iou_threshold: float = 0.9,
+    *,
+    small_crop_area_threshold: float = 0.0002,
+    free_depth_refinements: int = 2,
+    depth_containment_threshold: float = 0.95,
+) -> list[dict[str, Any]]:
+    """Return per-call crop-quality flags using the reward's exact state machine.
+
+    Invalid or non-zoom calls retain their position in the returned list with
+    ``valid=False``. Reward aggregation ignores those entries, while rollout
+    filtering can fail closed on them.
+    """
     threshold = min(max(float(iou_threshold), 0.0), 1.0)
     area_threshold = max(float(small_crop_area_threshold), 0.0)
     containment_threshold = min(max(float(depth_containment_threshold), 0.0), 1.0)
     free_depth = max(int(free_depth_refinements), 0)
-    repeat_count = 0
-    small_crop_count = 0
-    excess_depth_count = 0
     depth_run = 0
     previous_by_img_idx: dict[int, list[tuple[float, float, float, float]]] = {}
     previous_call: tuple[int, tuple[float, float, float, float]] | None = None
-    for img_idx, box in parsed_calls:
+    diagnostics: list[dict[str, Any]] = []
+    for tool_call in tool_calls:
+        parsed = _extract_zoom_call_box(tool_call)
+        if parsed is None:
+            diagnostics.append(
+                {
+                    "valid": False,
+                    "is_repeat": False,
+                    "is_small_crop": False,
+                    "is_excess_depth": False,
+                    "has_penalty": False,
+                }
+            )
+            continue
+
+        img_idx, box = parsed
         previous_boxes = previous_by_img_idx.setdefault(img_idx, [])
         is_repeat = any(_bbox_iou(box, previous_box) >= threshold for previous_box in previous_boxes)
-        if is_repeat:
-            repeat_count += 1
 
         area = _bbox_area(box)
-        if area / 1_000_000.0 < area_threshold:
-            small_crop_count += 1
+        is_small_crop = area / 1_000_000.0 < area_threshold
 
         is_depth_refinement = False
         if previous_call is not None and previous_call[0] == img_idx and not is_repeat:
@@ -507,22 +551,24 @@ def tool_repeat_overlap_reward(
             )
         if is_depth_refinement:
             depth_run += 1
-            if depth_run > free_depth:
-                excess_depth_count += 1
         else:
             depth_run = 0
+        is_excess_depth = depth_run > free_depth
 
         previous_boxes.append(box)
         previous_call = (img_idx, box)
-
-    repeat_fraction = repeat_count / num_calls
-    small_crop_fraction = small_crop_count / num_calls
-    excess_depth_fraction = excess_depth_count / num_calls
-    return -(
-        max(float(repeat_weight), 0.0) * repeat_fraction
-        + max(float(small_crop_weight), 0.0) * small_crop_fraction
-        + max(float(excess_depth_weight), 0.0) * excess_depth_fraction
-    )
+        diagnostics.append(
+            {
+                "valid": True,
+                "img_idx": img_idx,
+                "bbox": box,
+                "is_repeat": is_repeat,
+                "is_small_crop": is_small_crop,
+                "is_excess_depth": is_excess_depth,
+                "has_penalty": is_repeat or is_small_crop or is_excess_depth,
+            }
+        )
+    return diagnostics
 
 
 def compute_score(
