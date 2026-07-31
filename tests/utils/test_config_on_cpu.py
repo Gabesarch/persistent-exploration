@@ -77,6 +77,68 @@ class TestConfigOnCPU(unittest.TestCase):
         self.assertFalse(cfg.trainer.save_validation_crops)
         self.assertEqual(cfg.trainer.comprehensive_debug_logging.log_every_n_steps, 1)
 
+    def test_gdpo_stability_defaults_off_and_branch_configs_opt_in(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        base_cfg = OmegaConf.load(repo_root / "verl" / "trainer" / "config" / "ppo_trainer.yaml")
+        self.assertFalse(base_cfg.algorithm.gdpo_stability_enabled)
+        self.assertEqual(base_cfg.algorithm.gdpo_component_std_floor, 0.05)
+        self.assertEqual(base_cfg.algorithm.gdpo_component_adv_clip, 5.0)
+        self.assertEqual(base_cfg.algorithm.gdpo_final_std_floor, 0.05)
+        self.assertEqual(base_cfg.algorithm.gdpo_final_adv_clip, 10.0)
+
+        branch_configs = [
+            "gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_cropzoom_cpueff_hardonly_"
+            "answer_retry_branch_donly_llmjudge_forcedprefill.yaml",
+            "gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_cropzoom_debug256_cpueff_"
+            "answer_retry_branch_donly_llmjudge_forcedprefill.yaml",
+        ]
+        for config_name in branch_configs:
+            cfg = OmegaConf.load(repo_root / "vero2_scripts" / "config" / config_name)
+            self.assertEqual(cfg.algorithm.gdpo_baseline_weight_key, "gdpo_baseline_weight")
+            self.assertTrue(cfg.algorithm.gdpo_stability_enabled)
+            self.assertEqual(cfg.algorithm.gdpo_component_std_floor, 0.05)
+            self.assertEqual(cfg.algorithm.gdpo_component_adv_clip, 5.0)
+            self.assertEqual(cfg.algorithm.gdpo_final_std_floor, 0.05)
+            self.assertEqual(cfg.algorithm.gdpo_final_adv_clip, 10.0)
+
+    def test_branch_strata_recipes_enable_guarded_gdpo_and_legacy_actor(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        branch_strata_configs = [
+            "gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_cropzoom_cpueff_hardonly_"
+            "answer_retry_branch_donly_llmjudge_forcedprefill_branchstrata.yaml",
+            "gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_cropzoom_debug256_cpueff_"
+            "answer_retry_branch_donly_llmjudge_forcedprefill_branchstrata.yaml",
+        ]
+        for config_name in branch_strata_configs:
+            cfg = OmegaConf.load(repo_root / "vero2_scripts" / "config" / config_name)
+            self.assertTrue(cfg.algorithm.gdpo_stability_enabled)
+            self.assertTrue(cfg.actor_rollout_ref.actor.policy_loss.branch_strata.enabled)
+            self.assertEqual(cfg.actor_rollout_ref.actor.policy_loss.branch_strata.branch_fraction, 0.2)
+            self.assertTrue(cfg.actor_rollout_ref.actor.policy_loss.branch_strata.cap_by_parent_prevalence)
+            self.assertTrue(cfg.actor_rollout_ref.actor.policy_loss.branch_strata.parent_balance)
+            self.assertEqual(cfg.trainer.use_legacy_worker_impl, "enable")
+
+    def test_noforceanswer_recipe_caps_retries_and_subsamples_branches(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        config_name = (
+            "gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_cropzoom_cpueff_hardonly_"
+            "answer_retry_branch_donly_llmjudge_forcedprefill_branchstrata_base_"
+            "noforceanswer_te015_turn4k_inferenceval.yaml"
+        )
+        cfg = OmegaConf.load(repo_root / "vero2_scripts" / "config" / config_name)
+
+        self.assertEqual(cfg.actor_rollout_ref.rollout.multi_turn.conditional_answer_retry_max_retries, 4)
+        strata = cfg.actor_rollout_ref.actor.policy_loss.branch_strata
+        self.assertEqual(strata.branch_fraction, 0.2)
+        self.assertTrue(strata.subsampling.enabled)
+        self.assertEqual(strata.subsampling.max_branches_per_parent, 1)
+        self.assertEqual(strata.subsampling.seed, 42)
+        reward_kwargs = cfg.reward.custom_reward_function.reward_kwargs
+        self.assertTrue(reward_kwargs.assistant_turn_overlong_enabled)
+        self.assertEqual(reward_kwargs.assistant_turn_overlong_max_turns, 11)
+        self.assertEqual(reward_kwargs.assistant_turn_overlong_buffer_turns, 2)
+        self.assertEqual(reward_kwargs.assistant_turn_overlong_penalty_factor, 1.0)
+
 
 class TestPrintCfgCommand(unittest.TestCase):
     """Test suite for the print_cfg.py command-line tool."""

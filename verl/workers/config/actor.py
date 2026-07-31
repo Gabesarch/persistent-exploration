@@ -33,6 +33,9 @@ from .model import HFModelConfig
 from .optimizer import OptimizerConfig
 
 __all__ = [
+    "BranchSubsamplingConfig",
+    "BranchLossStrataConfig",
+    "RetrySFTLossConfig",
     "PolicyLossConfig",
     "RouterReplayConfig",
     "ActorConfig",
@@ -43,6 +46,24 @@ __all__ = [
     "TorchTitanActorConfig",
     "MindSpeedActorConfig",
 ]
+
+
+@dataclass
+class BranchSubsamplingConfig(BaseConfig):
+    """Configuration for deterministic branch-row subsampling before training."""
+
+    enabled: bool = False
+    max_branches_per_parent: Optional[int] = None
+    seed: int = 42
+
+    def __post_init__(self):
+        if self.enabled and (self.max_branches_per_parent is None or int(self.max_branches_per_parent) <= 0):
+            raise ValueError(
+                "policy_loss.branch_strata.subsampling.max_branches_per_parent must be a positive integer "
+                "when subsampling is enabled."
+            )
+        if int(self.seed) < 0:
+            raise ValueError("policy_loss.branch_strata.subsampling.seed must be nonnegative.")
 
 
 @dataclass
@@ -75,6 +96,46 @@ class RouterReplayConfig(BaseConfig):
 
 
 @dataclass
+class BranchLossStrataConfig(BaseConfig):
+    """Configuration for parent-balanced canonical/branch policy-loss strata."""
+
+    enabled: bool = False
+    branch_fraction: float = 0.2
+    cap_by_parent_prevalence: bool = True
+    parent_balance: bool = True
+    branch_indicator_key: str = "is_conditional_answer_retry_branch"
+    parent_id_key: str = "request_id"
+    subsampling: BranchSubsamplingConfig = field(default_factory=BranchSubsamplingConfig)
+
+    def __post_init__(self):
+        if not 0.0 <= float(self.branch_fraction) < 1.0:
+            raise ValueError(
+                f"policy_loss.branch_strata.branch_fraction must satisfy 0 <= value < 1, got {self.branch_fraction!r}."
+            )
+        if not str(self.branch_indicator_key).strip():
+            raise ValueError("policy_loss.branch_strata.branch_indicator_key must be nonempty.")
+        if not str(self.parent_id_key).strip():
+            raise ValueError("policy_loss.branch_strata.parent_id_key must be nonempty.")
+        if self.subsampling.enabled and not self.enabled:
+            raise ValueError("policy_loss.branch_strata.subsampling.enabled requires branch strata to be enabled.")
+
+
+@dataclass
+class RetrySFTLossConfig(BaseConfig):
+    """Teacher-only answer-retry supervised-loss stratum."""
+
+    enabled: bool = False
+    loss_fraction: float = 0.05
+
+    def __post_init__(self):
+        if not 0.0 <= float(self.loss_fraction) < 1.0:
+            raise ValueError(
+                "policy_loss.retry_sft.loss_fraction must satisfy 0 <= value < 1, "
+                f"got {self.loss_fraction!r}."
+            )
+
+
+@dataclass
 class PolicyLossConfig(BaseConfig):
     """Configuration for policy loss computation.
 
@@ -97,6 +158,8 @@ class PolicyLossConfig(BaseConfig):
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
     rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
+    branch_strata: BranchLossStrataConfig = field(default_factory=BranchLossStrataConfig)
+    retry_sft: RetrySFTLossConfig = field(default_factory=RetrySFTLossConfig)
 
 
 @dataclass
@@ -216,6 +279,13 @@ class ActorConfig(BaseConfig):
         ]
         if self.loss_agg_mode not in valid_loss_agg_modes:
             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
+        if self.policy_loss.branch_strata.enabled:
+            if self.policy_loss.loss_mode != "gspo":
+                raise ValueError("policy_loss.branch_strata.enabled requires policy_loss.loss_mode='gspo'.")
+            if self.loss_agg_mode != "seq-mean-token-mean":
+                raise ValueError("policy_loss.branch_strata.enabled requires loss_agg_mode='seq-mean-token-mean'.")
+        if self.policy_loss.retry_sft.enabled and self.policy_loss.loss_mode != "gspo":
+            raise ValueError("policy_loss.retry_sft.enabled requires policy_loss.loss_mode='gspo'.")
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""

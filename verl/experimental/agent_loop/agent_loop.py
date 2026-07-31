@@ -26,7 +26,7 @@ import torch
 from cachetools import LRUCache
 from omegaconf import DictConfig, OmegaConf
 from PIL import Image
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
 
@@ -223,6 +223,8 @@ class AgentLoopOutput(BaseModel):
     """Response token ids including LLM generated token, tool response token."""
     response_mask: list[int]
     """Response mask, 1 for LLM generated token, 0 for tool response token."""
+    retry_sft_mask: Optional[list[int]] = None
+    """Response-aligned mask for teacher-only retry SFT targets."""
     response_logprobs: Optional[list[float]] = None
     """Log probabilities for the response tokens."""
     routed_experts: Optional[Any] = None
@@ -237,6 +239,8 @@ class AgentLoopOutput(BaseModel):
     """Auxiliary performance metrics"""
     extra_fields: dict[str, Any] = {}
     """Extra fields for dynamic addition."""
+    branch_outputs: list[Any] = Field(default_factory=list)
+    """Optional auxiliary outputs emitted by the agent loop."""
 
     def as_dict(self) -> dict[str, Any]:
         """Convert agent loop output to a dictionary."""
@@ -245,6 +249,10 @@ class AgentLoopOutput(BaseModel):
         output["prompts"] = torch.tensor(output.pop("prompt_ids"), dtype=torch.int64)
         output["responses"] = torch.tensor(output.pop("response_ids"), dtype=torch.int64)
         output["response_mask"] = torch.tensor(output.pop("response_mask"), dtype=torch.int64)
+        retry_sft_mask = output.pop("retry_sft_mask", None)
+        if retry_sft_mask is not None:
+            output["retry_sft_mask"] = torch.tensor(retry_sft_mask, dtype=torch.int64)
+        output.pop("branch_outputs", None)
 
         response_logprobs = output.pop("response_logprobs", None)
         if response_logprobs is not None:
@@ -279,6 +287,8 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded position ids."""
     response_mask: torch.Tensor
     """Padded response mask."""
+    retry_sft_mask: Optional[torch.Tensor] = None
+    """Padded teacher-only retry SFT mask."""
     attention_mask: torch.Tensor
     """Padded attention mask."""
     response_logprobs: Optional[torch.Tensor] = None
@@ -636,6 +646,7 @@ class AgentLoopWorker:
                 for i in range(len(batch)):
                     trace_this_sample = i in traced_indices
                     kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
+                    kwargs["__agent_loop_input_row"] = i
                     tasks.append(
                         asyncio.create_task(
                             self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
@@ -648,7 +659,8 @@ class AgentLoopWorker:
                 role="agent_loop_worker",
                 extra={"request_count": len(tasks)},
             ):
-                outputs = await asyncio.gather(*tasks)
+                output_groups = await asyncio.gather(*tasks)
+                outputs = [output for group in output_groups for output in group]
 
             output = self._postprocess(
                 outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)
@@ -663,7 +675,7 @@ class AgentLoopWorker:
         agent_name: str,
         trace: bool = True,
         **kwargs,
-    ) -> _InternalAgentLoopOutput:
+    ) -> list[_InternalAgentLoopOutput]:
         with rollout_trace_attr(
             step=trajectory["step"],
             sample_index=trajectory["sample_index"],
@@ -687,7 +699,13 @@ class AgentLoopWorker:
                 data_config=DictConfigWrap(self.config.data),
             )
             output: AgentLoopOutput = await agent_loop.run(sampling_params, _debug_trajectory=trajectory, **kwargs)
-            return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
+            source_row = kwargs.get("__agent_loop_input_row")
+            output.extra_fields["__agent_loop_input_row"] = source_row
+            internal_outputs = [await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)]
+            for branch_output in output.branch_outputs or []:
+                branch_output.extra_fields["__agent_loop_input_row"] = source_row
+                internal_outputs.append(await self._agent_loop_postprocess(branch_output, trajectory["validate"], **kwargs))
+            return internal_outputs
 
     async def _agent_loop_postprocess(self, output, validate, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
@@ -797,6 +815,17 @@ class AgentLoopWorker:
             position_ids=position_ids,
             kwargs=kwargs,
         )
+        retry_sft_mask_values = self._finalize_retry_sft_mask(output)
+        retry_sft_mask_output = self.tokenizer.pad(
+            {"input_ids": retry_sft_mask_values},
+            padding="max_length",
+            max_length=self.rollout_config.response_length,
+            return_tensors="pt",
+            return_attention_mask=False,
+        )
+        if retry_sft_mask_output["input_ids"].dim() == 1:
+            retry_sft_mask_output["input_ids"] = retry_sft_mask_output["input_ids"].unsqueeze(0)
+        retry_sft_mask = retry_sft_mask_output["input_ids"] * response_output["attention_mask"]
         await self._compute_teacher_logprobs(
             output,
             prompt_ids=output.prompt_ids,
@@ -827,6 +856,7 @@ class AgentLoopWorker:
             input_ids=input_ids,
             position_ids=position_ids,
             response_mask=response_mask,
+            retry_sft_mask=retry_sft_mask,
             attention_mask=attention_mask,
             response_logprobs=response_logprobs,
             routed_experts=routed_experts,
@@ -839,6 +869,64 @@ class AgentLoopWorker:
             metrics=output.metrics,
             extra_fields=output.extra_fields,
         )
+
+    def _finalize_retry_sft_mask(self, output: AgentLoopOutput) -> list[int]:
+        response_length = len(output.response_ids)
+        mask = [0] * response_length
+        candidates = output.extra_fields.pop("__agent_loop_retry_sft_candidates", []) or []
+        multi_turn = self.rollout_config.multi_turn
+        if not bool(getattr(multi_turn, "conditional_answer_retry_sft_enabled", False)):
+            output.extra_fields["retry_sft_eligible_count"] = 0
+            output.extra_fields["retry_sft_selected_count"] = 0
+            output.extra_fields["retry_sft_token_count"] = 0
+            return mask
+
+        final_grade = output.extra_fields.get("reward_extra_info")
+        final_accuracy = final_grade.get("accuracy") if isinstance(final_grade, dict) else None
+        eligible: list[dict[str, Any]] = []
+        rejection_counts: dict[str, int] = {}
+        for candidate in candidates:
+            reasons = list(candidate.get("static_rejection_reasons") or [])
+            if not candidate.get("tool_executed_successfully"):
+                reasons.append("tool_execution_failed")
+            rejected_accuracy = candidate.get("rejected_accuracy")
+            if not isinstance(final_accuracy, int | float) or isinstance(final_accuracy, bool):
+                reasons.append("missing_final_accuracy")
+            elif not isinstance(rejected_accuracy, int | float) or isinstance(rejected_accuracy, bool):
+                reasons.append("missing_rejected_accuracy")
+            elif not float(final_accuracy) > float(rejected_accuracy):
+                reasons.append("accuracy_not_improved")
+            if reasons:
+                for reason in set(reasons):
+                    rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+                continue
+            eligible.append(candidate)
+
+        selection = str(getattr(multi_turn, "conditional_answer_retry_sft_target_selection", "all"))
+        if selection == "all":
+            selected = eligible
+        elif selection == "first":
+            selected = eligible[:1]
+        elif selection == "last":
+            selected = eligible[-1:]
+        else:
+            raise ValueError(f"unsupported retry SFT target selection: {selection!r}")
+
+        selected_count = 0
+        for candidate in selected:
+            start = int(candidate["response_start"])
+            end = int(candidate["response_end"])
+            if start < 0 or end <= start or end > response_length:
+                rejection_counts["invalid_token_span"] = rejection_counts.get("invalid_token_span", 0) + 1
+                continue
+            mask[start:end] = [1] * (end - start)
+            selected_count += 1
+
+        output.extra_fields["retry_sft_eligible_count"] = len(eligible)
+        output.extra_fields["retry_sft_selected_count"] = selected_count
+        output.extra_fields["retry_sft_rejection_counts"] = rejection_counts
+        output.extra_fields["retry_sft_token_count"] = sum(mask)
+        return mask
 
     def _compute_multi_modal_inputs(self, output, input_ids) -> dict[str, torch.Tensor]:
         """Compute multi-modal inputs with image and video."""
@@ -960,6 +1048,15 @@ class AgentLoopWorker:
         prompt_ids = torch.cat([input.prompt_ids for input in inputs], dim=0)
         response_ids = torch.cat([input.response_ids for input in inputs], dim=0)
         response_mask = torch.cat([input.response_mask for input in inputs], dim=0)
+        retry_sft_mask = torch.cat(
+            [
+                input.retry_sft_mask
+                if input.retry_sft_mask is not None
+                else torch.zeros_like(input.response_mask)
+                for input in inputs
+            ],
+            dim=0,
+        )
         attention_mask = torch.cat([input.attention_mask for input in inputs], dim=0)
         input_ids = torch.cat([input.input_ids for input in inputs], dim=0)
         position_ids = torch.cat([input.position_ids for input in inputs], dim=0)
@@ -976,6 +1073,7 @@ class AgentLoopWorker:
                 "prompts": prompt_ids,  # [bsz, prompt_length]
                 "responses": response_ids,  # [bsz, response_length]
                 "response_mask": response_mask,  # [bsz, response_length]
+                "retry_sft_mask": retry_sft_mask,  # [bsz, response_length]
                 "input_ids": input_ids,  # [bsz, prompt_length + response_length]
                 "attention_mask": attention_mask,  # [bsz, prompt_length + response_length]
                 # position_ids: [bsz, 3, prompt_length + response_length] or [bsz, prompt_length + response_length]
@@ -997,7 +1095,13 @@ class AgentLoopWorker:
             "__num_turns__": np.array([input.num_turns for input in inputs], dtype=np.int32),
         }
         if self.reward_loop_worker_handles is None and input_non_tensor_batch:
-            non_tensor_batch.update(input_non_tensor_batch)
+            non_tensor_batch.update(self._expand_input_non_tensor_batch(inputs, input_non_tensor_batch))
+        elif input_non_tensor_batch and "__rollout_row_id" in input_non_tensor_batch:
+            # Trainer-side batch expansion needs this internal row map even when
+            # async reward workers own the user-facing non-tensor fields.
+            non_tensor_batch["__rollout_row_id"] = self._expand_input_non_tensor_batch(
+                inputs, {"__rollout_row_id": input_non_tensor_batch["__rollout_row_id"]}
+            )["__rollout_row_id"]
 
         # Add reward_extra_info to non_tensor_batch. Reward functions can emit sparse
         # metadata, e.g. LLM-judge keys only for reward types where the judge applies.
@@ -1037,13 +1141,29 @@ class AgentLoopWorker:
             "conditional_answer_retry_count",
             "conditional_answer_retry_last_grade",
             "conditional_answer_retry_skipped_reason",
+            "is_conditional_answer_retry_branch",
+            "gdpo_baseline_weight",
+            "conditional_answer_retry_branch_mask_mode",
+            "conditional_answer_retry_branch_retry_count",
+            "conditional_answer_retry_branch_grade",
+            "conditional_answer_retry_branch_removed_assistant_text",
+            "retry_sft_candidate_count",
+            "retry_sft_eligible_count",
+            "retry_sft_selected_count",
+            "retry_sft_rejection_counts",
+            "retry_sft_token_count",
             "turn_scores",
             "tool_rewards",
             "min_global_steps",
             "max_global_steps",
             "extras",
         }
-        all_keys = set(key for input_item in inputs for key in input_item.extra_fields) | default_extra_keys
+        all_keys = {
+            key
+            for input_item in inputs
+            for key in input_item.extra_fields
+            if not str(key).startswith("__agent_loop_")
+        } | default_extra_keys
         for key in all_keys:
             temp_arr = np.empty(len(inputs), dtype=object)
             temp_arr[:] = [input.extra_fields.get(key) for input in inputs]
@@ -1063,6 +1183,27 @@ class AgentLoopWorker:
             non_tensor_batch=non_tensor_batch,
             meta_info=meta_info,
         )
+
+    @staticmethod
+    def _expand_input_non_tensor_batch(
+        inputs: list[_InternalAgentLoopOutput],
+        input_non_tensor_batch: dict,
+    ) -> dict[str, np.ndarray]:
+        expanded = {}
+        for key, values in input_non_tensor_batch.items():
+            if len(values) == len(inputs):
+                expanded[key] = values
+                continue
+            row_values = []
+            for input_item in inputs:
+                source_row = input_item.extra_fields.get("__agent_loop_input_row")
+                if source_row is None:
+                    raise ValueError(
+                        f"Cannot expand non-tensor key {key!r}: missing source row for agent-loop output."
+                    )
+                row_values.append(values[int(source_row)])
+            expanded[key] = np.array(row_values, dtype=getattr(values, "dtype", object))
+        return expanded
 
 
 async def get_trajectory_info(step, index, validate):

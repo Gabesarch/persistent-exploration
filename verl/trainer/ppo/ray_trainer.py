@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import math
 import os
 import shutil
 import uuid
@@ -60,7 +61,7 @@ from verl.trainer.ppo.utils import (
     need_teacher_policy,
 )
 from verl.utils import tensordict_utils as tu
-from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
+from verl.utils.checkpoint.checkpoint_manager import resolve_ppo_checkpoint_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.crop_cache import (
     CROP_IMAGE_REFS_KEY,
@@ -81,12 +82,12 @@ from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.lazy_multi_modal import lazy_multi_modal_inputs_enabled
 from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
-from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.response_display import (
     apply_response_display_prefix,
     apply_response_display_prefixes,
     get_response_display_prefix,
 )
+from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
@@ -231,6 +232,8 @@ def compute_advantage(
         if adv_estimator in (AdvantageEstimator.GDPO, "gdpo"):
             adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
             adv_kwargs["batch"] = data.batch
+            gdpo_diagnostics: dict[str, float] = {}
+            adv_kwargs["diagnostics"] = gdpo_diagnostics
         # Add sum_pi_squared for Optimal Token Baseline
         if adv_estimator in (AdvantageEstimator.OPTIMAL_TOKEN_BASELINE, AdvantageEstimator.TIR_OPTIMAL_TOKEN_BASELINE):
             # Check if sum_pi_squared is available
@@ -249,6 +252,8 @@ def compute_advantage(
         advantages, returns = adv_estimator_fn(**adv_kwargs)
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+        if adv_estimator in (AdvantageEstimator.GDPO, "gdpo") and gdpo_diagnostics:
+            data.meta_info["gdpo_stability_metrics"] = gdpo_diagnostics
     return data
 
 
@@ -339,9 +344,143 @@ class RayPPOTrainer:
 
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
+        self._validate_branch_strata_config()
+        self._validate_retry_sft_config()
         self._validate_lazy_multi_modal_inputs_config()
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+    def _branch_strata_config(self):
+        policy_loss = self.config.actor_rollout_ref.actor.get("policy_loss", {})
+        return policy_loss.get("branch_strata", {})
+
+    def _validate_branch_strata_config(self) -> None:
+        strata = self._branch_strata_config()
+        if not strata or not bool(strata.get("enabled", False)):
+            return
+        if self.use_legacy_worker_impl == "disable":
+            raise ValueError(
+                "policy_loss.branch_strata currently requires trainer.use_legacy_worker_impl != 'disable'."
+            )
+        if self.config.actor_rollout_ref.actor.policy_loss.loss_mode != "gspo":
+            raise ValueError("policy_loss.branch_strata requires policy_loss.loss_mode='gspo'.")
+        if self.config.actor_rollout_ref.actor.loss_agg_mode != "seq-mean-token-mean":
+            raise ValueError("policy_loss.branch_strata requires loss_agg_mode='seq-mean-token-mean'.")
+
+    def _validate_retry_sft_config(self) -> None:
+        retry_sft = self.config.actor_rollout_ref.actor.get("policy_loss", {}).get("retry_sft", {})
+        if not retry_sft or not bool(retry_sft.get("enabled", False)):
+            return
+        if self.use_legacy_worker_impl == "disable":
+            raise ValueError("policy_loss.retry_sft currently requires trainer.use_legacy_worker_impl != 'disable'.")
+        if self.config.actor_rollout_ref.actor.policy_loss.loss_mode != "gspo":
+            raise ValueError("policy_loss.retry_sft requires policy_loss.loss_mode='gspo'.")
+
+    def _attach_branch_strata_loss_weights(self, batch: DataProto, metrics: dict) -> None:
+        strata = self._branch_strata_config()
+        if not strata or not bool(strata.get("enabled", False)):
+            return
+        branch_key = str(strata.get("branch_indicator_key", "is_conditional_answer_retry_branch"))
+        parent_key = str(strata.get("parent_id_key", "request_id"))
+        if branch_key not in batch.non_tensor_batch:
+            raise ValueError(f"Branch-stratified loss requires non-tensor batch key {branch_key!r}.")
+        if parent_key not in batch.non_tensor_batch:
+            raise ValueError(f"Branch-stratified loss requires non-tensor batch key {parent_key!r}.")
+        padding_mask = np.asarray(
+            batch.non_tensor_batch.get("__branch_padding_row", np.zeros(len(batch), dtype=bool)), dtype=bool
+        )
+        weights, diagnostics = core_algos.compute_branch_strata_loss_weights(
+            response_mask=batch.batch["response_mask"],
+            branch_flags=np.asarray(batch.non_tensor_batch[branch_key], dtype=object),
+            parent_ids=np.asarray(batch.non_tensor_batch[parent_key], dtype=object),
+            padding_mask=padding_mask,
+            branch_fraction=float(strata.get("branch_fraction", 0.2)),
+            cap_by_parent_prevalence=bool(strata.get("cap_by_parent_prevalence", True)),
+            parent_balance=bool(strata.get("parent_balance", True)),
+            allow_inactive_canonical=bool(
+                self.config.actor_rollout_ref.actor.get("policy_loss", {})
+                .get("retry_sft", {})
+                .get("enabled", False)
+            ),
+        )
+        batch.batch["branch_policy_loss_weight"] = weights
+        branch_flags = np.asarray(batch.non_tensor_batch[branch_key], dtype=object)
+        is_branch = torch.tensor(
+            [bool(flag) if isinstance(flag, bool | np.bool_) else False for flag in branch_flags],
+            dtype=torch.bool,
+            device=weights.device,
+        )
+        is_branch[torch.as_tensor(padding_mask, dtype=torch.bool, device=weights.device)] = False
+        batch.batch["branch_policy_loss_is_branch"] = is_branch
+        for name, value in diagnostics.items():
+            metrics[f"branch_strata/{name}"] = value
+
+    def _subsample_branch_training_rows(self, batch: DataProto, metrics: dict) -> DataProto:
+        """Uniformly cap branch rows per parent while retaining every canonical row."""
+        strata = self._branch_strata_config()
+        subsampling = strata.get("subsampling", {}) if strata else {}
+        if not subsampling or not bool(subsampling.get("enabled", False)):
+            return batch
+
+        branch_key = str(strata.get("branch_indicator_key", "is_conditional_answer_retry_branch"))
+        parent_key = str(strata.get("parent_id_key", "request_id"))
+        if branch_key not in batch.non_tensor_batch:
+            raise ValueError(f"Branch subsampling requires non-tensor batch key {branch_key!r}.")
+        if parent_key not in batch.non_tensor_batch:
+            raise ValueError(f"Branch subsampling requires non-tensor batch key {parent_key!r}.")
+
+        branch_flags = np.asarray(batch.non_tensor_batch[branch_key], dtype=object)
+        parent_ids = np.asarray(batch.non_tensor_batch[parent_key], dtype=object)
+        if len(branch_flags) != len(batch) or len(parent_ids) != len(batch):
+            raise ValueError(
+                "Branch subsampling metadata must have one entry per response row: "
+                f"rows={len(batch)}, branch_flags={len(branch_flags)}, parent_ids={len(parent_ids)}."
+            )
+
+        branches_by_parent: dict[Any, list[int]] = defaultdict(list)
+        for row, flag in enumerate(branch_flags):
+            if not isinstance(flag, bool | np.bool_):
+                raise ValueError(f"Branch subsampling row {row} has non-boolean branch flag {flag!r}.")
+            if not bool(flag):
+                continue
+            parent = parent_ids[row]
+            if parent is None or (isinstance(parent, str) and not parent.strip()):
+                raise ValueError(f"Branch subsampling row {row} has an empty parent id.")
+            branches_by_parent[parent].append(row)
+
+        input_branch_rows = sum(len(rows) for rows in branches_by_parent.values())
+        input_counts = [len(rows) for rows in branches_by_parent.values()]
+        prefix = "branch_strata/subsampling"
+        metrics[f"{prefix}/input_branch_rows"] = input_branch_rows
+        metrics[f"{prefix}/branch_parents"] = len(branches_by_parent)
+        metrics[f"{prefix}/input_parent_branch_count_mean"] = (
+            float(np.mean(input_counts)) if input_counts else 0.0
+        )
+        metrics[f"{prefix}/input_parent_branch_count_max"] = max(input_counts, default=0)
+
+        if input_branch_rows == 0:
+            metrics[f"{prefix}/retained_branch_rows"] = 0
+            metrics[f"{prefix}/dropped_branch_rows"] = 0
+            metrics[f"{prefix}/retention_rate"] = 1.0
+            return batch
+
+        max_per_parent = int(subsampling.get("max_branches_per_parent"))
+        seed = int(subsampling.get("seed", 42))
+        rng = np.random.default_rng(np.random.SeedSequence([seed, int(self.global_steps)]))
+        keep = np.logical_not(np.asarray(branch_flags, dtype=bool))
+        retained_branch_rows = 0
+        for rows in branches_by_parent.values():
+            if len(rows) <= max_per_parent:
+                selected = rows
+            else:
+                selected = rng.choice(rows, size=max_per_parent, replace=False).tolist()
+            keep[np.asarray(selected, dtype=np.int64)] = True
+            retained_branch_rows += len(selected)
+
+        metrics[f"{prefix}/retained_branch_rows"] = retained_branch_rows
+        metrics[f"{prefix}/dropped_branch_rows"] = input_branch_rows - retained_branch_rows
+        metrics[f"{prefix}/retention_rate"] = retained_branch_rows / input_branch_rows
+        return batch.select_idxs(np.flatnonzero(keep))
 
     def _gpu_memory_context(self, batch: DataProto | None = None, extra: Mapping[str, Any] | None = None) -> dict:
         context = {}
@@ -691,9 +830,7 @@ class RayPPOTrainer:
             )
             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
-            image_paths = self._collect_image_references(
-                [item.non_tensor_batch.get("extra_info") for item in batch]
-            )
+            image_paths = self._collect_image_references([item.non_tensor_batch.get("extra_info") for item in batch])
 
             reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
             if "request_id" in batch.non_tensor_batch:
@@ -777,6 +914,60 @@ class RayPPOTrainer:
             batch.pop(non_tensor_batch_keys=["teacher_multi_modal_data"])
         return teacher_batch
 
+    @staticmethod
+    def _reward_extra_values_to_list(key: str, values, expected_len: int) -> list:
+        if isinstance(values, np.ndarray):
+            values_list = values.tolist()
+        elif isinstance(values, list):
+            values_list = values
+        else:
+            values_list = [values]
+
+        if len(values_list) != expected_len:
+            raise ValueError(f"{key}: len(values)={len(values_list)}, expected_len={expected_len}")
+        return values_list
+
+    @classmethod
+    def _extend_validation_reward_extra_infos(
+        cls,
+        reward_extra_infos_dict: dict[str, list],
+        reward_extra_info: Mapping[str, Any],
+        batch_size: int,
+        current_size: int,
+    ) -> None:
+        """Append one validation batch of reward metadata while preserving sample alignment."""
+        for key, values in reward_extra_infos_dict.items():
+            if key == "reward":
+                continue
+            if len(values) != current_size:
+                raise ValueError(f"{key}: len(accumulated_values)={len(values)}, expected_len={current_size}")
+
+        for key, values in list(reward_extra_infos_dict.items()):
+            if key != "reward" and key not in reward_extra_info:
+                values.extend([None] * batch_size)
+
+        for key, values in reward_extra_info.items():
+            if key == "reward":
+                continue
+            values_list = cls._reward_extra_values_to_list(key, values, batch_size)
+            if key not in reward_extra_infos_dict:
+                reward_extra_infos_dict[key] = [None] * current_size
+            reward_extra_infos_dict[key].extend(values_list)
+
+    @staticmethod
+    def _pad_validation_reward_extra_result(
+        reward_extra_infos_dict: Mapping[str, list],
+        keys: set[str],
+        sample_count: int,
+    ) -> dict[str, list]:
+        padded = {}
+        for key in keys:
+            values = list(reward_extra_infos_dict.get(key, []))
+            if values and len(values) != sample_count:
+                raise ValueError(f"{key}: len(values)={len(values)}, expected_len={sample_count}")
+            padded[key] = values if values else [None] * sample_count
+        return padded
+
     def _validate(self, merged: bool = False):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
@@ -838,6 +1029,20 @@ class RayPPOTrainer:
 
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+            if len(test_output_gen_batch) != len(test_batch):
+                branch_count = 0
+                branch_flags = test_output_gen_batch.non_tensor_batch.get("is_conditional_answer_retry_branch")
+                if branch_flags is not None:
+                    branch_count = sum(
+                        flag is True or isinstance(flag, np.bool_) and bool(flag) for flag in branch_flags
+                    )
+                raise RuntimeError(
+                    "Validation rollout returned a different row count than the validation batch "
+                    f"({len(test_output_gen_batch)} vs {len(test_batch)}). "
+                    f"branch_rows={branch_count}. Branch rows are training-only for this experiment; "
+                    "keep actor_rollout_ref.rollout.multi_turn."
+                    "conditional_answer_retry_branch_enable_validation=false."
+                )
 
             print("validation generation end")
 
@@ -884,13 +1089,12 @@ class RayPPOTrainer:
                 )
 
             reward_extra_infos_dict["reward"].extend(scores)
-            for key, values in reward_extra_info.items():
-                if key not in reward_extra_infos_dict:
-                    reward_extra_infos_dict[key] = []
-                if isinstance(values, np.ndarray):
-                    reward_extra_infos_dict[key].extend(values.tolist())
-                else:
-                    reward_extra_infos_dict[key].extend(values if isinstance(values, list) else [values])
+            self._extend_validation_reward_extra_infos(
+                reward_extra_infos_dict=reward_extra_infos_dict,
+                reward_extra_info=reward_extra_info,
+                batch_size=len(scores),
+                current_size=len(sample_scores) - len(scores),
+            )
 
             # collect num_turns of each prompt
             if "__num_turns__" in test_batch.non_tensor_batch:
@@ -974,10 +1178,14 @@ class RayPPOTrainer:
 
         reward_extra_infos_dict = {}
         all_keys = set(result_a["reward_extra_infos_dict"].keys()) | set(result_b["reward_extra_infos_dict"].keys())
+        padded_a = self._pad_validation_reward_extra_result(
+            result_a["reward_extra_infos_dict"], all_keys, len(result_a["sample_uids"])
+        )
+        padded_b = self._pad_validation_reward_extra_result(
+            result_b["reward_extra_infos_dict"], all_keys, len(result_b["sample_uids"])
+        )
         for key in all_keys:
-            list_a = result_a["reward_extra_infos_dict"].get(key, [])
-            list_b = result_b["reward_extra_infos_dict"].get(key, [])
-            reward_extra_infos_dict[key] = list_a + list_b
+            reward_extra_infos_dict[key] = padded_a[key] + padded_b[key]
 
         return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
 
@@ -1257,31 +1465,17 @@ class RayPPOTrainer:
         if self.config.trainer.resume_mode == "disable":
             return 0
 
-        # load from hdfs
         if self.config.trainer.default_hdfs_dir is not None:
             raise NotImplementedError("load from hdfs is not implemented yet")
-        else:
-            checkpoint_folder = self.config.trainer.default_local_dir  # TODO: check path
-            if not os.path.isabs(checkpoint_folder):
-                working_dir = os.getcwd()
-                checkpoint_folder = os.path.join(working_dir, checkpoint_folder)
-            global_step_folder = find_latest_ckpt_path(checkpoint_folder)  # None if no latest
-
-        # find global_step_folder
-        if self.config.trainer.resume_mode == "auto":
-            if global_step_folder is None:
-                print("Training from scratch")
-                return 0
-        else:
-            if self.config.trainer.resume_mode == "resume_path":
-                assert isinstance(self.config.trainer.resume_from_path, str), "resume ckpt must be str type"
-                assert "global_step_" in self.config.trainer.resume_from_path, (
-                    "resume ckpt must specify the global_steps"
-                )
-                global_step_folder = self.config.trainer.resume_from_path
-                if not os.path.isabs(global_step_folder):
-                    working_dir = os.getcwd()
-                    global_step_folder = os.path.join(working_dir, global_step_folder)
+        global_step_folder = resolve_ppo_checkpoint_path(
+            default_local_dir=self.config.trainer.default_local_dir,
+            resume_mode=self.config.trainer.resume_mode,
+            resume_from_path=self.config.trainer.get("resume_from_path"),
+            bootstrap_from_path=self.config.trainer.get("bootstrap_from_path"),
+        )
+        if global_step_folder is None:
+            print("Training from scratch")
+            return 0
         print(f"Load from checkpoint folder: {global_step_folder}")
         # set global step
         self.global_steps = int(global_step_folder.split("global_step_")[-1])
@@ -1427,6 +1621,50 @@ class RayPPOTrainer:
             seqlen_list=global_seqlen_lst.tolist(), partitions=global_partition_lst, prefix=logging_prefix
         )
         metrics.update(global_balance_stats)
+
+    def _pad_branch_expanded_training_batch(self, batch: DataProto, metrics: dict) -> DataProto:
+        """Pad branch-expanded batches so distributed actor paths keep valid divisibility.
+
+        Branch rows make the post-rollout batch size data-dependent. Padded rows are
+        made loss-free and excluded from GDPO canonical baseline statistics.
+        """
+        baseline_weight_key = self.config.algorithm.get("gdpo_baseline_weight_key", None)
+        if not baseline_weight_key or baseline_weight_key not in batch.non_tensor_batch:
+            return batch
+
+        divisor = max(self._get_dp_size(self.actor_rollout_wg, "actor"), 1)
+        ppo_mini_batch_size = self.config.actor_rollout_ref.actor.get("ppo_mini_batch_size", None)
+        if ppo_mini_batch_size:
+            divisor = math.lcm(divisor, int(ppo_mini_batch_size))
+        if divisor <= 1 or len(batch) % divisor == 0:
+            return batch
+
+        original_len = len(batch)
+        batch, pad_size = pad_dataproto_to_divisor(batch, divisor)
+        if pad_size <= 0:
+            return batch
+
+        pad_slice = slice(original_len, len(batch))
+        metrics["gdpo/padding_rows/added"] = int(pad_size)
+        metrics["gdpo/padding_rows/divisor"] = int(divisor)
+
+        if "response_mask" in batch.batch:
+            batch.batch["response_mask"][pad_slice] = 0
+        if "retry_sft_mask" in batch.batch:
+            batch.batch["retry_sft_mask"][pad_slice] = 0
+        if "rm_scores" in batch.batch:
+            batch.batch["rm_scores"][pad_slice] = 0
+
+        reward_keys = self.config.algorithm.get("gdpo_reward_keys", None) or []
+        for key in reward_keys:
+            if key in batch.non_tensor_batch:
+                batch.non_tensor_batch[key][pad_slice] = 0.0
+
+        batch.non_tensor_batch[baseline_weight_key][pad_slice] = 0.0
+        padding_mask = np.zeros(len(batch), dtype=bool)
+        padding_mask[pad_slice] = True
+        batch.non_tensor_batch["__branch_padding_row"] = padding_mask
+        return batch
 
     def _compute_values(self, batch: DataProto) -> DataProto:
         if self.use_legacy_worker_impl == "disable":
@@ -1666,6 +1904,7 @@ class RayPPOTrainer:
                 gen_batch_output = gen_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
+                gen_batch_output.non_tensor_batch["__rollout_row_id"] = np.arange(len(gen_batch_output), dtype=np.int64)
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
@@ -1717,7 +1956,12 @@ class RayPPOTrainer:
                             del rm_scores, gen_baseline_batch, gen_baseline_output
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    rollout_row_ids = gen_batch_output.non_tensor_batch.pop("__rollout_row_id", None)
+                    if rollout_row_ids is not None:
+                        batch = batch.select_idxs(np.asarray(rollout_row_ids, dtype=np.int64))
                     batch = batch.union(gen_batch_output)
+                    batch = self._subsample_branch_training_rows(batch, metrics)
+                    batch = self._pad_branch_expanded_training_batch(batch, metrics)
                     if self._should_compute_teacher_colocate(batch):
                         with marked_timer("teacher", timing_raw, color="cyan"):
                             batch_teacher = self._compute_teacher_colocate(batch)
@@ -1725,6 +1969,7 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+                    self._attach_branch_strata_loss_weights(batch, metrics)
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -1902,9 +2147,7 @@ class RayPPOTrainer:
                         # 3. The current step number is a multiple of the save frequency.
                         # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
                         if self.config.trainer.save_freq > 0 and (
-                            is_last_step
-                            or self.global_steps % self.config.trainer.save_freq == 0
-                            or esi_force_save
+                            is_last_step or self.global_steps % self.config.trainer.save_freq == 0 or esi_force_save
                         ):
                             if esi_force_save:
                                 print("Force saving checkpoint: ESI instance expiration approaching.")
@@ -1974,6 +2217,47 @@ class RayPPOTrainer:
                             metrics[f"gdpo/{key}/std"] = float(np.std(vals))
                             metrics[f"gdpo/{key}/max"] = float(np.max(vals))
                             metrics[f"gdpo/{key}/min"] = float(np.min(vals))
+                    baseline_weight_key = self.config.algorithm.get("gdpo_baseline_weight_key", None)
+                    if baseline_weight_key and baseline_weight_key in batch.non_tensor_batch:
+                        weights = np.asarray(batch.non_tensor_batch[baseline_weight_key], dtype=np.float32)
+                        padding_mask = np.asarray(
+                            batch.non_tensor_batch.get("__branch_padding_row", np.zeros(len(weights), dtype=bool)),
+                            dtype=bool,
+                        )
+                        branch_mask = (weights <= 0.0) & ~padding_mask
+                        metrics["gdpo/branch_rows/count"] = int(np.sum(branch_mask))
+                        metrics["gdpo/branch_rows/rate"] = float(np.mean(branch_mask)) if len(branch_mask) else 0.0
+                        metrics["gdpo/padding_rows/count"] = int(np.sum(padding_mask))
+                        metric_weights = weights[~padding_mask]
+                        if len(metric_weights):
+                            metrics["gdpo/baseline_weight/mean"] = float(np.mean(metric_weights))
+                            metrics["gdpo/baseline_weight/min"] = float(np.min(metric_weights))
+                            metrics["gdpo/baseline_weight/max"] = float(np.max(metric_weights))
+                    for key in (
+                        "retry_sft_candidate_count",
+                        "retry_sft_eligible_count",
+                        "retry_sft_selected_count",
+                        "retry_sft_token_count",
+                    ):
+                        if key not in batch.non_tensor_batch:
+                            continue
+                        values = [
+                            float(value)
+                            for value in batch.non_tensor_batch[key]
+                            if isinstance(value, int | float | np.integer | np.floating)
+                            and not isinstance(value, bool | np.bool_)
+                        ]
+                        if values:
+                            metrics[f"retry_sft/{key.removeprefix('retry_sft_')}/sum"] = float(np.sum(values))
+                            metrics[f"retry_sft/{key.removeprefix('retry_sft_')}/mean"] = float(np.mean(values))
+                    if "retry_sft_rejection_counts" in batch.non_tensor_batch:
+                        rejection_totals: dict[str, int] = defaultdict(int)
+                        for counts in batch.non_tensor_batch["retry_sft_rejection_counts"]:
+                            if isinstance(counts, dict):
+                                for reason, count in counts.items():
+                                    rejection_totals[str(reason)] += int(count)
+                        for reason, count in rejection_totals.items():
+                            metrics[f"retry_sft/rejected/{reason}"] = count
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()

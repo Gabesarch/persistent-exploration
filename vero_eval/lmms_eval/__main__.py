@@ -576,6 +576,9 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
     if args.wandb_args:
         wandb_logger.run.finish()
 
+    if any(result is None for result in results_list):
+        sys.exit(1)
+
 
 def cli_evaluate_single(args: Union[argparse.Namespace, None] = None) -> None:
     selected_task_list = args.tasks.split(",") if args.tasks else None

@@ -77,6 +77,9 @@ class MultiTurnConfig(BaseConfig):
 
     enable: bool = False
     max_assistant_turns: Optional[int] = None
+    # Maximum number of model-generated tokens in one assistant turn.
+    # None leaves the per-turn generation budget uncapped.
+    max_assistant_tokens_per_turn: Optional[int] = None
     tool_config_path: Optional[str] = None
     max_user_turns: Optional[int] = None
     max_parallel_calls: int = 1
@@ -92,7 +95,17 @@ class MultiTurnConfig(BaseConfig):
     format: str = "hermes"
     num_repeat_rollouts: Optional[int] = None
     force_tool_calls_until_final_turn: bool = False
+    force_answer_on_final_turn: bool = False
+    # Validation-only override. None preserves the legacy behavior of inheriting
+    # force_answer_on_final_turn; a boolean controls validation independently.
+    force_answer_on_final_turn_validation: Optional[bool] = None
     final_answer_token_margin: int = 2048
+    # Text appended inside the forced final turn's `<think>` block before generation.
+    # Empty string leaves forced final-answer generation unchanged.
+    force_final_answer_think_prefill: str = ""
+    # Include injected final-answer think-prefill tokens in the policy-loss mask.
+    # These counterfactual tokens require recomputed old-policy likelihoods.
+    force_final_answer_think_prefill_trainable: bool = False
     # Text forced immediately after the `<answer>` tag on the forced final turn (e.g. "\n\\boxed{"
     # to start a boxed answer). Empty string forces only the `<answer>` tag, as before.
     force_final_answer_prefix: str = ""
@@ -108,6 +121,8 @@ class MultiTurnConfig(BaseConfig):
         "The maximum amount of tool calling has been reached. Please output a final answer in the next turn."
     )
     conditional_answer_retry_enabled: bool = False
+    # Whether GT-based answer retry is allowed during validation rollouts.
+    conditional_answer_retry_enable_validation: bool = True
     conditional_answer_retry_force_next_tool_call: bool = True
     conditional_answer_retry_suffix: str = (
         "You have not gathered enough information yet. In your next turn, keep exploring rather than answering "
@@ -116,8 +131,22 @@ class MultiTurnConfig(BaseConfig):
         "clearly supports a conclusion."
     )
     conditional_answer_retry_assistant_prefill: str = ""
+    # Include injected retry-prefill tokens in the policy-loss mask.
+    # These counterfactual tokens require recomputed old-policy likelihoods.
+    conditional_answer_retry_assistant_prefill_trainable: bool = False
+    # Use the assistant prefill only for retry-teacher generation. The live
+    # canonical trajectory stores only the generated suffix.
+    conditional_answer_retry_teacher_only_prefill: bool = False
+    conditional_answer_retry_sft_enabled: bool = False
+    conditional_answer_retry_sft_target_selection: str = "all"
     conditional_answer_retry_correct_accuracy_threshold: float = 0.0
     conditional_answer_retry_max_retries: Optional[int] = None
+    conditional_answer_retry_branch_enabled: bool = False
+    conditional_answer_retry_branch_enable_validation: bool = False
+    conditional_answer_retry_branch_mask_mode: str = "divergence_only"
+    conditional_answer_retry_branch_reward_components: dict[str, float] = field(default_factory=dict)
+    conditional_answer_retry_branch_use_graded_rewards: bool = False
+    conditional_answer_retry_branch_baseline_weight_key: str = "gdpo_baseline_weight"
     llm_judge_enabled: bool = False
     llm_judge_prompt_path: Optional[str] = None
     llm_judge_reward_types: list[str] = field(default_factory=lambda: ["search"])

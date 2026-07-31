@@ -15,6 +15,7 @@
 import asyncio
 import concurrent.futures
 from collections.abc import Mapping, Sequence
+from numbers import Integral
 from typing import Any
 
 import numpy as np
@@ -93,15 +94,20 @@ def rehydrate_multi_modal_inputs(
     for idx, raw_prompt in enumerate(raw_prompts):
         messages = _normalize_raw_prompt(raw_prompt)
         multi_modal_data = _process_vision_info_sync(processor, dataset_cls, data_config, messages)
-        _append_crop_images(multi_modal_data, _get_sample_crop_image_refs(crop_image_refs, idx))
+        original_inputs = _normalize_original_inputs(original_multi_modal_inputs, idx)
+        _append_crop_images(
+            multi_modal_data,
+            _get_sample_crop_image_refs(crop_image_refs, idx),
+            original_inputs=original_inputs,
+        )
         sample_inputs = _compute_multi_modal_inputs_for_sample(
             tokenizer=tokenizer,
             processor=processor,
             input_ids=input_ids_cpu[idx],
             multi_modal_data=multi_modal_data,
         )
-        if assert_metadata_match and original_multi_modal_inputs is not None:
-            _assert_metadata_matches(original_multi_modal_inputs[idx], sample_inputs, idx)
+        if assert_metadata_match and original_inputs is not None:
+            _assert_metadata_matches(original_inputs, sample_inputs, idx)
         rebuilt_inputs.append(sample_inputs)
     return rebuilt_inputs
 
@@ -160,13 +166,53 @@ def _process_vision_info_sync(
     return multi_modal_data
 
 
-def _append_crop_images(multi_modal_data: dict[str, Any], crop_image_refs: Any) -> None:
-    refs = normalize_crop_image_refs(crop_image_refs)
+def _append_crop_images(
+    multi_modal_data: dict[str, Any],
+    crop_image_refs: Any,
+    *,
+    original_inputs: Mapping[str, Any] | None = None,
+) -> None:
+    refs = _filter_crop_refs_for_original_metadata(
+        crop_image_refs,
+        original_inputs=original_inputs,
+        base_image_count=len(multi_modal_data.get("images") or []),
+    )
     if not refs:
         return
     images = list(multi_modal_data.get("images") or [])
     images.extend(load_crop_images(refs))
     multi_modal_data["images"] = images
+
+
+def _filter_crop_refs_for_original_metadata(
+    crop_image_refs: Any,
+    *,
+    original_inputs: Mapping[str, Any] | None,
+    base_image_count: int,
+) -> list[dict[str, Any]]:
+    refs = normalize_crop_image_refs(crop_image_refs)
+    if not refs or original_inputs is None:
+        return refs
+
+    image_grid_thw = original_inputs.get("image_grid_thw")
+    if image_grid_thw is None:
+        return refs
+
+    original_image_count = int(_as_cpu_tensor(image_grid_thw).shape[0])
+    expected_crop_count = max(0, original_image_count - int(base_image_count))
+    if len(refs) <= expected_crop_count:
+        return refs
+
+    indexed_refs = [
+        ref
+        for ref in refs
+        if isinstance(ref.get("image_index"), Integral)
+        and base_image_count <= int(ref["image_index"]) < original_image_count
+    ]
+    if len(indexed_refs) == expected_crop_count:
+        return indexed_refs
+
+    return refs[:expected_crop_count]
 
 
 def _get_sample_crop_image_refs(crop_image_refs: Sequence[Any] | None, idx: int) -> Any:
@@ -175,6 +221,15 @@ def _get_sample_crop_image_refs(crop_image_refs: Sequence[Any] | None, idx: int)
     if isinstance(crop_image_refs, np.ndarray):
         return crop_image_refs[idx]
     return crop_image_refs[idx]
+
+
+def _normalize_original_inputs(original_multi_modal_inputs: Sequence[Any] | None, idx: int) -> Mapping[str, Any] | None:
+    if original_multi_modal_inputs is None:
+        return None
+    original_inputs = original_multi_modal_inputs[idx]
+    if hasattr(original_inputs, "data"):
+        original_inputs = original_inputs.data
+    return original_inputs or {}
 
 
 def _run_coro_sync(coro):
@@ -190,9 +245,7 @@ def _run_coro_sync(coro):
 
 
 def _assert_metadata_matches(original_inputs: Any, rebuilt_inputs: dict[str, torch.Tensor], sample_idx: int) -> None:
-    if hasattr(original_inputs, "data"):
-        original_inputs = original_inputs.data
-    original_inputs = original_inputs or {}
+    original_inputs = _normalize_original_inputs([original_inputs], 0)
     for key in METADATA_COMPARE_KEYS:
         original_value = original_inputs.get(key)
         rebuilt_value = rebuilt_inputs.get(key)
@@ -204,10 +257,19 @@ def _assert_metadata_matches(original_inputs: Any, rebuilt_inputs: dict[str, tor
                 f"present in only one of rollout/rebuilt inputs"
             )
         if not torch.equal(_as_cpu_tensor(original_value), _as_cpu_tensor(rebuilt_value)):
+            original_tensor = _as_cpu_tensor(original_value)
+            rebuilt_tensor = _as_cpu_tensor(rebuilt_value)
             raise ValueError(
                 f"lazy multimodal metadata mismatch for sample {sample_idx}: key {key!r} differs "
-                "between rollout and rebuilt inputs"
+                "between rollout and rebuilt inputs "
+                f"(rollout_shape={tuple(original_tensor.shape)}, rebuilt_shape={tuple(rebuilt_tensor.shape)}, "
+                f"rollout_preview={_tensor_preview(original_tensor)}, rebuilt_preview={_tensor_preview(rebuilt_tensor)})"
             )
+
+
+def _tensor_preview(value: torch.Tensor, limit: int = 12) -> list[Any]:
+    flat = value.detach().cpu().reshape(-1)
+    return flat[:limit].tolist()
 
 
 def _as_cpu_tensor(value: Any) -> torch.Tensor:

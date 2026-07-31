@@ -16,6 +16,7 @@ import inspect
 import json
 import logging
 import os
+import re
 from enum import Enum
 from typing import Any, Optional
 from uuid import uuid4
@@ -25,6 +26,7 @@ from PIL import Image
 
 from verl.experimental.agent_loop.agent_loop import (
     AgentLoopBase,
+    AgentLoopMetrics,
     AgentLoopOutput,
     register,
 )
@@ -44,19 +46,18 @@ from verl.utils.debug.comprehensive_logging import (
     should_log_step,
     to_jsonable,
 )
+from verl.utils.forced_action_tags import build_forced_action_extra_args
 from verl.utils.profiler import simple_timer
 from verl.utils.response_display import apply_response_display_prefix, get_response_display_prefix
 from verl.utils.reward_score.math_verify_reward_type_multiturn_tool_calling_optional_think import (
-    _extract_reward_answer,
+    _contains_reserved_tag,
     _extract_reward_type,
     _parse_multiturn_tool_calling_output,
+    _parse_tool_call_payload,
+    extract_answer_for_accuracy,
+    tool_repeat_overlap_call_diagnostics,
 )
 from verl.utils.rollout_trace import rollout_trace_op
-from verl.utils.forced_action_tags import (
-    FORCE_ACTION_AFTER_THINK_IDS_OPTIONS_KEY,
-    FORCE_ACTION_REQUIRED_TAG_KEY,
-    FORCE_ACTION_TAG_IDS_KEY,
-)
 from verl.workers.rollout.replica import TokenOutput
 
 logger = logging.getLogger(__file__)
@@ -128,6 +129,7 @@ class AgentData:
         self.prompt_ids: list[int] = []
         self.response_ids: list[int] = []
         self.response_mask: list[int] = []
+        self.retry_sft_mask: list[int] = []
         self.response_logprobs: list[float] = []
         self.turn_scores: list[float] = []
         self.tool_rewards: list[float] = []
@@ -141,9 +143,12 @@ class AgentData:
 
         # Extra fields for dynamic addition, e.g., tool session data
         self.extra_fields: dict[str, Any] = {}
+        self.branch_outputs: list[AgentLoopOutput] = []
         self.debug_events: list[dict[str, Any]] = []
         self.crop_image_refs: list[dict[str, Any]] = []
         self.force_next_tool_call = False
+        self.retry_sft_candidates: list[dict[str, Any]] = []
+        self.executed_tool_calls: list[dict[str, Any]] = []
         self.last_user_tool_prompt_start: int | None = None
         self.last_user_tool_prompt_end: int | None = None
         self.last_user_tool_response_mask_start: int | None = None
@@ -165,13 +170,28 @@ class ToolAgentLoop(AgentLoopBase):
         multi_turn_config = self.rollout_config.multi_turn
         self.max_user_turns = multi_turn_config.max_user_turns
         self.max_assistant_turns = multi_turn_config.max_assistant_turns
+        self.max_assistant_tokens_per_turn = getattr(
+            multi_turn_config, "max_assistant_tokens_per_turn", None
+        )
+        if self.max_assistant_tokens_per_turn is not None:
+            self.max_assistant_tokens_per_turn = int(self.max_assistant_tokens_per_turn)
+            if self.max_assistant_tokens_per_turn <= 0:
+                raise ValueError("multi_turn.max_assistant_tokens_per_turn must be positive or null")
         self.max_parallel_calls = multi_turn_config.max_parallel_calls
         self.max_tool_response_length = multi_turn_config.max_tool_response_length
         # Per-turn generation cap (ported from tmp/training-files-main): clamp each turn's max_tokens.
         self.max_assistant_response_length = getattr(multi_turn_config, "max_assistant_response_length", None)
         self.tool_response_truncate_side = multi_turn_config.tool_response_truncate_side
         self.force_tool_calls_until_final_turn = getattr(multi_turn_config, "force_tool_calls_until_final_turn", False)
+        self.force_answer_on_final_turn = getattr(multi_turn_config, "force_answer_on_final_turn", False)
+        self.force_answer_on_final_turn_validation = getattr(
+            multi_turn_config, "force_answer_on_final_turn_validation", None
+        )
         self.final_answer_token_margin = getattr(multi_turn_config, "final_answer_token_margin", 2048)
+        self.force_final_answer_think_prefill = getattr(multi_turn_config, "force_final_answer_think_prefill", "")
+        self.force_final_answer_think_prefill_trainable = bool(
+            getattr(multi_turn_config, "force_final_answer_think_prefill_trainable", False)
+        )
         self.force_final_answer_prefix = getattr(multi_turn_config, "force_final_answer_prefix", "")
         self.tool_response_turn_suffix_enabled = getattr(multi_turn_config, "tool_response_turn_suffix_enabled", False)
         self.tool_response_explore_turns = getattr(multi_turn_config, "tool_response_explore_turns", 10)
@@ -179,6 +199,9 @@ class ToolAgentLoop(AgentLoopBase):
         self.tool_response_final_suffix = getattr(multi_turn_config, "tool_response_final_suffix", "")
         self.conditional_answer_retry_enabled = getattr(
             multi_turn_config, "conditional_answer_retry_enabled", False
+        )
+        self.conditional_answer_retry_enable_validation = bool(
+            getattr(multi_turn_config, "conditional_answer_retry_enable_validation", True)
         )
         self.conditional_answer_retry_force_next_tool_call = getattr(
             multi_turn_config, "conditional_answer_retry_force_next_tool_call", True
@@ -196,11 +219,52 @@ class ToolAgentLoop(AgentLoopBase):
         self.conditional_answer_retry_assistant_prefill = getattr(
             multi_turn_config, "conditional_answer_retry_assistant_prefill", ""
         )
+        self.conditional_answer_retry_assistant_prefill_trainable = bool(
+            getattr(multi_turn_config, "conditional_answer_retry_assistant_prefill_trainable", False)
+        )
+        self.conditional_answer_retry_teacher_only_prefill = bool(
+            getattr(multi_turn_config, "conditional_answer_retry_teacher_only_prefill", False)
+        )
+        self.conditional_answer_retry_sft_enabled = bool(
+            getattr(multi_turn_config, "conditional_answer_retry_sft_enabled", False)
+        )
+        self.conditional_answer_retry_sft_target_selection = str(
+            getattr(multi_turn_config, "conditional_answer_retry_sft_target_selection", "all")
+        )
+        if self.conditional_answer_retry_sft_target_selection not in {"all", "first", "last"}:
+            raise ValueError(
+                "conditional_answer_retry_sft_target_selection must be one of 'all', 'first', or 'last'"
+            )
+        if self.conditional_answer_retry_teacher_only_prefill:
+            if not self.conditional_answer_retry_assistant_prefill:
+                raise ValueError("teacher-only retry prefill requires a nonempty assistant prefill")
+            if self.conditional_answer_retry_assistant_prefill_trainable:
+                raise ValueError("teacher-only retry prefill is incompatible with trainable injected prefills")
+        if self.conditional_answer_retry_sft_enabled and not self.conditional_answer_retry_teacher_only_prefill:
+            raise ValueError("retry SFT requires conditional_answer_retry_teacher_only_prefill=true")
         self.conditional_answer_retry_correct_accuracy_threshold = getattr(
             multi_turn_config, "conditional_answer_retry_correct_accuracy_threshold", 0.0
         )
         self.conditional_answer_retry_max_retries = getattr(
             multi_turn_config, "conditional_answer_retry_max_retries", None
+        )
+        self.conditional_answer_retry_branch_enabled = getattr(
+            multi_turn_config, "conditional_answer_retry_branch_enabled", False
+        )
+        self.conditional_answer_retry_branch_enable_validation = getattr(
+            multi_turn_config, "conditional_answer_retry_branch_enable_validation", False
+        )
+        self.conditional_answer_retry_branch_mask_mode = getattr(
+            multi_turn_config, "conditional_answer_retry_branch_mask_mode", "divergence_only"
+        )
+        self.conditional_answer_retry_branch_reward_components = dict(
+            getattr(multi_turn_config, "conditional_answer_retry_branch_reward_components", {}) or {}
+        )
+        self.conditional_answer_retry_branch_use_graded_rewards = bool(
+            getattr(multi_turn_config, "conditional_answer_retry_branch_use_graded_rewards", False)
+        )
+        self.conditional_answer_retry_branch_baseline_weight_key = getattr(
+            multi_turn_config, "conditional_answer_retry_branch_baseline_weight_key", "gdpo_baseline_weight"
         )
         self.llm_judge_enabled = bool(getattr(multi_turn_config, "llm_judge_enabled", False))
         self.conditional_answer_retry_reward_fn = (
@@ -226,6 +290,26 @@ class ToolAgentLoop(AgentLoopBase):
         reward_kwargs = dict(reward_config.get("custom_reward_function", {}).get("reward_kwargs", {}))
         self.llm_judge_format_score = float(reward_kwargs.get("format_score", 0.5))
         self.llm_judge_tool_efficiency_score_weight = float(reward_kwargs.get("tool_efficiency_score_weight", 0.0))
+        self.allow_unboxed_answer_for_accuracy = bool(reward_kwargs.get("allow_unboxed_answer_for_accuracy", True))
+        self.tool_repeat_overlap_iou_threshold = float(
+            reward_kwargs.get("tool_repeat_overlap_iou_threshold", 0.9)
+        )
+        self.tool_repeat_overlap_small_crop_area_threshold = float(
+            reward_kwargs.get("tool_repeat_overlap_small_crop_area_threshold", 0.0002)
+        )
+        self.tool_repeat_overlap_free_depth_refinements = int(
+            reward_kwargs.get("tool_repeat_overlap_free_depth_refinements", 2)
+        )
+        self.tool_repeat_overlap_depth_containment_threshold = float(
+            reward_kwargs.get("tool_repeat_overlap_depth_containment_threshold", 0.95)
+        )
+        if bool(reward_kwargs.get("assistant_turn_overlong_enabled", False)):
+            reward_max_turns = reward_kwargs.get("assistant_turn_overlong_max_turns")
+            if reward_max_turns != self.max_assistant_turns:
+                raise ValueError(
+                    "assistant_turn_overlong_max_turns must match multi_turn.max_assistant_turns when enabled, "
+                    f"got {reward_max_turns!r} != {self.max_assistant_turns!r}."
+                )
         tool_config_path = multi_turn_config.tool_config_path
         tool_list = initialize_tools_from_config(tool_config_path) if tool_config_path else []
         self.tools = {tool.name: tool for tool in tool_list}
@@ -330,14 +414,15 @@ class ToolAgentLoop(AgentLoopBase):
         prompt_ids = agent_data.prompt_ids[: len(agent_data.prompt_ids) - len(agent_data.response_mask)]
         multi_modal_data = {}
         if agent_data.image_data is not None:
-            multi_modal_data["images"] = agent_data.image_data
+            multi_modal_data["images"] = list(agent_data.image_data)
         if agent_data.video_data is not None:
-            multi_modal_data["videos"] = agent_data.video_data
+            multi_modal_data["videos"] = list(agent_data.video_data)
 
         output: AgentLoopOutput = AgentLoopOutput(
             prompt_ids=prompt_ids,
             response_ids=response_ids[: self.response_length],
             response_mask=agent_data.response_mask[: self.response_length],
+            retry_sft_mask=agent_data.retry_sft_mask[: self.response_length],
             multi_modal_data=multi_modal_data,
             response_logprobs=agent_data.response_logprobs[: self.response_length]
             if agent_data.response_logprobs
@@ -347,18 +432,25 @@ class ToolAgentLoop(AgentLoopBase):
             routed_experts=agent_data.routed_experts,
             extra_fields={**TERMINAL_TOOL_EXTRA_FIELD_DEFAULTS, **agent_data.extra_fields},
         )
+        if self.conditional_answer_retry_branch_enabled:
+            output.extra_fields[self.conditional_answer_retry_branch_baseline_weight_key] = 1.0
+            output.extra_fields["is_conditional_answer_retry_branch"] = False
         output.extra_fields.update(
             {
                 "request_id": agent_data.request_id,
+                "assistant_turns": agent_data.assistant_turns,
                 "turn_scores": agent_data.turn_scores,
                 "tool_rewards": agent_data.tool_rewards,
                 CROP_IMAGE_REFS_KEY: agent_data.crop_image_refs,
+                "__agent_loop_retry_sft_candidates": list(agent_data.retry_sft_candidates),
+                "retry_sft_candidate_count": len(agent_data.retry_sft_candidates),
             }
         )
         final_grade = await self._maybe_score_final_with_llm_judge(agent_data, kwargs)
         if final_grade is not None:
             output.reward_score = float(final_grade.get("score", 0.0) or 0.0)
             output.extra_fields["reward_extra_info"] = final_grade
+        output.branch_outputs = agent_data.branch_outputs
         if debug_enabled:
             await self._debug_log_sample_final(output, agent_data, kwargs, debug_trajectory)
         return output
@@ -399,25 +491,13 @@ class ToolAgentLoop(AgentLoopBase):
         )
 
     def _with_forced_action_extra_args(self, sampling_params: dict[str, Any], required_tag: str) -> dict[str, Any]:
-        # The semantic tag passed to vLLM (and used for downstream validation) stays `required_tag`,
-        # but the actually-forced token sequence may extend past it. On the forced final turn we can
-        # additionally force a fixed answer prefix (e.g. "\n\\boxed{") right after the `<answer>` tag.
-        forced_text = f"\n{required_tag}"
-        if required_tag == "<answer>" and self.force_final_answer_prefix:
-            forced_text += self.force_final_answer_prefix
-        tag_ids = self.tokenizer.encode(forced_text, add_special_tokens=False)
-        if not tag_ids:
-            raise ValueError(f"required action tag encoded to no tokens: {required_tag}")
-
         extra_args = dict(sampling_params.get("extra_args") or {})
         extra_args.update(
-            {
-                FORCE_ACTION_REQUIRED_TAG_KEY: required_tag,
-                FORCE_ACTION_TAG_IDS_KEY: tag_ids,
-                FORCE_ACTION_AFTER_THINK_IDS_OPTIONS_KEY: [
-                    self.tokenizer.encode("</think>", add_special_tokens=False),
-                ],
-            }
+            build_forced_action_extra_args(
+                self.tokenizer,
+                required_tag,
+                forced_suffix=self.force_final_answer_prefix if required_tag == "<answer>" else "",
+            )
         )
         return {**sampling_params, "extra_args": extra_args}
 
@@ -429,6 +509,38 @@ class ToolAgentLoop(AgentLoopBase):
         if assistant_turn == self.tool_response_explore_turns:
             return self.tool_response_final_suffix or ""
         return ""
+
+    def _conditional_answer_retry_active(self, rollout_kwargs: Optional[dict[str, Any]]) -> bool:
+        if not getattr(self, "conditional_answer_retry_enabled", False):
+            return False
+        debug_trajectory = (rollout_kwargs or {}).get("_debug_trajectory", {}) or {}
+        is_validation = bool(debug_trajectory.get("validate"))
+        return not is_validation or getattr(self, "conditional_answer_retry_enable_validation", True)
+
+    def _force_answer_on_final_turn_active(self, rollout_kwargs: Optional[dict[str, Any]]) -> bool:
+        debug_trajectory = (rollout_kwargs or {}).get("_debug_trajectory", {}) or {}
+        if debug_trajectory.get("validate"):
+            validation_override = getattr(self, "force_answer_on_final_turn_validation", None)
+            if validation_override is not None:
+                return bool(validation_override)
+        return bool(getattr(self, "force_answer_on_final_turn", False))
+
+    def _with_assistant_turn_token_cap(
+        self,
+        sampling_params: dict[str, Any],
+        agent_data: AgentData,
+    ) -> dict[str, Any]:
+        turn_cap = getattr(self, "max_assistant_tokens_per_turn", None)
+        if turn_cap is None:
+            return sampling_params
+        remaining_budget = self.response_length - len(agent_data.response_mask)
+        if remaining_budget <= 0:
+            raise RuntimeError("assistant generation requested after the response budget was exhausted")
+        caps = [int(turn_cap), int(remaining_budget)]
+        existing_cap = sampling_params.get("max_tokens")
+        if existing_cap is not None:
+            caps.append(int(existing_cap))
+        return {**sampling_params, "max_tokens": min(caps)}
 
     @staticmethod
     def _append_text_suffix(text: str, suffix: str) -> str:
@@ -472,18 +584,34 @@ class ToolAgentLoop(AgentLoopBase):
         add_messages: list[dict[str, Any]] = []
         forced_required_tag: Optional[str] = None
         assistant_prefill_ids: list[int] = []
+        teacher_only_prefill_ids: list[int] = []
         generation_snapshot = self._snapshot_generation_state(agent_data)
 
         if self.force_tool_calls_until_final_turn:
             forced_required_tag = "<answer>" if self._must_answer_now(agent_data) else "<tool_call>"
             sampling_params = self._with_forced_action_extra_args(sampling_params, forced_required_tag)
-        elif getattr(self, "conditional_answer_retry_enabled", False) and agent_data.force_next_tool_call:
+        elif self._force_answer_on_final_turn_active(rollout_kwargs) and self._must_answer_now(agent_data):
+            forced_required_tag = "<answer>"
+            sampling_params = self._with_forced_action_extra_args(sampling_params, forced_required_tag)
+        elif self._conditional_answer_retry_active(rollout_kwargs) and agent_data.force_next_tool_call:
             forced_required_tag = "<tool_call>"
             sampling_params = self._with_forced_action_extra_args(sampling_params, forced_required_tag)
-            assistant_prefill_ids = self._append_conditional_retry_assistant_prefill(agent_data)
+            if getattr(self, "conditional_answer_retry_teacher_only_prefill", False):
+                teacher_only_prefill_ids = self.tokenizer.encode(
+                    self.conditional_answer_retry_assistant_prefill,
+                    add_special_tokens=False,
+                )
+                if not teacher_only_prefill_ids:
+                    raise ValueError("teacher-only retry prefill encoded to an empty token sequence")
+            else:
+                assistant_prefill_ids = self._append_conditional_retry_assistant_prefill(agent_data)
             agent_data.force_next_tool_call = False
+        if forced_required_tag == "<answer>":
+            assistant_prefill_ids = self._append_force_final_answer_think_prefill(agent_data)
+        sampling_params = self._with_assistant_turn_token_cap(sampling_params, agent_data)
 
         with simple_timer("generate_sequences", agent_data.metrics):
+            generation_prompt_ids = agent_data.prompt_ids + teacher_only_prefill_ids
             # Per-turn response cap (ported from tmp/training-files-main): clamp this turn's max_tokens
             # to max_assistant_response_length so a single turn can't run out to the full response_length.
             # Copy first so the forced-action extra args set above are preserved.
@@ -497,7 +625,7 @@ class ToolAgentLoop(AgentLoopBase):
                 )
             output: TokenOutput = await self.server_manager.generate(
                 request_id=agent_data.request_id,
-                prompt_ids=agent_data.prompt_ids,
+                prompt_ids=generation_prompt_ids,
                 sampling_params=turn_sampling_params,
                 image_data=agent_data.image_data,
                 video_data=agent_data.video_data,
@@ -519,12 +647,18 @@ class ToolAgentLoop(AgentLoopBase):
 
         agent_data.assistant_turns += 1
         agent_data.response_ids = output.token_ids
+        response_start = len(agent_data.response_mask)
         agent_data.prompt_ids += agent_data.response_ids
-        agent_data.response_mask += [1] * len(agent_data.response_ids)
+        is_teacher_retry_turn = bool(teacher_only_prefill_ids)
+        agent_data.response_mask += [0 if is_teacher_retry_turn else 1] * len(agent_data.response_ids)
+        agent_data.retry_sft_mask += [0] * len(agent_data.response_ids)
         if output.log_probs:
             if assistant_prefill_ids:
                 agent_data.response_logprobs += [0.0] * len(assistant_prefill_ids)
-            agent_data.response_logprobs += output.log_probs
+            if is_teacher_retry_turn:
+                agent_data.response_logprobs += [0.0] * len(agent_data.response_ids)
+            else:
+                agent_data.response_logprobs += output.log_probs
 
         if output.routed_experts is not None:
             agent_data.routed_experts = output.routed_experts
@@ -533,7 +667,8 @@ class ToolAgentLoop(AgentLoopBase):
             assistant_message = await self.loop.run_in_executor(
                 None,
                 lambda: self.tokenizer.decode(
-                    assistant_prefill_ids + agent_data.response_ids, skip_special_tokens=True
+                    assistant_prefill_ids + teacher_only_prefill_ids + agent_data.response_ids,
+                    skip_special_tokens=True,
                 ),
             )
             assistant_message = apply_response_display_prefix(assistant_message, self.response_display_prefix)
@@ -543,13 +678,32 @@ class ToolAgentLoop(AgentLoopBase):
                 "assistant_turn": agent_data.assistant_turns,
                 "text": assistant_message,
                 "num_tokens": len(agent_data.response_ids),
+                "teacher_only_prefill": bool(teacher_only_prefill_ids),
             }
+            if teacher_only_prefill_ids:
+                event["teacher_prompt_text"] = self.tokenizer.decode(
+                    generation_prompt_ids, skip_special_tokens=True
+                )
+                event["teacher_prompt_suffix"] = self.tokenizer.decode(
+                    teacher_only_prefill_ids, skip_special_tokens=True
+                )
+                event["stored_student_turn"] = apply_response_display_prefix(
+                    self.tokenizer.decode(agent_data.response_ids, skip_special_tokens=True),
+                    self.response_display_prefix,
+                )
             agent_data.debug_events.append(event)
             self._debug_append_event(event)
 
         # Extract tool calls before termination checks so forced final turns can be validated.
         tools = [tool.tool_schema for tool in self.tools.values()]
         _, agent_data.tool_calls = await self.tool_parser.extract_tool_calls(agent_data.response_ids, tools)
+
+        if is_teacher_retry_turn:
+            self._record_retry_sft_candidate(
+                agent_data=agent_data,
+                response_start=response_start,
+                response_end=len(agent_data.response_mask),
+            )
 
         if forced_required_tag == "<tool_call>" and not agent_data.tool_calls:
             self._mark_forced_structure_error(agent_data, "missing_tool_call")
@@ -564,7 +718,7 @@ class ToolAgentLoop(AgentLoopBase):
                 return AgentState.TERMINATED
 
         if (
-            getattr(self, "conditional_answer_retry_enabled", False)
+            self._conditional_answer_retry_active(rollout_kwargs)
             and not agent_data.tool_calls
             and rollout_kwargs is not None
         ):
@@ -609,6 +763,27 @@ class ToolAgentLoop(AgentLoopBase):
 
     def _append_conditional_retry_assistant_prefill(self, agent_data: AgentData) -> list[int]:
         prefill = self.conditional_answer_retry_assistant_prefill or ""
+        return self._append_assistant_prefill(
+            agent_data,
+            prefill,
+            trainable=self.conditional_answer_retry_assistant_prefill_trainable,
+        )
+
+    def _append_force_final_answer_think_prefill(self, agent_data: AgentData) -> list[int]:
+        prefill = self.force_final_answer_think_prefill or ""
+        return self._append_assistant_prefill(
+            agent_data,
+            prefill,
+            trainable=self.force_final_answer_think_prefill_trainable,
+        )
+
+    def _append_assistant_prefill(
+        self,
+        agent_data: AgentData,
+        prefill: str,
+        *,
+        trainable: bool,
+    ) -> list[int]:
         if not prefill:
             return []
         prefill_ids = self.tokenizer.encode(prefill, add_special_tokens=False)
@@ -617,13 +792,102 @@ class ToolAgentLoop(AgentLoopBase):
         if len(agent_data.response_mask) + len(prefill_ids) >= self.response_length:
             return []
         agent_data.prompt_ids += prefill_ids
-        agent_data.response_mask += [0] * len(prefill_ids)
+        # Trainable prefills are counterfactual, teacher-forced actions. Their rollout
+        # log-probability placeholders remain zero for alignment, so configurations
+        # enabling them must recompute old-policy likelihoods rather than use rollout IS.
+        agent_data.response_mask += [int(trainable)] * len(prefill_ids)
+        agent_data.retry_sft_mask += [0] * len(prefill_ids)
         return prefill_ids
+
+    @staticmethod
+    def _tool_call_as_reward_dict(tool_call: FunctionCall) -> dict[str, Any] | None:
+        arguments = tool_call.arguments
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except json.JSONDecodeError:
+                return None
+        if not isinstance(arguments, dict):
+            return None
+        return {"name": tool_call.name, "arguments": arguments}
+
+    def _record_retry_sft_candidate(
+        self,
+        *,
+        agent_data: AgentData,
+        response_start: int,
+        response_end: int,
+    ) -> None:
+        suffix_text = self.tokenizer.decode(agent_data.response_ids, skip_special_tokens=True)
+        standalone_text = apply_response_display_prefix(
+            suffix_text,
+            self.response_display_prefix or "<think>\n",
+        )
+        match = re.fullmatch(
+            r"\s*<think>(?P<think>.*?)</think>\s*<tool_call>(?P<tool_call>.*?)</tool_call>\s*",
+            standalone_text,
+            flags=re.DOTALL,
+        )
+        think_nonempty = bool(match and match.group("think").strip())
+        format_valid = False
+        parsed_payload: dict[str, Any] | None = None
+        if match is not None:
+            payload = _parse_tool_call_payload(match.group("tool_call"))
+            if payload is not None and not _contains_reserved_tag(match.group("think")):
+                parsed_payload = payload
+                format_valid = think_nonempty and len(agent_data.tool_calls) == 1
+
+        parsed_tool_call = (
+            self._tool_call_as_reward_dict(agent_data.tool_calls[0])
+            if len(agent_data.tool_calls) == 1
+            else None
+        )
+        tool_matches_text = parsed_payload is not None and parsed_payload == parsed_tool_call
+        tool_history = list(agent_data.executed_tool_calls)
+        if parsed_tool_call is not None:
+            tool_history.append(parsed_tool_call)
+        diagnostics = tool_repeat_overlap_call_diagnostics(
+            tool_history,
+            iou_threshold=self.tool_repeat_overlap_iou_threshold,
+            small_crop_area_threshold=self.tool_repeat_overlap_small_crop_area_threshold,
+            free_depth_refinements=self.tool_repeat_overlap_free_depth_refinements,
+            depth_containment_threshold=self.tool_repeat_overlap_depth_containment_threshold,
+        )
+        current_diagnostics = diagnostics[-1] if parsed_tool_call is not None and diagnostics else {"valid": False}
+        rejected_grade = agent_data.extra_fields.get("conditional_answer_retry_last_grade")
+        rejected_accuracy = rejected_grade.get("accuracy") if isinstance(rejected_grade, dict) else None
+        static_reasons = []
+        if not format_valid or not tool_matches_text:
+            static_reasons.append("invalid_format")
+        if not think_nonempty:
+            static_reasons.append("empty_think")
+        if not bool(current_diagnostics.get("valid")):
+            static_reasons.append("invalid_coordinate")
+        if bool(current_diagnostics.get("is_repeat")):
+            static_reasons.append("repeat")
+        if bool(current_diagnostics.get("is_small_crop")):
+            static_reasons.append("small_crop")
+        if bool(current_diagnostics.get("is_excess_depth")):
+            static_reasons.append("excess_depth")
+
+        agent_data.retry_sft_candidates.append(
+            {
+                "assistant_turn": agent_data.assistant_turns,
+                "response_start": response_start,
+                "response_end": response_end,
+                "rejected_accuracy": rejected_accuracy,
+                "static_rejection_reasons": static_reasons,
+                "tool_executed_successfully": False,
+                "tool_call": parsed_tool_call,
+                "crop_diagnostics": current_diagnostics,
+            }
+        )
 
     def _snapshot_generation_state(self, agent_data: AgentData) -> dict[str, Any]:
         return {
             "prompt_ids_len": len(agent_data.prompt_ids),
             "response_mask_len": len(agent_data.response_mask),
+            "retry_sft_mask_len": len(agent_data.retry_sft_mask),
             "response_logprobs_len": len(agent_data.response_logprobs),
             "assistant_turns": agent_data.assistant_turns,
             "extra_fields": dict(agent_data.extra_fields),
@@ -634,6 +898,7 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.prompt_ids = agent_data.prompt_ids[: snapshot["prompt_ids_len"]]
         agent_data.response_ids = []
         agent_data.response_mask = agent_data.response_mask[: snapshot["response_mask_len"]]
+        agent_data.retry_sft_mask = agent_data.retry_sft_mask[: snapshot["retry_sft_mask_len"]]
         agent_data.response_logprobs = agent_data.response_logprobs[: snapshot["response_logprobs_len"]]
         agent_data.assistant_turns = snapshot["assistant_turns"]
         agent_data.tool_calls = []
@@ -665,6 +930,14 @@ class ToolAgentLoop(AgentLoopBase):
             self._log_incorrect_answer_retry_skipped(agent_data, grade, retry_count, skipped_reason)
             return None
 
+        self._maybe_append_wrong_answer_branch(
+            agent_data=agent_data,
+            generation_snapshot=generation_snapshot,
+            grade=grade,
+            retry_count=retry_count + 1,
+            removed_assistant_text=assistant_message,
+            rollout_kwargs=rollout_kwargs,
+        )
         self._rollback_generation_state(agent_data, generation_snapshot)
         retry_count += 1
         suffix = self.conditional_answer_retry_suffix or ""
@@ -686,6 +959,90 @@ class ToolAgentLoop(AgentLoopBase):
         if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
             return AgentState.TERMINATED
         return AgentState.GENERATING
+
+    def _maybe_append_wrong_answer_branch(
+        self,
+        agent_data: AgentData,
+        generation_snapshot: dict[str, Any],
+        grade: dict[str, Any],
+        retry_count: int,
+        removed_assistant_text: str,
+        rollout_kwargs: dict[str, Any],
+    ) -> None:
+        if not self.conditional_answer_retry_branch_enabled:
+            return
+        debug_trajectory = rollout_kwargs.get("_debug_trajectory", {}) or {}
+        if debug_trajectory.get("validate") and not self.conditional_answer_retry_branch_enable_validation:
+            return
+        if self.conditional_answer_retry_branch_mask_mode != "divergence_only":
+            raise ValueError(
+                "conditional_answer_retry_branch_mask_mode only supports 'divergence_only', "
+                f"got {self.conditional_answer_retry_branch_mask_mode!r}"
+            )
+
+        divergence_start = int(generation_snapshot["response_mask_len"])
+        response_ids = agent_data.prompt_ids[-len(agent_data.response_mask) :] if agent_data.response_mask else []
+        prompt_ids = agent_data.prompt_ids[: len(agent_data.prompt_ids) - len(agent_data.response_mask)]
+        branch_response_mask = [
+            int(mask) if idx >= divergence_start else 0 for idx, mask in enumerate(agent_data.response_mask)
+        ]
+        branch_response_mask = branch_response_mask[: len(response_ids)]
+
+        branch_logprobs = None
+        if agent_data.response_logprobs:
+            branch_logprobs = list(agent_data.response_logprobs[: len(response_ids)])
+
+        multi_modal_data = {}
+        if agent_data.image_data is not None:
+            multi_modal_data["images"] = list(agent_data.image_data)
+        if agent_data.video_data is not None:
+            multi_modal_data["videos"] = list(agent_data.video_data)
+
+        reward_extra_info = self._branch_reward_extra_info(grade)
+        baseline_key = self.conditional_answer_retry_branch_baseline_weight_key
+        branch_output = AgentLoopOutput(
+            prompt_ids=prompt_ids,
+            response_ids=response_ids[: self.response_length],
+            response_mask=branch_response_mask[: self.response_length],
+            retry_sft_mask=[0] * min(len(response_ids), self.response_length),
+            multi_modal_data=multi_modal_data,
+            response_logprobs=branch_logprobs[: self.response_length] if branch_logprobs else None,
+            reward_score=float(reward_extra_info.get("score", 0.0) or 0.0),
+            num_turns=agent_data.user_turns + agent_data.assistant_turns + 1,
+            metrics=AgentLoopMetrics(),
+            routed_experts=None,
+            extra_fields={
+                **TERMINAL_TOOL_EXTRA_FIELD_DEFAULTS,
+                "request_id": agent_data.request_id,
+                "assistant_turns": agent_data.assistant_turns,
+                "is_conditional_answer_retry_branch": True,
+                baseline_key: 0.0,
+                "conditional_answer_retry_branch_mask_mode": self.conditional_answer_retry_branch_mask_mode,
+                "conditional_answer_retry_branch_retry_count": retry_count,
+                "conditional_answer_retry_branch_grade": grade,
+                "conditional_answer_retry_branch_removed_assistant_text": removed_assistant_text,
+                "conditional_answer_retry_count": retry_count,
+                "conditional_answer_retry_last_grade": grade,
+                "conditional_answer_retry_skipped_reason": None,
+                "reward_extra_info": reward_extra_info,
+                "turn_scores": list(agent_data.turn_scores),
+                "tool_rewards": list(agent_data.tool_rewards),
+                CROP_IMAGE_REFS_KEY: list(agent_data.crop_image_refs),
+            },
+        )
+        agent_data.branch_outputs.append(branch_output)
+
+    def _branch_reward_extra_info(self, grade: dict[str, Any]) -> dict[str, Any]:
+        reward_extra_info = dict(grade) if isinstance(grade, dict) else {}
+        if self.conditional_answer_retry_branch_use_graded_rewards:
+            return reward_extra_info
+
+        reward_extra_info["score"] = 0.0
+        for key in ("accuracy", "format", "tool_repeat_overlap"):
+            reward_extra_info[key] = 0.0
+        for key, value in self.conditional_answer_retry_branch_reward_components.items():
+            reward_extra_info[str(key)] = float(value)
+        return reward_extra_info
 
     async def _grade_current_response(self, agent_data: AgentData, rollout_kwargs: dict[str, Any]) -> dict[str, Any]:
         if self.conditional_answer_retry_reward_fn is None:
@@ -722,6 +1079,11 @@ class ToolAgentLoop(AgentLoopBase):
             rollout_kwargs=rollout_kwargs,
             use_llm_judge=True,
         )
+        if getattr(self, "conditional_answer_retry_sft_enabled", False):
+            # Retry-SFT eligibility is finalized during agent-loop postprocessing,
+            # before trainer-side reward extraction. Return the ordinary base grade
+            # for non-judge domains as well so final accuracy is available there.
+            return grade
         if grade.get("llm_judge_used"):
             return grade
         if grade.get("llm_judge_error") and not getattr(self, "llm_judge_fallback_to_string_reward", True):
@@ -737,7 +1099,9 @@ class ToolAgentLoop(AgentLoopBase):
     ) -> dict[str, Any]:
         reward_model = rollout_kwargs.get("reward_model") or {}
         ground_truth = reward_model.get("ground_truth") if isinstance(reward_model, dict) else None
-        extra_info = rollout_kwargs.get("extra_info")
+        raw_extra_info = rollout_kwargs.get("extra_info")
+        extra_info = dict(raw_extra_info) if isinstance(raw_extra_info, dict) else {}
+        extra_info["assistant_turns"] = agent_data.assistant_turns
         base_result = self.conditional_answer_retry_reward_fn(
             data_source=rollout_kwargs.get("data_source", "unknown"),
             solution_str=solution_str,
@@ -796,13 +1160,19 @@ class ToolAgentLoop(AgentLoopBase):
         if not getattr(self, "llm_judge_prompt_template", None):
             return {"llm_judge_used": False, "llm_judge_error": "missing_prompt_template"}
 
-        is_valid, final_answer_text, _ = _parse_multiturn_tool_calling_output(solution_str)
+        is_valid, final_answer_text, _, _ = _parse_multiturn_tool_calling_output(solution_str)
         if not is_valid or not final_answer_text:
+            if "<answer>" in str(solution_str) and "</answer>" in str(solution_str):
+                return {"llm_judge_used": False, "llm_judge_error": "missing_final_answer"}
             return {"llm_judge_used": False, "llm_judge_error": "invalid_trajectory_format"}
 
         reward_type = _extract_reward_type(extra_info)
-        final_answer = _extract_reward_answer(final_answer_text, reward_type)
-        if final_answer is None:
+        answer_info = extract_answer_for_accuracy(
+            final_answer_text,
+            reward_type,
+            allow_unboxed_answer_for_accuracy=getattr(self, "allow_unboxed_answer_for_accuracy", True),
+        )
+        if answer_info.prediction is None:
             return {"llm_judge_used": False, "llm_judge_error": "missing_final_answer"}
 
         question = self._extract_llm_judge_question(agent_data, extra_info)
@@ -812,7 +1182,7 @@ class ToolAgentLoop(AgentLoopBase):
         judge_prompt = self._format_llm_judge_prompt(
             question=question,
             reference=str(ground_truth).strip(),
-            prediction=str(final_answer).strip(),
+            prediction=str(answer_info.prediction).strip(),
         )
         prompt_ids = self._encode_llm_judge_prompt(judge_prompt)
         sampling_params = {
@@ -856,6 +1226,8 @@ class ToolAgentLoop(AgentLoopBase):
             "llm_judge_partial_credit": partial_credit,
             "llm_judge_accuracy": accuracy,
             "llm_judge_error": None,
+            "answer_has_boxed": answer_info.has_boxed,
+            "answer_used_unboxed_fallback": answer_info.used_unboxed_fallback,
         }
 
     def _format_llm_judge_prompt(self, question: str, reference: str, prediction: str) -> str:
@@ -1049,6 +1421,7 @@ class ToolAgentLoop(AgentLoopBase):
             )
             agent_data.prompt_ids = prompt_ids
             agent_data.response_mask = []
+            agent_data.retry_sft_mask = []
             agent_data.response_logprobs = []
             self._record_last_user_tool_prompt_block(
                 agent_data=agent_data,
@@ -1087,6 +1460,11 @@ class ToolAgentLoop(AgentLoopBase):
                 agent_data.response_mask[:mask_start]
                 + [0] * len(replacement_ids)
                 + agent_data.response_mask[mask_end:]
+            )
+            agent_data.retry_sft_mask = (
+                agent_data.retry_sft_mask[:mask_start]
+                + [0] * len(replacement_ids)
+                + agent_data.retry_sft_mask[mask_end:]
             )
         if agent_data.response_logprobs and logprobs_end > logprobs_start:
             agent_data.response_logprobs = (
@@ -1212,10 +1590,26 @@ class ToolAgentLoop(AgentLoopBase):
             )
             agent_data.prompt_ids += response_ids
             agent_data.response_mask += [0] * len(response_ids)
+            agent_data.retry_sft_mask += [0] * len(response_ids)
             if agent_data.response_logprobs:
                 agent_data.response_logprobs += [0.0] * len(response_ids)
             agent_data.user_turns += 1
             return AgentState.TERMINATED
+
+        successful_calls = [
+            self._tool_call_as_reward_dict(tool_call)
+            for tool_call, (tool_response, _, _) in zip(active_tool_calls, responses, strict=False)
+            if not tool_response.terminate
+        ]
+        successful_calls = [call for call in successful_calls if call is not None]
+        agent_data.executed_tool_calls.extend(successful_calls)
+        for candidate in reversed(agent_data.retry_sft_candidates):
+            if candidate.get("assistant_turn") != agent_data.assistant_turns:
+                continue
+            candidate["tool_executed_successfully"] = (
+                len(successful_calls) == 1 and successful_calls[0] == candidate.get("tool_call")
+            )
+            break
 
         # Process tool responses and update multi_modal_data
         # Removed: agent_data.new_images_this_turn = []
@@ -1355,6 +1749,7 @@ class ToolAgentLoop(AgentLoopBase):
         logprobs_start = len(agent_data.response_logprobs)
         agent_data.prompt_ids += response_ids
         agent_data.response_mask += [0] * len(response_ids)
+        agent_data.retry_sft_mask += [0] * len(response_ids)
         if agent_data.response_logprobs:
             agent_data.response_logprobs += [0.0] * len(response_ids)
         agent_data.user_turns += 1
@@ -1399,6 +1794,7 @@ class ToolAgentLoop(AgentLoopBase):
         # Update prompt_ids and response_mask
         agent_data.prompt_ids += response_ids
         agent_data.response_mask += [0] * len(response_ids)
+        agent_data.retry_sft_mask += [0] * len(response_ids)
         if agent_data.response_logprobs:
             agent_data.response_logprobs += [0.0] * len(response_ids)
 
@@ -1594,6 +1990,20 @@ class ToolAgentLoop(AgentLoopBase):
             "num_turns": output.num_turns,
             "turn_scores": agent_data.turn_scores,
             "tool_rewards": agent_data.tool_rewards,
+            "conditional_answer_retry_branch_outputs": [
+                {
+                    "response_tokens": len(branch.response_ids),
+                    "masked_tokens": int(sum(branch.response_mask)),
+                    "is_conditional_answer_retry_branch": branch.extra_fields.get(
+                        "is_conditional_answer_retry_branch"
+                    ),
+                    self.conditional_answer_retry_branch_baseline_weight_key: branch.extra_fields.get(
+                        self.conditional_answer_retry_branch_baseline_weight_key
+                    ),
+                    "reward_extra_info": branch.extra_fields.get("reward_extra_info"),
+                }
+                for branch in (output.branch_outputs or [])
+            ],
             "debug_events": agent_data.debug_events,
             "metrics": output.metrics.model_dump(),
         }

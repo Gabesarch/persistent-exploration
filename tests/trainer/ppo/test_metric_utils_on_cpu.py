@@ -296,6 +296,7 @@ class TestComputeDataMetrics(unittest.TestCase):
         """Set up common test data."""
         # Create a mock DataProto object
         self.batch = MagicMock()
+        self.batch.meta_info = {}
         self.batch.batch = {
             "token_level_scores": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
             "token_level_rewards": torch.tensor([[0.5, 1.0], [1.5, 2.0]]),
@@ -348,6 +349,17 @@ class TestComputeDataMetrics(unittest.TestCase):
         self.assertIn("critic/score/mean", metrics)
         self.assertIn("critic/rewards/mean", metrics)
         self.assertIn("response_length/mean", metrics)
+
+    def test_compute_data_metrics_includes_gdpo_stability_metadata(self):
+        self.batch.meta_info["gdpo_stability_metrics"] = {
+            "gdpo/stability/final_max_abs": 1.25,
+            "gdpo/stability/final_low_variance_fallback": 1.0,
+        }
+
+        metrics = compute_data_metrics(self.batch, use_critic=False)
+
+        self.assertEqual(metrics["gdpo/stability/final_max_abs"], 1.25)
+        self.assertEqual(metrics["gdpo/stability/final_low_variance_fallback"], 1.0)
 
 
 class TestComputeTimingMetrics(unittest.TestCase):
@@ -541,6 +553,22 @@ class TestProcessValidationMetrics(unittest.TestCase):
 
         # For bootstrap with n=2, the majority vote could be either A or B
         # depending on the random sampling, so we don't check the exact value
+
+    def test_process_validation_metrics_ignores_missing_optional_values(self):
+        """Test process_validation_metrics skips None placeholders from sparse optional metadata."""
+        data_sources = ["source1", "source1", "source1"]
+        sample_inputs = ["prompt1", "prompt1", "prompt1"]
+        infos_dict = {
+            "score": [0.8, 0.9, 0.7],
+            "llm_judge_used": [True, None, False],
+            "llm_judge_raw_response": ['{"ok": true}', None, '{"ok": false}'],
+        }
+
+        result = process_validation_metrics(data_sources, sample_inputs, infos_dict, seed=42)
+
+        self.assertIn("llm_judge_used", result["source1"])
+        self.assertAlmostEqual(result["source1"]["llm_judge_used"]["mean@2"], 0.5)
+        self.assertNotIn("llm_judge_raw_response", result["source1"])
 
 
 if __name__ == "__main__":

@@ -73,6 +73,24 @@ algorithm:
   # Whether to normalize advantages by std (specific to GRPO)
   norm_adv_by_std_in_grpo: True
 
+  # Optional non-tensor key selecting rows that contribute to GDPO group baseline statistics
+  gdpo_baseline_weight_key: null
+
+  # Opt-in branch-safe GDPO normalization. Disabled to preserve legacy GDPO behavior.
+  gdpo_stability_enabled: false
+
+  # Below this canonical component std, use the raw centered reward difference.
+  gdpo_component_std_floor: 0.05
+
+  # Optional absolute bound on each response-level component advantage.
+  gdpo_component_adv_clip: 5.0
+
+  # Below this canonical aggregate std, mean-center without final std division.
+  gdpo_final_std_floor: 0.05
+
+  # Optional absolute bound on the final response-level advantage.
+  gdpo_final_adv_clip: 10.0
+
   # Whether to enable in-reward KL penalty
   use_kl_in_reward: False
 
@@ -182,6 +200,10 @@ trainer:
 
   # Path to resume training from (only used when resume_mode is "resume_path")
   resume_from_path: null
+
+  # Fallback checkpoint used by "auto" only when default_local_dir has no checkpoint.
+  # Once the destination saves a checkpoint, that newer destination checkpoint wins.
+  bootstrap_from_path: null
 
   # Whether to run validation before training begins
   val_before_train: True

@@ -7,9 +7,10 @@
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=968G
 #SBATCH --time=24:00:00
-#SBATCH --array=1-2%1
+#SBATCH --array=1-10%1
 #SBATCH --output=slurm/output/%x_%j.log
 #SBATCH --error=slurm/error/%x_%j.log
+#SBATCH --dependency=afterany:10636856_10
 
 ##SBATCH --job-name=crop_hard
 ##SBATCH --partition=gpu-test
@@ -41,13 +42,11 @@ if [ "$#" -gt 0 ] && [[ "$1" != -* ]]; then
   shift
 fi
 HYDRA_ARGS=("$@")
-DEFAULT_ANSWER_RETRY_ASSISTANT_PREFILL="Let's see, I do not have enough information to answer and need to continue exploring with additional tool calls."
-ANSWER_RETRY_ASSISTANT_PREFILL="${ANSWER_RETRY_ASSISTANT_PREFILL:-$DEFAULT_ANSWER_RETRY_ASSISTANT_PREFILL}"
-export ANSWER_RETRY_ASSISTANT_PREFILL
 
 CHECKPOINT_DATE_TIME="${CHECKPOINT_DATE_TIME:-20260524_160610}"
 RUN_UNIQUE_ID="${RUN_UNIQUE_ID:-${SLURM_JOB_ID:-pid_$$}}"
 NUM_GPUS="${NUM_GPUS:-${SLURM_GPUS_ON_NODE:-8}}"
+PPO_MAX_TOKEN_LEN_PER_GPU="${PPO_MAX_TOKEN_LEN_PER_GPU:-40960}"
 
 ALGORITHM_TAG="${ALGORITHM_TAG:-GDPO_HDPOtool_GSPO_fp16_math_verify}"
 TRAINER_EXPERIMENT_SUFFIX="${TRAINER_EXPERIMENT_SUFFIX:-qwen3vl_visual_probe_cropzoom_gdpo_hdpotool_hardonly_answer_retry_llmjudge_forcedprefill}"
@@ -115,9 +114,9 @@ has_hydra_override() {
   return 1
 }
 
-if ! has_hydra_override "actor_rollout_ref.rollout.multi_turn.conditional_answer_retry_assistant_prefill"; then
+if ! has_hydra_override "actor_rollout_ref.actor.ppo_max_token_len_per_gpu"; then
   HYDRA_ARGS=(
-    'actor_rollout_ref.rollout.multi_turn.conditional_answer_retry_assistant_prefill=${oc.env:ANSWER_RETRY_ASSISTANT_PREFILL}'
+    "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=$PPO_MAX_TOKEN_LEN_PER_GPU"
     "${HYDRA_ARGS[@]}"
   )
 fi
@@ -130,7 +129,7 @@ echo "TRAINER_EXPERIMENT_NAME=$TRAINER_EXPERIMENT_NAME"
 echo "CHECKPOINT_EXPERIMENT_NAME=$CHECKPOINT_EXPERIMENT_NAME"
 echo "TRAINER_DEFAULT_LOCAL_DIR=$TRAINER_DEFAULT_LOCAL_DIR"
 echo "LEGACY_CHECKPOINT_DIR_LINKED=$LEGACY_CHECKPOINT_DIR_LINKED"
-echo "ANSWER_RETRY_ASSISTANT_PREFILL=$ANSWER_RETRY_ASSISTANT_PREFILL"
+echo "PPO_MAX_TOKEN_LEN_PER_GPU=$PPO_MAX_TOKEN_LEN_PER_GPU"
 echo "LLM_JUDGE_PROMPT=${VERL_ROOT}/vero2_scripts/prompts/llm_judge_visual_search_prompt.txt"
 echo "LLM_JUDGE_ASSISTANT_PREFILL={"
 echo "LLM_JUDGE_MAX_TOKENS=48"
@@ -144,4 +143,5 @@ python3 -m verl.trainer.main_ppo \
   trainer.default_local_dir="$TRAINER_DEFAULT_LOCAL_DIR" \
   trainer.n_gpus_per_node="$NUM_GPUS" \
   actor_rollout_ref.actor.fsdp_config.fsdp_size="$NUM_GPUS" \
+  +prefill=answer_retry_final \
   "${HYDRA_ARGS[@]}"

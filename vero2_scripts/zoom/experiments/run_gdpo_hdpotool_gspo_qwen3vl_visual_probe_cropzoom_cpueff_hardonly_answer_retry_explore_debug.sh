@@ -80,9 +80,6 @@ case "${VERO2_COMPREHENSIVE_DEBUG_LOGGING:-1}" in
 esac
 RUN_ANSWER_RETRY_SMOKE_CHECK="${RUN_ANSWER_RETRY_SMOKE_CHECK:-1}"
 ANSWER_RETRY_SUFFIX="You have not gathered enough information yet. In your next turn, keep exploring rather than answering prematurely: use more tool calls to broaden the search, test alternative hypotheses, look for disconfirming evidence, and dig deeper into the most likely explanations. Finalize only when the evidence clearly supports a conclusion."
-DEFAULT_ANSWER_RETRY_ASSISTANT_PREFILL="Let's see, I do not have enough information to answer and need to continue exploring with additional tool calls."
-ANSWER_RETRY_ASSISTANT_PREFILL="${ANSWER_RETRY_ASSISTANT_PREFILL:-$DEFAULT_ANSWER_RETRY_ASSISTANT_PREFILL}"
-export ANSWER_RETRY_ASSISTANT_PREFILL
 
 DEBUG_LOG_DIR="${DEBUG_LOG_DIR:-${TRAINER_DEFAULT_LOCAL_DIR}/debug_logs/${RUN_UNIQUE_ID}}"
 if [ "$DEBUG_LOGGING_ENABLED" = "1" ]; then
@@ -160,17 +157,6 @@ if [ "$DEBUG_LOGGING_ENABLED" = "1" ]; then
   HYDRA_ARGS=("trainer.comprehensive_debug_logging.dir=$DEBUG_LOG_DIR" "${HYDRA_ARGS[@]}")
 fi
 
-has_hydra_override() {
-  local key="$1"
-  local arg
-  for arg in "${HYDRA_ARGS[@]}"; do
-    if [[ "$arg" == "$key="* ]]; then
-      return 0
-    fi
-  done
-  return 1
-}
-
 # if [ "$NUM_GPUS" -le 2 ]; then
 #   if ! has_hydra_override "actor_rollout_ref.rollout.gpu_memory_utilization"; then
 #     HYDRA_ARGS+=("actor_rollout_ref.rollout.gpu_memory_utilization=${CROP_DEBUG_GPU_MEMORY_UTILIZATION:-0.5}")
@@ -180,12 +166,6 @@ has_hydra_override() {
 #   fi
 # fi
 
-if ! has_hydra_override "actor_rollout_ref.rollout.multi_turn.conditional_answer_retry_assistant_prefill"; then
-  HYDRA_ARGS=(
-    'actor_rollout_ref.rollout.multi_turn.conditional_answer_retry_assistant_prefill=${oc.env:ANSWER_RETRY_ASSISTANT_PREFILL}'
-    "${HYDRA_ARGS[@]}"
-  )
-fi
 
 echo "LOG_FILE=$LOG_FILE"
 echo "TRAINER_PROJECT_NAME=$TRAINER_PROJECT_NAME"
@@ -200,7 +180,6 @@ echo "TOOL_EFFICIENCY_REWARD_MODE=$TOOL_EFFICIENCY_REWARD_MODE"
 echo "TOOL_EFFICIENCY_FREE_CALLS=$TOOL_EFFICIENCY_FREE_CALLS"
 echo "TOOL_EFFICIENCY_CONCAVE_K=$TOOL_EFFICIENCY_CONCAVE_K"
 echo "TOOL_EFFICIENCY_CONCAVE_Q=$TOOL_EFFICIENCY_CONCAVE_Q"
-echo "ANSWER_RETRY_ASSISTANT_PREFILL=$ANSWER_RETRY_ASSISTANT_PREFILL"
 printf 'HYDRA_ARGS:'; printf ' %q' "${HYDRA_ARGS[@]}"; printf '\n'
 
 run_answer_retry_smoke_check() {

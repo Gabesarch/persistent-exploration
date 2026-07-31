@@ -124,6 +124,42 @@ def test_rehydrate_multi_modal_inputs_appends_crop_paths_in_order(tmp_path):
     assert torch.equal(rebuilt[0]["images_seqlens"], torch.tensor([6, 12]))
 
 
+def test_rehydrate_multi_modal_inputs_ignores_stale_extra_crop_refs(tmp_path):
+    crop_paths = []
+    for idx, color in enumerate(("red", "blue")):
+        crop_path = tmp_path / f"crop_{idx}.png"
+        Image.new("RGB", (12, 10), color=color).save(crop_path)
+        crop_paths.append(crop_path)
+
+    original_inputs = [
+        {
+            "image_grid_thw": torch.tensor([[1, 2, 3], [1, 3, 4]]),
+            "images_seqlens": torch.tensor([6, 12]),
+        }
+    ]
+
+    rebuilt = rehydrate_multi_modal_inputs(
+        raw_prompts=[[{"role": "user", "content": "look"}]],
+        input_ids=torch.tensor([[1, 2, 3]]),
+        tokenizer=_FakeTokenizer(),
+        processor=_FakeProcessor(),
+        dataset_cls=_FakeDataset,
+        data_config={"max_pixels": 128},
+        original_multi_modal_inputs=original_inputs,
+        crop_image_refs=[
+            [
+                {"path": str(crop_paths[0]), "image_index": 1},
+                {"path": str(crop_paths[1]), "image_index": 2},
+            ]
+        ],
+        assert_metadata_match=True,
+    )
+
+    assert rebuilt[0]["pixel_values"].shape[0] == 2
+    assert torch.equal(rebuilt[0]["image_grid_thw"], torch.tensor([[1, 2, 3], [1, 3, 4]]))
+    assert torch.equal(rebuilt[0]["images_seqlens"], torch.tensor([6, 12]))
+
+
 def test_rehydrate_multi_modal_inputs_raises_on_metadata_mismatch():
     original_inputs = [{"image_grid_thw": torch.tensor([[1, 9, 9]]), "images_seqlens": torch.tensor([81])}]
 

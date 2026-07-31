@@ -6,16 +6,15 @@ import re
 import shutil
 import tempfile
 import time
+import urllib.parse
+import urllib.request
 import uuid
+from functools import lru_cache
 from multiprocessing import cpu_count
 from typing import Dict, List, Optional, Tuple
 
 from accelerate import Accelerator, DistributedType
 from dotenv import load_dotenv
-from loguru import logger as eval_logger
-from openai import AsyncOpenAI
-from tqdm import tqdm
-
 from lmms_eval.api.instance import GenerationResult, Instance, TokenCounts
 from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model
@@ -34,6 +33,12 @@ from lmms_eval.models.model_utils.usage_metrics import (
     log_usage,
 )
 from lmms_eval.protocol import ChatMessages
+from loguru import logger as eval_logger
+from openai import AsyncOpenAI
+from tqdm import tqdm
+from transformers import AutoTokenizer
+
+from verl.utils.forced_action_tags import build_forced_action_openai_extra_body
 
 VideoReader, _ = optional_import("decord", "VideoReader")
 cpu, _ = optional_import("decord", "cpu")
@@ -44,6 +49,14 @@ cpu, _ = optional_import("decord", "cpu")
 _TOOL_SAVED_IMAGE_RE = re.compile(r"Saved drawn image to:\s*(\S+)")
 _HIDDEN_TOOL_ARGS = {"image_path"}
 _IMAGE_REGISTRY_ENV = "LMMS_EVAL_IMAGE_REGISTRY"
+_ASSISTANT_THINK_PREFIX = "<think>\n"
+_ANSWER_BLOCK_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL)
+_VLLM_ADMIN_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+class VLLMServerLifecycleError(RuntimeError):
+    """Raised when the policy server cannot complete a required lifecycle transition."""
+
 
 # Env var carrying the per-call image registry (img_idx -> file path) to the MCP
 # tool subprocess, so tools resolve img_idx the way training does. Keep in sync
@@ -53,6 +66,39 @@ _IMAGE_REGISTRY_ENV = "LMMS_EVAL_IMAGE_REGISTRY"
 # vero_eval package root (parent of lmms_eval), used to resolve the relative
 # system_prompt_files paths declared in task yamls (e.g. prompts/tools/*.txt).
 _VERO_EVAL_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+
+def _hf_tokenizer_local_files_only() -> bool:
+    override = os.getenv("LMMS_EVAL_HF_TOKENIZER_LOCAL_ONLY")
+    if override is not None:
+        return override.lower() not in {"0", "false", "no", "off"}
+    return os.getenv("HF_HUB_OFFLINE", "").lower() in {"1", "true", "yes", "on"} or os.getenv(
+        "TRANSFORMERS_OFFLINE", ""
+    ).lower() in {"1", "true", "yes", "on"}
+
+
+def _resolve_hf_tokenizer_path(name: str) -> str:
+    if os.path.isabs(name) or os.path.isdir(name):
+        return name
+    if not _hf_tokenizer_local_files_only():
+        return name
+    hf_home = os.path.expanduser(os.getenv("HF_HOME", ""))
+    local = os.path.join(hf_home, name) if hf_home else ""
+    if local and os.path.isdir(local):
+        return local
+    return name
+
+
+@lru_cache(maxsize=4)
+def _get_forced_action_tokenizer(name: str):
+    use_fast = os.getenv("LMMS_EVAL_HF_TOKENIZER_USE_FAST", "1").lower() not in {"0", "false", "no", "off"}
+    trust_remote_code = os.getenv("LMMS_EVAL_HF_TRUST_REMOTE_CODE", "0").lower() in {"1", "true", "yes", "on"}
+    return AutoTokenizer.from_pretrained(
+        _resolve_hf_tokenizer_path(name),
+        use_fast=use_fast,
+        trust_remote_code=trust_remote_code,
+        local_files_only=_hf_tokenizer_local_files_only(),
+    )
 
 
 def _composite_zoom_to_original(image_provenance, img_idx, bbox):
@@ -83,6 +129,19 @@ def _composite_zoom_to_original(image_provenance, img_idx, bbox):
         nsub[2] / w_orig * 1000.0, nsub[3] / h_orig * 1000.0,
     ]
     return orig_idx, nsub, bbox_prime
+
+
+def _restore_assistant_forced_prefill(content: str, prefix: str = _ASSISTANT_THINK_PREFIX) -> str:
+    """Restore forced assistant prefill that is present in the prompt but omitted from completions."""
+    if not content or not prefix:
+        return content
+    stripped = content.lstrip()
+    if stripped.startswith(prefix.strip()):
+        return content
+    if "</think>" not in content:
+        return content
+    leading_ws_len = len(content) - len(stripped)
+    return content[:leading_ws_len] + prefix + stripped
 
 
 load_dotenv(verbose=True)
@@ -122,8 +181,12 @@ class AsyncOpenAIChat(lmms):
         prefix_hash_chars: int = 256,
         system_prompt: Optional[str] = None,
         max_tool_iterations: int = 10,
-        max_tool_images: int = 8,
+        max_tool_images: int = 10,
         tool_image_as_user_turn: bool = False,
+        force_answer_after_max_tool_iterations: bool = False,
+        force_final_answer_prefix: str = "",
+        force_final_answer_think_prefill: Optional[str] = None,
+        manage_vllm_server_lifecycle: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -177,6 +240,24 @@ class AsyncOpenAIChat(lmms):
         self.max_tool_iterations = int(max_tool_iterations)
         self.max_tool_images = int(max_tool_images)
         self.tool_image_as_user_turn = parse_bool(tool_image_as_user_turn)
+        self.force_answer_after_max_tool_iterations = parse_bool(force_answer_after_max_tool_iterations)
+        self.force_final_answer_prefix = force_final_answer_prefix or ""
+        self.manage_vllm_server_lifecycle = parse_bool(manage_vllm_server_lifecycle)
+        if force_final_answer_think_prefill is None:
+            force_final_answer_think_prefill = os.getenv("FORCE_FINAL_ANSWER_THINK_PREFILL", "")
+        self.force_final_answer_think_prefill = force_final_answer_think_prefill or ""
+        self._forced_action_tokenizer = None
+        self._forced_final_stats = {
+            "primary_attempts": 0,
+            "primary_successes": 0,
+            "fallback_attempts": 0,
+            "fallback_successes": 0,
+            "primary_input_tokens": 0,
+            "primary_output_tokens": 0,
+            "fallback_input_tokens": 0,
+            "fallback_output_tokens": 0,
+        }
+        self._forced_final_failures: dict[str, int] = {}
         self._tool_functions = None
         self._task_tools_cache = {}
         self._task_system_prompt_cache = {}
@@ -227,6 +308,103 @@ class AsyncOpenAIChat(lmms):
 
         self.device = self.accelerator.device
 
+    def _vllm_server_root(self) -> str:
+        if not self.base_url:
+            raise RuntimeError(
+                "manage_vllm_server_lifecycle requires an OpenAI-compatible base_url"
+            )
+        server_root = str(self.base_url).rstrip("/")
+        if server_root.endswith("/v1"):
+            server_root = server_root[:-3]
+        return server_root
+
+    def _is_local_vllm_server(self) -> bool:
+        if not self.base_url:
+            return False
+        hostname = urllib.parse.urlparse(str(self.base_url)).hostname
+        return hostname in {"localhost", "127.0.0.1", "::1"}
+
+    def _post_vllm_admin(self, action: str, *, level: Optional[int] = None) -> None:
+        params = {}
+        if level is not None:
+            params["level"] = str(level)
+        query = f"?{urllib.parse.urlencode(params)}" if params else ""
+        url = f"{self._vllm_server_root()}/{action}{query}"
+        request = urllib.request.Request(url, method="POST")
+        request_timeout = max(0.1, min(float(self.timeout), 30.0))
+        with _VLLM_ADMIN_OPENER.open(request, timeout=request_timeout):
+            pass
+
+    def _vllm_is_sleeping(self, request_timeout_s: Optional[float] = None) -> bool:
+        url = f"{self._vllm_server_root()}/is_sleeping"
+        if request_timeout_s is None:
+            request_timeout_s = 10.0
+        request_timeout = max(
+            0.001,
+            min(float(self.timeout), 10.0, float(request_timeout_s)),
+        )
+        with _VLLM_ADMIN_OPENER.open(url, timeout=request_timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if isinstance(payload, bool):
+            return payload
+        if isinstance(payload, dict):
+            for key in ("is_sleeping", "sleeping"):
+                value = payload.get(key)
+                if isinstance(value, bool):
+                    return value
+        raise RuntimeError(f"Unexpected response from vLLM /is_sleeping: {payload!r}")
+
+    def _wait_for_vllm_sleep_state(
+        self,
+        *,
+        expected_sleeping: bool,
+        timeout_s: float = 300.0,
+    ) -> None:
+        deadline = time.monotonic() + timeout_s
+        last_observation = "no response"
+        while True:
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                state = "sleeping" if expected_sleeping else "awake"
+                raise TimeoutError(
+                    f"Timed out after {timeout_s:g}s waiting for vLLM server to become "
+                    f"{state}; last observation: {last_observation}"
+                )
+            try:
+                sleeping = self._vllm_is_sleeping(request_timeout_s=remaining_s)
+                last_observation = f"is_sleeping={sleeping}"
+                if sleeping is expected_sleeping:
+                    return
+            except Exception as exc:
+                last_observation = f"{type(exc).__name__}: {exc}"
+            time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
+
+    def _wake_vllm_server(self) -> None:
+        try:
+            if not self._vllm_is_sleeping():
+                return
+        except Exception:
+            pass
+        self._post_vllm_admin("wake_up")
+        self._wait_for_vllm_sleep_state(expected_sleeping=False)
+
+    def _sleep_vllm_server(self) -> None:
+        try:
+            if self._vllm_is_sleeping():
+                return
+        except Exception:
+            pass
+        self._post_vllm_admin("sleep", level=2)
+        self._wait_for_vllm_sleep_state(expected_sleeping=True)
+
+    def _sleep_vllm_server_best_effort(self, context: str) -> None:
+        try:
+            self._sleep_vllm_server()
+        except BaseException as exc:
+            eval_logger.error(
+                f"Best-effort vLLM deep-sleep cleanup failed after {context}: {exc}"
+            )
+
     @property
     def model(self):
         # returns the model, unwrapping it if using Accelerate
@@ -235,6 +413,150 @@ class AsyncOpenAIChat(lmms):
     @property
     def batch_size(self):
         return self.batch_size_per_gpu
+
+    def _forced_action_extra_body(self, required_tag: str) -> dict:
+        tokenizer_name = os.getenv("LMMS_EVAL_HF_TOKENIZER", "Qwen/Qwen3-8B")
+        if self._forced_action_tokenizer is None:
+            self._forced_action_tokenizer = _get_forced_action_tokenizer(tokenizer_name)
+
+        return build_forced_action_openai_extra_body(
+            self._forced_action_tokenizer,
+            required_tag,
+            forced_suffix=self.force_final_answer_prefix if required_tag == "<answer>" else "",
+        )
+
+    def _with_forced_action_extra_body(self, payload: dict, required_tag: str) -> dict:
+        payload = dict(payload)
+        extra_body = dict(payload.get("extra_body") or {})
+        extra_body.update(self._forced_action_extra_body(required_tag))
+        payload["extra_body"] = extra_body
+        return payload
+
+    def _with_final_answer_think_prefill(self, payload: dict, *, close_think: bool = False) -> tuple[dict, str]:
+        if not self.force_final_answer_think_prefill:
+            return payload, ""
+
+        payload = dict(payload)
+        messages = list(payload.get("messages") or [])
+        prefill_content = f"{_ASSISTANT_THINK_PREFIX}{self.force_final_answer_think_prefill}"
+        if close_think:
+            prefill_content += "\n</think>"
+        messages.append({"role": "assistant", "content": prefill_content})
+        payload["messages"] = messages
+        extra_body = dict(payload.get("extra_body") or {})
+        extra_body.update({"continue_final_message": True, "add_generation_prompt": False})
+        payload["extra_body"] = extra_body
+        return payload, prefill_content
+
+    def _forced_final_answer_request(self, payload: dict, *, hard_fallback: bool) -> tuple[dict, str]:
+        request_payload = dict(payload)
+        # vLLM retains the tool schemas in the rendered prompt by default while
+        # disabling OpenAI/Hermes tool-call extraction for this request.
+        request_payload["tool_choice"] = "none"
+        request_payload = self._with_forced_action_extra_body(request_payload, "<answer>")
+        return self._with_final_answer_think_prefill(request_payload, close_think=hard_fallback)
+
+    @staticmethod
+    def _forced_final_answer_failure(response) -> Optional[str]:
+        choice = response.choices[0]
+        message = choice.message
+        if getattr(message, "tool_calls", None):
+            return "unexpected_message_tool_calls"
+        content = message.content or ""
+        if "<tool_call>" in content or "</tool_call>" in content:
+            return "textual_tool_call"
+        if content.count("<answer>") == 0:
+            return "missing_answer_tag"
+        if content.count("<answer>") != 1:
+            return "multiple_answer_tags"
+        if content.count("</answer>") == 0:
+            return "missing_answer_close"
+        if content.count("</answer>") != 1:
+            return "multiple_answer_closes"
+        matches = _ANSWER_BLOCK_RE.findall(content)
+        if len(matches) != 1:
+            return "malformed_answer_block"
+        if not matches[0].strip():
+            return "empty_answer"
+        return None
+
+    def _record_forced_final_failure(self, reason: str) -> None:
+        self._forced_final_failures[reason] = self._forced_final_failures.get(reason, 0) + 1
+
+    @staticmethod
+    def _response_token_counts(response) -> tuple[int, int, int]:
+        if not getattr(response, "usage", None):
+            return 0, 0, 0
+        input_tokens = getattr(response.usage, "prompt_tokens", 0) or 0
+        output_tokens = getattr(response.usage, "completion_tokens", 0) or 0
+        reasoning_tokens = 0
+        details = getattr(response.usage, "completion_tokens_details", None)
+        if details:
+            reasoning_tokens = getattr(details, "reasoning_tokens", 0) or 0
+        return input_tokens, output_tokens, reasoning_tokens
+
+    @staticmethod
+    def _tool_call_diagnostic(response) -> str:
+        tool_calls = getattr(response.choices[0].message, "tool_calls", None) or []
+        rendered = []
+        for call in tool_calls:
+            function = getattr(call, "function", None)
+            rendered.append(
+                {
+                    "name": getattr(function, "name", None),
+                    "arguments": getattr(function, "arguments", None),
+                }
+            )
+        return json.dumps(rendered, ensure_ascii=False)
+
+    async def _obtain_forced_final_answer(self, payload: dict, request_idx: int):
+        self._forced_final_stats["primary_attempts"] += 1
+        primary_payload, primary_prefill = self._forced_final_answer_request(
+            payload,
+            hard_fallback=False,
+        )
+        primary_response = await self.client.chat.completions.create(**primary_payload)
+        responses_for_usage = [("primary", primary_response)]
+        primary_failure = self._forced_final_answer_failure(primary_response)
+        if primary_failure is None:
+            self._forced_final_stats["primary_successes"] += 1
+            return primary_response, primary_prefill, responses_for_usage
+
+        self._record_forced_final_failure(f"primary_{primary_failure}")
+        eval_logger.warning(
+            "Forced final-answer primary request failed "
+            f"for request {request_idx}: reason={primary_failure} "
+            f"finish_reason={primary_response.choices[0].finish_reason} "
+            f"tool_calls={self._tool_call_diagnostic(primary_response)} "
+            f"content={repr((primary_response.choices[0].message.content or '')[-1000:])}"
+        )
+        self._forced_final_stats["fallback_attempts"] += 1
+        fallback_payload, fallback_prefill = self._forced_final_answer_request(
+            payload,
+            hard_fallback=True,
+        )
+        fallback_response = await self.client.chat.completions.create(**fallback_payload)
+        responses_for_usage.append(("fallback", fallback_response))
+        fallback_failure = self._forced_final_answer_failure(fallback_response)
+        if fallback_failure is not None:
+            self._record_forced_final_failure(f"fallback_{fallback_failure}")
+            eval_logger.error(
+                "Hard forced final-answer retry failed "
+                f"for request {request_idx}: reason={fallback_failure}, "
+                f"finish_reason={fallback_response.choices[0].finish_reason}, "
+                f"tool_calls={self._tool_call_diagnostic(fallback_response)}, "
+                f"content={repr((fallback_response.choices[0].message.content or '')[-1000:])}"
+            )
+            # Treat a malformed forced answer as a bad sample, not a bad run.
+            # Replacing the response also prevents permissive task parsers from
+            # extracting a plausible-looking answer from malformed content.
+            fallback_response.choices[0].message.content = (
+                f"[LMMS_EVAL_FORCED_FINAL_ANSWER_FAILED: {fallback_failure}]"
+            )
+            return fallback_response, "", responses_for_usage
+
+        self._forced_final_stats["fallback_successes"] += 1
+        return fallback_response, fallback_prefill, responses_for_usage
 
     def _rewrite_tool_schemas_for_model(self, tool_list):
         rewritten = []
@@ -456,6 +778,9 @@ class AsyncOpenAIChat(lmms):
         # _composite_zoom_to_original) so chained / multi-index zooms keep full detail.
         image_provenance: Dict[int, tuple] = {}
         next_img_idx = 0
+        task_metadata = self.task_metadata.get(task) or {}
+        show_initial_image_index_hint = parse_bool(task_metadata.get("show_initial_image_index_hint", True))
+
         if self.mcp_client is not None:
             for image_idx, image in enumerate(images):
                 # Save losslessly at ORIGINAL resolution (PNG), matching training's
@@ -466,12 +791,13 @@ class AsyncOpenAIChat(lmms):
                 image_registry[next_img_idx] = image_path
                 image_provenance[next_img_idx] = (next_img_idx, [0.0, 0.0, float(image.width), float(image.height)])
                 next_img_idx += 1
-                messages[-1]["content"].append(
-                    {
-                        "type": "text",
-                        "text": f"\nImage {image_idx} is available as img_idx={image_idx}.",
-                    }
-                )
+                if show_initial_image_index_hint:
+                    messages[-1]["content"].append(
+                        {
+                            "type": "text",
+                            "text": f"\nImage {image_idx} is available as img_idx={image_idx}.",
+                        }
+                    )
             for video_idx, video in enumerate(videos):
                 messages[-1]["content"].append(
                     {
@@ -515,7 +841,8 @@ class AsyncOpenAIChat(lmms):
                 payload["tool_choice"] = "auto"
             # Per-task image-indexing mode controls the model-visible tool_response wording
             # (training_faithful | multi_index | None=default). See _tool_image_registered_text.
-            image_indexing_mode = (self.task_metadata.get(task) or {}).get("image_indexing")
+            image_indexing_mode = task_metadata.get("image_indexing")
+            restore_assistant_forced_prefill = parse_bool(task_metadata.get("restore_assistant_forced_prefill", False))
 
             response = await self.client.chat.completions.create(**payload)
             last_response = response.choices[0].message.content or ""
@@ -546,10 +873,14 @@ class AsyncOpenAIChat(lmms):
             tool_iteration = 0
             tool_image_count = 0
             terminal_tool_called = False
+            forced_final_answer_requested = False
             while response.choices[0].finish_reason == "tool_calls" and tool_iteration < self.max_tool_iterations:
                 tool_iteration += 1
                 assistant_message = response.choices[0].message
-                assistant_dict = {"role": "assistant", "content": assistant_message.content or ""}
+                assistant_content = assistant_message.content or ""
+                if restore_assistant_forced_prefill:
+                    assistant_content = _restore_assistant_forced_prefill(assistant_content)
+                assistant_dict = {"role": "assistant", "content": assistant_content}
                 if assistant_message.tool_calls:
                     assistant_dict["tool_calls"] = [
                         {
@@ -652,11 +983,18 @@ class AsyncOpenAIChat(lmms):
                 if pending_user_images:
                     messages.append({"role": "user", "content": pending_user_images + [{"type": "text", "text": "Above are the tool-returned image(s)."}]})
 
+                final_turn_due = (
+                    self.force_answer_after_max_tool_iterations
+                    and tool_iteration >= self.max_tool_iterations
+                )
+                force_final_answer_now = final_turn_due and not terminal_tools
+                force_terminal_answer_now = final_turn_due and bool(terminal_tools)
+
                 # Once the image budget is spent, stop offering image-producing tools
                 # so the model answers. Terminal (answer-protocol) tools stay offered:
                 # they return no images and may be the task's only answer channel
                 # (e.g. screenspot's computer_use).
-                if tool_image_count >= self.max_tool_images:
+                if tool_image_count >= self.max_tool_images and not force_final_answer_now:
                     terminal_only = [f for f in payload.get("tools", []) if f["function"]["name"] in terminal_tools]
                     if terminal_only:
                         payload["tools"] = terminal_only
@@ -665,35 +1003,65 @@ class AsyncOpenAIChat(lmms):
                         payload.pop("tool_choice", None)
 
                 payload["messages"] = messages
-                response = await self.client.chat.completions.create(**payload)
-                input_tokens = 0
-                output_tokens = 0
-                reasoning_tokens = 0
-                if hasattr(response, "usage") and response.usage:
-                    input_tokens = getattr(response.usage, "prompt_tokens", 0) or 0
-                    output_tokens = getattr(response.usage, "completion_tokens", 0) or 0
-                    if hasattr(response.usage, "completion_tokens_details") and response.usage.completion_tokens_details:
-                        reasoning_tokens = getattr(response.usage.completion_tokens_details, "reasoning_tokens", 0) or 0
-                total_input_tokens += input_tokens
-                total_output_tokens += output_tokens
-                total_reasoning_tokens += reasoning_tokens
-                log_usage(
-                    model_name=self.model_version,
-                    task_name=task if "task" in locals() else None,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    reasoning_tokens=reasoning_tokens,
-                    source="model",
-                )
+                if force_terminal_answer_now:
+                    payload["tools"] = [
+                        function
+                        for function in payload.get("tools", [])
+                        if function["function"]["name"] in terminal_tools
+                    ]
+                    payload["tool_choice"] = "auto"
+                request_payload = payload
+                response_prefill = ""
+                forced_final_answer_valid = False
+                responses_for_usage = []
+                if force_final_answer_now:
+                    forced_final_answer_requested = True
+                    eval_logger.info(f"Forcing final answer on final allowed assistant turn for request {idx}")
+                    response, response_prefill, responses_for_usage = await self._obtain_forced_final_answer(
+                        payload,
+                        idx,
+                    )
+                    forced_final_answer_valid = self._forced_final_answer_failure(response) is None
+                else:
+                    response = await self.client.chat.completions.create(**request_payload)
+                    responses_for_usage.append(("primary", response))
+
+                for force_stage, usage_response in responses_for_usage:
+                    input_tokens, output_tokens, reasoning_tokens = self._response_token_counts(usage_response)
+                    total_input_tokens += input_tokens
+                    total_output_tokens += output_tokens
+                    total_reasoning_tokens += reasoning_tokens
+                    if force_final_answer_now:
+                        self._forced_final_stats[f"{force_stage}_input_tokens"] += input_tokens
+                        self._forced_final_stats[f"{force_stage}_output_tokens"] += output_tokens
+                    log_usage(
+                        model_name=self.model_version,
+                        task_name=task if "task" in locals() else None,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        reasoning_tokens=reasoning_tokens,
+                        source="model",
+                    )
                 last_response = response.choices[0].message.content or ""
                 try:
+                    if response_prefill:
+                        all_response += response_prefill
                     all_response += last_response
                 except Exception as e:
                     all_response += str(e)
+                if force_terminal_answer_now:
+                    for call in response.choices[0].message.tool_calls or []:
+                        all_response += f"<tool_call>{call.function.name} {call.function.arguments}</tool_call>"
+                        if call.function.name in terminal_tools:
+                            terminal_tool_called = True
+                            break
 
             if tool_iteration >= self.max_tool_iterations and not terminal_tool_called:
-                eval_logger.warning(f"Max tool iterations ({self.max_tool_iterations}) reached for request {idx}")
-                all_response += f"\n[MAX_TOOL_ITERATIONS_REACHED]"
+                if forced_final_answer_requested and forced_final_answer_valid:
+                    eval_logger.info(f"Final answer was forced on max tool turn for request {idx}")
+                else:
+                    eval_logger.warning(f"Max tool iterations ({self.max_tool_iterations}) reached for request {idx}")
+                    all_response += f"\n[MAX_TOOL_ITERATIONS_REACHED]"
             return all_response, idx, TokenCounts(input_tokens=total_input_tokens, output_tokens=total_output_tokens, reasoning_tokens=total_reasoning_tokens)
         finally:
             _cleanup_request_images()
@@ -837,9 +1205,43 @@ class AsyncOpenAIChat(lmms):
             maybe_update_concurrency(force=True)
 
             pbar.close()
+            if self._forced_final_stats["primary_attempts"]:
+                eval_logger.info(
+                    "Forced final-answer summary: "
+                    f"stats={json.dumps(self._forced_final_stats, sort_keys=True)} "
+                    f"failures={json.dumps(self._forced_final_failures, sort_keys=True)}"
+                )
             return res
 
-        eval_results = asyncio.run(run())
+        manage_lifecycle = self.manage_vllm_server_lifecycle and bool(requests)
+        if manage_lifecycle and not self._is_local_vllm_server():
+            eval_logger.warning(
+                "Ignoring manage_vllm_server_lifecycle for non-local base_url "
+                f"{self.base_url!r}; vLLM admin endpoints are restricted to localhost"
+            )
+            manage_lifecycle = False
+        if manage_lifecycle:
+            try:
+                self._wake_vllm_server()
+            except BaseException:
+                self._sleep_vllm_server_best_effort("wake failure")
+                raise
+        try:
+            eval_results = asyncio.run(run())
+        except BaseException:
+            if manage_lifecycle:
+                self._sleep_vllm_server_best_effort("generation failure")
+            raise
+        if manage_lifecycle:
+            # A successful generation is not safe to hand to the judge until the
+            # shared vLLM server has released weights and KV cache.
+            try:
+                self._sleep_vllm_server()
+            except Exception as exc:
+                raise VLLMServerLifecycleError(
+                    "Policy generation succeeded, but the managed vLLM server did not "
+                    "confirm level-2 deep sleep; refusing to initialize the judge"
+                ) from exc
         eval_results.sort(key=lambda x: x[1])  # Sort by index to restore original
         results = results + [content for content, _ in eval_results]
         if self.mcp_client is not None:

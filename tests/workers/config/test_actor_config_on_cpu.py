@@ -18,9 +18,13 @@ import unittest
 from verl.utils.config import omega_conf_to_dataclass
 from verl.workers.config import (
     ActorConfig,
+    BranchLossStrataConfig,
+    BranchSubsamplingConfig,
     FSDPActorConfig,
     McoreActorConfig,
     OptimizerConfig,
+    PolicyLossConfig,
+    RetrySFTLossConfig,
 )
 
 
@@ -213,6 +217,60 @@ class TestActorConfig(unittest.TestCase):
             rollout_n=1,
         )
         self.assertIsNotNone(config)  # Should not raise an exception
+
+    def test_branch_strata_config_validation(self):
+        with self.assertRaisesRegex(ValueError, "0 <= value < 1"):
+            BranchLossStrataConfig(branch_fraction=1.0)
+
+        with self.assertRaisesRegex(ValueError, "loss_mode='gspo'"):
+            ActorConfig(
+                strategy="fsdp",
+                rollout_n=1,
+                use_dynamic_bsz=True,
+                loss_agg_mode="seq-mean-token-mean",
+                policy_loss=PolicyLossConfig(branch_strata=BranchLossStrataConfig(enabled=True)),
+            )
+
+        with self.assertRaisesRegex(ValueError, "loss_agg_mode='seq-mean-token-mean'"):
+            ActorConfig(
+                strategy="fsdp",
+                rollout_n=1,
+                use_dynamic_bsz=True,
+                loss_agg_mode="token-mean",
+                policy_loss=PolicyLossConfig(loss_mode="gspo", branch_strata=BranchLossStrataConfig(enabled=True)),
+            )
+
+    def test_branch_subsampling_config_validation(self):
+        subsampling = BranchSubsamplingConfig(enabled=True, max_branches_per_parent=1, seed=42)
+        config = BranchLossStrataConfig(enabled=True, subsampling=subsampling)
+        self.assertTrue(config.subsampling.enabled)
+        self.assertEqual(config.subsampling.max_branches_per_parent, 1)
+        self.assertEqual(config.subsampling.seed, 42)
+
+        for invalid_cap in (None, 0, -1):
+            with self.assertRaisesRegex(ValueError, "must be a positive integer"):
+                BranchSubsamplingConfig(enabled=True, max_branches_per_parent=invalid_cap)
+
+        with self.assertRaisesRegex(ValueError, "requires branch strata to be enabled"):
+            BranchLossStrataConfig(
+                enabled=False,
+                subsampling=BranchSubsamplingConfig(enabled=True, max_branches_per_parent=1),
+            )
+
+    def test_retry_sft_config_validation(self):
+        retry_sft = RetrySFTLossConfig(enabled=True, loss_fraction=0.05)
+        config = ActorConfig(
+            strategy="fsdp",
+            rollout_n=1,
+            use_dynamic_bsz=True,
+            loss_agg_mode="seq-mean-token-mean",
+            policy_loss=PolicyLossConfig(loss_mode="gspo", retry_sft=retry_sft),
+        )
+        self.assertTrue(config.policy_loss.retry_sft.enabled)
+        self.assertEqual(config.policy_loss.retry_sft.loss_fraction, 0.05)
+
+        with self.assertRaisesRegex(ValueError, "0 <= value < 1"):
+            RetrySFTLossConfig(enabled=True, loss_fraction=1.0)
 
     def test_fsdp_actor_config_validation_exceptions(self):
         """Test that FSDPActorConfig.validate() raises appropriate validation exceptions."""

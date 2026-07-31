@@ -6,10 +6,17 @@ task: "hstarbench_mixed_reasoning_zoom"
 generation_kwargs:
   max_new_tokens: 16384
   temperature: 0.7
+  top_p: 0.8
+  top_k: 20
+  repetition_penalty: 1.0
+  presence_penalty: 0.0
   do_sample: true
 doc_to_messages: !function utils.hstarbench_bbox_zoom_doc_to_messages_vero
 lmms_eval_specific_kwargs:
   default:
+    use_panorama_strip: true
+    bbox_zoom_only: true
+    score_mode: answer_bbox_dual
     pre_prompt: "\n"
     post_prompt: ""
 metadata:

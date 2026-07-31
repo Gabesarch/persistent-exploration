@@ -227,6 +227,76 @@ def find_latest_ckpt_path(path, directory_format="global_step_{}"):
     return ckpt_path
 
 
+def validate_bootstrap_ckpt_path(path: str) -> str:
+    """Validate and return an absolute FSDP PPO checkpoint path."""
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("trainer.bootstrap_from_path must be a non-empty string")
+
+    checkpoint_path = os.path.abspath(os.path.expanduser(os.path.expandvars(path)))
+    checkpoint_name = os.path.basename(os.path.normpath(checkpoint_path))
+    step_text = checkpoint_name.removeprefix("global_step_")
+    if not checkpoint_name.startswith("global_step_") or not step_text.isdigit():
+        raise ValueError(
+            "trainer.bootstrap_from_path must point to a global_step_<integer> directory, "
+            f"got {path!r}"
+        )
+    if not os.path.isdir(checkpoint_path):
+        raise FileNotFoundError(f"bootstrap checkpoint directory does not exist: {checkpoint_path}")
+
+    actor_path = os.path.join(checkpoint_path, "actor")
+    if not os.path.isdir(actor_path):
+        raise FileNotFoundError(f"bootstrap checkpoint actor directory does not exist: {actor_path}")
+
+    actor_files = os.listdir(actor_path)
+    required_prefixes = (
+        "model_world_size_",
+        "optim_world_size_",
+        "extra_state_world_size_",
+    )
+    missing_prefixes = [
+        prefix for prefix in required_prefixes if not any(name.startswith(prefix) for name in actor_files)
+    ]
+    if missing_prefixes:
+        raise FileNotFoundError(
+            f"bootstrap checkpoint actor state is incomplete at {actor_path}; "
+            f"missing files with prefixes {missing_prefixes}"
+        )
+
+    dataloader_path = os.path.join(checkpoint_path, "data.pt")
+    if not os.path.isfile(dataloader_path):
+        raise FileNotFoundError(f"bootstrap checkpoint dataloader state does not exist: {dataloader_path}")
+    return checkpoint_path
+
+
+def resolve_ppo_checkpoint_path(
+    default_local_dir: str,
+    resume_mode: str,
+    resume_from_path: str | None = None,
+    bootstrap_from_path: str | None = None,
+) -> str | None:
+    """Resolve the PPO checkpoint, preferring destination state over an auto-mode bootstrap."""
+    if resume_mode == "disable":
+        return None
+    if resume_mode == "auto":
+        checkpoint_folder = os.path.abspath(default_local_dir)
+        latest_path = find_latest_ckpt_path(checkpoint_folder)
+        if latest_path is not None:
+            return latest_path
+        if bootstrap_from_path:
+            return validate_bootstrap_ckpt_path(bootstrap_from_path)
+        return None
+    if resume_mode == "resume_path":
+        if not isinstance(resume_from_path, str):
+            raise ValueError("trainer.resume_from_path must be a string when resume_mode='resume_path'")
+        checkpoint_path = os.path.abspath(os.path.expanduser(os.path.expandvars(resume_from_path)))
+        checkpoint_name = os.path.basename(os.path.normpath(checkpoint_path))
+        step_text = checkpoint_name.removeprefix("global_step_")
+        if not checkpoint_name.startswith("global_step_") or not step_text.isdigit():
+            raise ValueError("trainer.resume_from_path must point to a global_step_<integer> directory")
+        return checkpoint_path
+    raise ValueError(f"unknown trainer.resume_mode: {resume_mode!r}")
+
+
 def get_checkpoint_tracker_filename(root_path: str):
     """
     Tracker file rescords the latest chckpoint during training to restart from.

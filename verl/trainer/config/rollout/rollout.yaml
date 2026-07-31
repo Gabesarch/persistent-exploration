@@ -179,6 +179,9 @@ multi_turn:
   # null for no limit (default max_length // 3)
   max_user_turns: null
 
+  # null for no per-turn generation cap
+  max_assistant_tokens_per_turn: null
+
   # max parallel call for tools in single turn
   max_parallel_calls: 1
 
@@ -216,9 +219,24 @@ multi_turn:
   # then force <answer> on the final turn. Implemented via vLLM bad_words.
   force_tool_calls_until_final_turn: False
 
+  # Allow normal early actions, but force <answer> once the final allowable
+  # assistant turn or final-answer token margin is reached.
+  force_answer_on_final_turn: False
+
+  # Validation-only override for force_answer_on_final_turn. Null inherits the
+  # shared setting for backward compatibility; true/false controls validation independently.
+  force_answer_on_final_turn_validation: null
+
   # Token headroom reserved for the final <answer> turn; if remaining response budget
   # drops below this, switch to forcing an answer to avoid an answerless overflow.
   final_answer_token_margin: 2048
+
+  # Prefix inserted inside the `<think>` block before generation on forced final-answer turns.
+  force_final_answer_think_prefill: ""
+
+  # Include the injected final-answer think prefill in the policy-loss mask.
+  # Keep false for normal on-policy rollouts; true uses recomputed old-policy likelihoods.
+  force_final_answer_think_prefill_trainable: False
 
   # Append turn-dependent guidance to tool responses without forcing logits/actions.
   tool_response_turn_suffix_enabled: False
@@ -230,11 +248,37 @@ multi_turn:
   # are removed, the previous user/tool message receives this suffix, and the
   # next assistant turn can be forced to make a tool call.
   conditional_answer_retry_enabled: False
+
+  # Permit GT-based answer retry during validation; disable for inference-faithful validation.
+  conditional_answer_retry_enable_validation: True
+
   conditional_answer_retry_force_next_tool_call: True
   conditional_answer_retry_suffix: "You have not gathered enough information yet. In your next turn, keep exploring rather than answering prematurely: use more tool calls to broaden the search, test alternative hypotheses, look for disconfirming evidence, and dig deeper into the most likely explanations. Finalize only when the evidence clearly supports a conclusion."
   conditional_answer_retry_assistant_prefill: ""
+
+  # Include the injected retry prefill in the policy-loss mask.
+  # Keep false for normal on-policy rollouts; true uses recomputed old-policy likelihoods.
+  conditional_answer_retry_assistant_prefill_trainable: False
+
+  # Use the retry prefill only in the temporary teacher generation prompt.
+  conditional_answer_retry_teacher_only_prefill: False
+
+  # Mark eligible teacher-only retry suffixes for supervised loss.
+  conditional_answer_retry_sft_enabled: False
+
+  # Eligible target selection: all, first, or last.
+  conditional_answer_retry_sft_target_selection: all
+
   conditional_answer_retry_correct_accuracy_threshold: 0.0
   conditional_answer_retry_max_retries: null
+  conditional_answer_retry_branch_enabled: False
+  conditional_answer_retry_branch_enable_validation: False
+  conditional_answer_retry_branch_mask_mode: "divergence_only"
+  conditional_answer_retry_branch_reward_components: {}
+  # Preserve the complete retry grade (including scalar score) on emitted branch rows.
+  # When false, conditional_answer_retry_branch_reward_components supplies fixed rewards.
+  conditional_answer_retry_branch_use_graded_rewards: False
+  conditional_answer_retry_branch_baseline_weight_key: "gdpo_baseline_weight"
 
 # support logging rollout prob for debugging purpose
 # "Truncated importance sampling" requires rollout log probs, set to True when turning on Truncated importance sampling

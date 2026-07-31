@@ -26,6 +26,42 @@ from verl.workers.config import ActorConfig, CriticConfig
 from verl.workers.utils.padding import no_padding_2_padding
 
 
+def masked_sft_nll(
+    log_prob: torch.Tensor,
+    loss_mask: torch.Tensor,
+    *,
+    batch_num_tokens: int | torch.Tensor,
+    dp_size: int = 1,
+) -> torch.Tensor:
+    """Token-normalized supervised NLL shared by SFT and hybrid PPO actors."""
+    if isinstance(batch_num_tokens, torch.Tensor):
+        denominator = batch_num_tokens.to(device=log_prob.device, dtype=log_prob.dtype)
+    else:
+        denominator = log_prob.new_tensor(batch_num_tokens)
+    if denominator.item() <= 0:
+        return log_prob.sum() * 0.0
+    return -masked_sum(log_prob, loss_mask) / denominator * dp_size
+
+
+def combine_retry_sft_loss(
+    rl_loss: torch.Tensor,
+    retry_sft_loss: torch.Tensor,
+    *,
+    loss_fraction: float,
+    has_rl: bool,
+    has_retry_sft: bool,
+) -> torch.Tensor:
+    """Combine independently normalized RL and retry-SFT strata."""
+    if not has_retry_sft:
+        return rl_loss
+    if not has_rl:
+        return retry_sft_loss
+    fraction = float(loss_fraction)
+    if not 0.0 <= fraction < 1.0:
+        raise ValueError(f"retry SFT loss_fraction must satisfy 0 <= value < 1, got {fraction!r}")
+    return (1.0 - fraction) * rl_loss + fraction * retry_sft_loss
+
+
 def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
     pad_mode = tu.get_non_tensor_data(data=data, key="pad_mode", default=DatasetPadMode.NO_PADDING)
     dp_size = data["dp_size"]
@@ -47,10 +83,20 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         # NOTE: loss is averaged over all tokens in the batch across all data parallel groups,
         # For FSDP backend, the loss is directly used for backward; while for Megatron backend,
         # the loss should be scaled by `num_microbatches` for pp schedule.
-        loss = -masked_sum(log_prob_flatten, loss_mask_flatten) / batch_num_tokens * dp_size
+        loss = masked_sft_nll(
+            log_prob_flatten,
+            loss_mask_flatten,
+            batch_num_tokens=batch_num_tokens,
+            dp_size=dp_size,
+        )
     else:
         response_mask = data["response_mask"].to(bool)
-        loss = -masked_sum(log_prob, response_mask) / batch_num_tokens * dp_size
+        loss = masked_sft_nll(
+            log_prob,
+            response_mask,
+            batch_num_tokens=batch_num_tokens,
+            dp_size=dp_size,
+        )
 
     return loss, {}
 

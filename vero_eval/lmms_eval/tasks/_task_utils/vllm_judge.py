@@ -109,6 +109,21 @@ class JudgeConfig:
     max_tokens: int
     gpu_memory_utilization: float
     system_prompt: Optional[str]
+    chat_template: Optional[str] = None
+
+
+def _load_chat_template(raw_template: Optional[str]) -> Optional[str]:
+    if not raw_template:
+        return None
+    if "\n" in raw_template or "{{" in raw_template or "{%" in raw_template:
+        return raw_template
+    candidate = os.path.expandvars(os.path.expanduser(raw_template))
+    if os.path.isfile(candidate):
+        with open(candidate, "r", encoding="utf-8") as handle:
+            return handle.read()
+    if os.path.sep in raw_template or raw_template.endswith((".jinja", ".jinja2", ".j2")):
+        raise FileNotFoundError(f"Judge chat template file not found: {raw_template}")
+    return raw_template
 
 
 def _load_config(model_hint: Optional[str]) -> JudgeConfig:
@@ -126,6 +141,7 @@ def _load_config(model_hint: Optional[str]) -> JudgeConfig:
         os.getenv("CHARXIV_JUDGE_GPU_MEMORY_UTILIZATION", os.getenv("VLLM_JUDGE_GPU_MEMORY_UTILIZATION", "0.9"))
     )
     system_prompt = os.getenv("CHARXIV_JUDGE_SYSTEM_PROMPT", os.getenv("VLLM_JUDGE_SYSTEM_PROMPT", _DEFAULT_SYSTEM_PROMPT))
+    chat_template = _load_chat_template(os.getenv("VLLM_JUDGE_CHAT_TEMPLATE"))
     return JudgeConfig(
         model_path=model_path,
         tensor_parallel_size=tensor_parallel,
@@ -139,6 +155,7 @@ def _load_config(model_hint: Optional[str]) -> JudgeConfig:
         max_tokens=max_tokens,
         gpu_memory_utilization=gpu_memory_utilization,
         system_prompt=system_prompt,
+        chat_template=chat_template,
     )
 
 
@@ -159,6 +176,9 @@ class VLLMJudgeEngine:
         )
         self.supports_multimodal = hasattr(self._llm, "chat")
         self._tokenizer = self._llm.get_tokenizer()
+        self._chat_template = config.chat_template
+        if self._chat_template and hasattr(self._tokenizer, "chat_template"):
+            self._tokenizer.chat_template = self._chat_template
         sampling_kwargs = {
             "temperature": config.temperature,
             "top_p": config.top_p,
@@ -178,10 +198,14 @@ class VLLMJudgeEngine:
         if self._system_prompt:
             messages.append({"role": "system", "content": self._system_prompt})
         messages.append({"role": "user", "content": prompt})
+        chat_template_kwargs = {}
+        if self._chat_template:
+            chat_template_kwargs["chat_template"] = self._chat_template
         return self._tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True,
+            **chat_template_kwargs,
         )
 
     def _resolve_sampling_params(self, max_tokens: Optional[int]) -> SamplingParams:
@@ -226,10 +250,14 @@ class VLLMJudgeEngine:
         if self._system_prompt and not any(isinstance(msg, dict) and msg.get("role") == "system" for msg in payload_messages):
             payload_messages = [{"role": "system", "content": self._system_prompt}] + payload_messages
         sampling_params = self._resolve_sampling_params(max_tokens)
+        chat_kwargs: dict[str, Any] = {}
+        if self._chat_template:
+            chat_kwargs["chat_template"] = self._chat_template
         outputs = self._llm.chat(
             messages=[payload_messages],
             sampling_params=sampling_params,
             use_tqdm=False,
+            **chat_kwargs,
         )
         if not outputs or not outputs[0].outputs:
             return ""
@@ -277,13 +305,12 @@ class VLLMJudgeEngineQwen3:
                 "..",
                 "..",
                 "..",
-                "examples",
                 "prompts",
                 "qwen3_nonthinking.jinja",
             )
         )
-        self._chat_template = None
-        if os.path.isfile(template_path):
+        self._chat_template = config.chat_template
+        if self._chat_template is None and os.path.isfile(template_path):
             with open(template_path, "r", encoding="utf-8") as handle:
                 self._chat_template = handle.read()
         LLM, SamplingParams = _vllm()
@@ -317,10 +344,14 @@ class VLLMJudgeEngineQwen3:
         # if self._system_prompt:
         #     messages.append({"role": "system", "content": self._system_prompt})
         messages.append({"role": "user", "content": prompt})
+        chat_template_kwargs = {}
+        if self._chat_template:
+            chat_template_kwargs["chat_template"] = self._chat_template
         return self._tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True,
+            **chat_template_kwargs,
         )
 
     def _resolve_sampling_params(self, max_tokens: Optional[int]) -> SamplingParams:
@@ -703,12 +734,12 @@ class VLLMServerJudge:
             self._sleep_llm()
 
 
-_ENGINE_CACHE: dict[str, object] = {}
+_ENGINE_CACHE: dict[str, tuple[JudgeConfig, object]] = {}
 
 
 def _shutdown_all_engines() -> None:
     """atexit hook: gracefully shut down all cached vLLM judge engines."""
-    for engine in _ENGINE_CACHE.values():
+    for _, engine in _ENGINE_CACHE.values():
         if hasattr(engine, "shutdown"):
             try:
                 engine.shutdown()
@@ -725,7 +756,18 @@ def get_judge_engine(model_hint: Optional[str] = None):
     use_server_env = os.getenv("VLLM_SERVER_JUDGE", "").strip().lower() in {"1", "true", "yes"}
     use_server = use_server_env or config.model_path == VLLMServerJudge._MODEL_NAME
     cache_key = f"{config.model_path}|server={int(use_server)}"
-    engine = _ENGINE_CACHE.get(cache_key)
+    cached = _ENGINE_CACHE.get(cache_key)
+    if cached is not None and cached[0] == config:
+        return cached[1]
+    if cached is not None:
+        stale_engine = cached[1]
+        if hasattr(stale_engine, "shutdown"):
+            try:
+                stale_engine.shutdown()
+            except Exception:
+                pass
+        _ENGINE_CACHE.pop(cache_key, None)
+    engine = None
     if engine is None:
         model_lower = config.model_path.lower()
         if config.model_path in _GPT_MODEL_NAME:
@@ -736,7 +778,7 @@ def get_judge_engine(model_hint: Optional[str] = None):
             engine = VLLMJudgeEngineQwen3(config)
         else:
             engine = VLLMJudgeEngine(config)
-        _ENGINE_CACHE[cache_key] = engine
+        _ENGINE_CACHE[cache_key] = (config, engine)
     return engine
 
 

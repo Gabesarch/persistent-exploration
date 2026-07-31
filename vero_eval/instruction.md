@@ -86,13 +86,16 @@ override with `SUFFIX=` for a domain run.
 
 ## 4. Judge (for tasks scored by an LLM, e.g. visual_probe / mathvista / charxiv)
 
-`countqa` etc. are exact-match (no judge). Judge tasks **auto-launch a dedicated Qwen3-32B
-judge on the 2nd GPU** — the strong, reportable judge (same as the previous repo). That's
-why `run_eval.sbatch` defaults to `--gres=gpu:2`.
+`countqa` and other rule-based tasks do not use a judge. Judge tasks default to
+`JUDGE_BACKEND=engine`: Vero generates every response, the policy server enters
+confirmed level-2 sleep, and the reportable Qwen3-32B judge runs in-process on the
+same GPU during postprocessing. Consequently, `run_eval.sbatch` defaults to one GPU.
 
-- 1 GPU + a judge task → it falls back to using the **policy model as the judge (8B)** and
-  prints a **WARNING** (don't report those numbers). Give it 2 GPUs for the real judge.
-- `JUDGE_BACKEND=engine` runs the 32B judge in-process instead (also needs 2 GPUs).
+- `JUDGE_BACKEND=server` keeps the legacy dedicated HTTP judge and requires two GPUs.
+- `JUDGE_BACKEND=server START_VLLM_JUDGE_SERVER=0` deliberately reuses the policy as
+  judge and prints a **NON-REPORTABLE** warning; it is never an automatic fallback.
+- Explicit hosted `API_TYPE=openai` or `API_TYPE=azure` judges do not manage the local
+  policy server lifecycle.
 
 ---
 

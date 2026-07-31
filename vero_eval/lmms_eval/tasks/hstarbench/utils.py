@@ -176,6 +176,14 @@ def _initial_context(env) -> str:
 
 def _initial_context_from_doc(doc: Dict[str, Any], kwargs: Optional[Dict[str, Any]] = None) -> str:
     """Build first-turn prompt without instantiating HstarEnv (safe for lmms-eval request build)."""
+    # Strip+zoom tasks source their real prompt from doc_to_messages and must not require
+    # the vagen simulator checkout (see _vagen). Mirror hstarbench_bbox_zoom_doc_to_messages
+    # here so the eager doc_to_text preview in Task.__init__ works without vagen.
+    if _bbox_zoom_only(kwargs, doc):
+        text = ZOOM_BBOX_SYSTEM_PROMPT.strip() + "\n\n" + hstarbench_bbox_zoom_doc_to_text(doc, kwargs)
+        if _use_panorama_strip(doc, kwargs) and bool((kwargs or {}).get("include_erp_for_mcp", doc.get("include_erp_for_mcp"))):
+            text += "\n" + PANORAMA_STRIP_TOOL_HINT.strip()
+        return text
     v = _vagen()
     is_nav = doc.get("eval_set") == "navigation" or bool(doc.get("is_nav"))
     prompt_format = doc.get("prompt_format", "free_think")

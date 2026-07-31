@@ -63,7 +63,11 @@ class DAPORewardManager(RewardManagerBase):
 
         data_source = data_item.non_tensor_batch["data_source"]
         ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
-        extra_info = data_item.non_tensor_batch.get("extra_info", {})
+        raw_extra_info = data_item.non_tensor_batch.get("extra_info", {})
+        extra_info = dict(raw_extra_info) if isinstance(raw_extra_info, dict) else {}
+        tool_extra_fields = data_item.non_tensor_batch.get("tool_extra_fields", None)
+        if isinstance(tool_extra_fields, dict):
+            extra_info.update(tool_extra_fields)
 
         response_str = await self.loop.run_in_executor(
             None, lambda: self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)

@@ -8,7 +8,7 @@
 #
 # Env (set_paths.sh): CHECKPOINT_PATH, PORT, API_KEY, MODEL_VERSION, SYSTEM_PROMPT,
 # MCP_SERVER_PATH (''=tools off), MAX_TOOL_ITERATIONS (10), JUDGE_BACKEND (default
-# server = reuse policy server as judge; engine would OOM beside the policy on 1 GPU).
+# engine = sequential in-process judge while the one-GPU policy server sleeps).
 set -euo pipefail
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; VERO_EVAL_DIR="$(cd "$SELF/.." && pwd)"
@@ -19,7 +19,7 @@ source "$VERO_EVAL_DIR/examples/_domain_map.sh"
 
 DOMAINS="all"; SUFFIX="reasoning"; OUTPUT_ROOT=""; LIMIT="${LIMIT:-}"; NO_SERVE=0
 PORT="${PORT:-9001}"; API_KEY="${API_KEY:-qwen}"; KEEP_SERVER="${KEEP_SERVER:-1}"
-export JUDGE_BACKEND="${JUDGE_BACKEND:-server}"
+export JUDGE_BACKEND="${JUDGE_BACKEND:-engine}"
 while [[ $# -gt 0 ]]; do case "$1" in
   --domains) DOMAINS="$2"; shift 2;; --model-suffix) SUFFIX="$2"; shift 2;;
   --output-root) OUTPUT_ROOT="$2"; shift 2;; --limit) LIMIT="$2"; shift 2;;

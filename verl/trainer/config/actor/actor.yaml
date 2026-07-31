@@ -75,6 +75,57 @@ policy_loss:
   # KL divergence penalty coefficient
   ppo_kl_coef: 0.1
 
+  # Parent-balanced canonical/branch policy-loss strata.
+  branch_strata:
+
+    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+    _target_: verl.workers.config.BranchLossStrataConfig
+
+    # Enable separate canonical and branch GSPO loss strata.
+    enabled: false
+
+    # Maximum fraction of policy loss assigned to branch suffixes.
+    branch_fraction: 0.2
+
+    # Cap branch fraction by branch-parent prevalence among canonical rows.
+    cap_by_parent_prevalence: true
+
+    # Split each parent trajectory's branch mass equally among its branches.
+    parent_balance: true
+
+    # Non-tensor batch key identifying branch rows.
+    branch_indicator_key: is_conditional_answer_retry_branch
+
+    # Non-tensor batch key shared by each canonical row and its branches.
+    parent_id_key: request_id
+
+    # Uniformly subsample branch rows per parent before training.
+    subsampling:
+
+      # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+      _target_: verl.workers.config.BranchSubsamplingConfig
+
+      # Enable branch-row subsampling.
+      enabled: false
+
+      # Maximum number of branch rows retained for each parent.
+      max_branches_per_parent: null
+
+      # Base seed combined with the global training step for deterministic sampling.
+      seed: 42
+
+  # Teacher-only answer-retry supervised-loss stratum.
+  retry_sft:
+
+    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+    _target_: verl.workers.config.RetrySFTLossConfig
+
+    # Enable retry SFT alongside the configured policy loss.
+    enabled: false
+
+    # Fraction of total loss assigned to retry SFT when eligible targets exist.
+    loss_fraction: 0.05
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 
@@ -310,4 +361,3 @@ qat:
 
   # Path to vLLM quantization config JSON file
   quantization_config_path: null
-

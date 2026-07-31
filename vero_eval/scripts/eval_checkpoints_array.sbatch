@@ -5,7 +5,7 @@
 #SBATCH --time=4:00:00
 #SBATCH --mem=80G
 #SBATCH --cpus-per-task=10
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:1
 #SBATCH --partition=pli
 #SBATCH --account=vlmrl
 #SBATCH --output=vero_eval/logs/eval_ckpt_%A_%a.out
@@ -17,7 +17,7 @@
 # and pins 0.9 GPU util, so checkpoints cannot share a GPU).
 #
 # Required env: CHECKPOINT_INDEX_PATH (one checkpoint dir per line), DOMAIN, MODEL_SUFFIX,
-#   RUN_ROOT. Optional: PORT(9001), NUM_GPUS(1), JUDGE_BACKEND(server), LIMIT,
+#   RUN_ROOT. Optional: PORT(9001), NUM_GPUS(1), JUDGE_BACKEND(engine), LIMIT,
 #   MCP_SERVER_PATH, SYSTEM_PROMPT, MAX_TOOL_ITERATIONS(10), MERGE_BACKEND(fsdp), SKIP_IF_EXISTS(1).
 set -euo pipefail
 
@@ -30,7 +30,7 @@ source "$VERO_EVAL_DIR/examples/_domain_map.sh"
 
 : "${CHECKPOINT_INDEX_PATH:?required}"; : "${DOMAIN:?required}"; : "${MODEL_SUFFIX:?required}"; : "${RUN_ROOT:?required}"
 PORT="${PORT:-9001}"; API_KEY="${API_KEY:-qwen}"; NUM_GPUS="${NUM_GPUS:-1}"
-export JUDGE_BACKEND="${JUDGE_BACKEND:-server}"
+export JUDGE_BACKEND="${JUDGE_BACKEND:-engine}"
 SKIP_IF_EXISTS="${SKIP_IF_EXISTS:-1}"; MERGE_BACKEND="${MERGE_BACKEND:-fsdp}"
 cd "$VERO_EVAL_DIR"
 
