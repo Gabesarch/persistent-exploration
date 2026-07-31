@@ -9,7 +9,7 @@ hydra:
 algorithm:
   adv_estimator: gdpo
   gdpo_reward_keys: [accuracy, format, tool_efficiency, tool_repeat_overlap, assistant_turn_overlong]
-  gdpo_reward_weights: [0.8, 0.2, 0.2, 0.2, 0.2]
+  gdpo_reward_weights: [0.8, 0.2, 0.1, 0.1, 0.2]
   gdpo_reward_eligibility:
     tool_efficiency:
       key: accuracy
