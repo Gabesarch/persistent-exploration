@@ -55,6 +55,7 @@ class BranchSubsamplingConfig(BaseConfig):
     enabled: bool = False
     max_branches_per_parent: Optional[int] = None
     seed: int = 42
+    selection: str = "random"
 
     def __post_init__(self):
         if self.enabled and (self.max_branches_per_parent is None or int(self.max_branches_per_parent) <= 0):
@@ -64,6 +65,10 @@ class BranchSubsamplingConfig(BaseConfig):
             )
         if int(self.seed) < 0:
             raise ValueError("policy_loss.branch_strata.subsampling.seed must be nonnegative.")
+        if self.selection not in {"random", "last"}:
+            raise ValueError(
+                "policy_loss.branch_strata.subsampling.selection must be either 'random' or 'last'."
+            )
 
 
 @dataclass

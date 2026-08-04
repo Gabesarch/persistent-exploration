@@ -225,6 +225,9 @@ class ToolAgentLoop(AgentLoopBase):
         self.conditional_answer_retry_teacher_only_prefill = bool(
             getattr(multi_turn_config, "conditional_answer_retry_teacher_only_prefill", False)
         )
+        self.conditional_answer_retry_teacher_suffix_gspo_enabled = bool(
+            getattr(multi_turn_config, "conditional_answer_retry_teacher_suffix_gspo_enabled", False)
+        )
         self.conditional_answer_retry_sft_enabled = bool(
             getattr(multi_turn_config, "conditional_answer_retry_sft_enabled", False)
         )
@@ -242,6 +245,13 @@ class ToolAgentLoop(AgentLoopBase):
                 raise ValueError("teacher-only retry prefill is incompatible with trainable injected prefills")
         if self.conditional_answer_retry_sft_enabled and not self.conditional_answer_retry_teacher_only_prefill:
             raise ValueError("retry SFT requires conditional_answer_retry_teacher_only_prefill=true")
+        if self.conditional_answer_retry_teacher_suffix_gspo_enabled:
+            if not self.conditional_answer_retry_teacher_only_prefill:
+                raise ValueError(
+                    "retry teacher-suffix GSPO requires conditional_answer_retry_teacher_only_prefill=true"
+                )
+            if self.conditional_answer_retry_sft_enabled:
+                raise ValueError("retry teacher-suffix GSPO is incompatible with retry SFT")
         self.conditional_answer_retry_correct_accuracy_threshold = getattr(
             multi_turn_config, "conditional_answer_retry_correct_accuracy_threshold", 0.0
         )
@@ -650,14 +660,21 @@ class ToolAgentLoop(AgentLoopBase):
         response_start = len(agent_data.response_mask)
         agent_data.prompt_ids += agent_data.response_ids
         is_teacher_retry_turn = bool(teacher_only_prefill_ids)
-        agent_data.response_mask += [0 if is_teacher_retry_turn else 1] * len(agent_data.response_ids)
+        train_teacher_suffix_with_gspo = (
+            is_teacher_retry_turn
+            and bool(getattr(self, "conditional_answer_retry_teacher_suffix_gspo_enabled", False))
+        )
+        teacher_suffix_loss_mask = int(train_teacher_suffix_with_gspo or not is_teacher_retry_turn)
+        agent_data.response_mask += [teacher_suffix_loss_mask] * len(agent_data.response_ids)
         agent_data.retry_sft_mask += [0] * len(agent_data.response_ids)
         if output.log_probs:
             if assistant_prefill_ids:
                 agent_data.response_logprobs += [0.0] * len(assistant_prefill_ids)
-            if is_teacher_retry_turn:
+            if is_teacher_retry_turn and not train_teacher_suffix_with_gspo:
                 agent_data.response_logprobs += [0.0] * len(agent_data.response_ids)
             else:
+                # Preserve the actual H+prefill behavior likelihood for diagnostics.
+                # GSPO's old-policy anchor is recomputed separately under stored H.
                 agent_data.response_logprobs += output.log_probs
 
         if output.routed_experts is not None:

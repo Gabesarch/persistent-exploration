@@ -99,7 +99,7 @@ policy_loss:
     # Non-tensor batch key shared by each canonical row and its branches.
     parent_id_key: request_id
 
-    # Uniformly subsample branch rows per parent before training.
+    # Subsample branch rows per parent before training.
     subsampling:
 
       # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
@@ -113,6 +113,9 @@ policy_loss:
 
       # Base seed combined with the global training step for deterministic sampling.
       seed: 42
+
+      # Branch selection policy: random or last in rollout order.
+      selection: random
 
   # Teacher-only answer-retry supervised-loss stratum.
   retry_sft:

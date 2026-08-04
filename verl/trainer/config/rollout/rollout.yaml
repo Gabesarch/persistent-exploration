@@ -263,6 +263,10 @@ multi_turn:
   # Use the retry prefill only in the temporary teacher generation prompt.
   conditional_answer_retry_teacher_only_prefill: False
 
+  # Apply GSPO to the stored teacher suffix under the prefix-free context.
+  # The temporary teacher prefill remains excluded from the trajectory and loss.
+  conditional_answer_retry_teacher_suffix_gspo_enabled: False
+
   # Mark eligible teacher-only retry suffixes for supervised loss.
   conditional_answer_retry_sft_enabled: False
 

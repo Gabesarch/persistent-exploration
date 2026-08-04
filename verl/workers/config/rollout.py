@@ -137,6 +137,9 @@ class MultiTurnConfig(BaseConfig):
     # Use the assistant prefill only for retry-teacher generation. The live
     # canonical trajectory stores only the generated suffix.
     conditional_answer_retry_teacher_only_prefill: bool = False
+    # Apply GSPO to the stored teacher suffix under the prefix-free canonical
+    # context. The temporary teacher prefill itself is never stored or trained.
+    conditional_answer_retry_teacher_suffix_gspo_enabled: bool = False
     conditional_answer_retry_sft_enabled: bool = False
     conditional_answer_retry_sft_target_selection: str = "all"
     conditional_answer_retry_correct_accuracy_threshold: float = 0.0
