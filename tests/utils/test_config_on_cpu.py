@@ -139,6 +139,26 @@ class TestConfigOnCPU(unittest.TestCase):
         self.assertEqual(reward_kwargs.assistant_turn_overlong_buffer_turns, 2)
         self.assertEqual(reward_kwargs.assistant_turn_overlong_penalty_factor, 1.0)
 
+    def test_randomturncap_recipe_is_isolated_and_configured(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        cfg = OmegaConf.load(
+            repo_root / "vero2_scripts" / "config" / "branchstrata20_fresh_randomturncap.yaml"
+        )
+        multi_turn = cfg.actor_rollout_ref.rollout.multi_turn
+        self.assertEqual(multi_turn.max_assistant_turns, 11)
+        self.assertTrue(multi_turn.randomized_max_assistant_turns_enabled)
+        self.assertEqual(multi_turn.randomized_max_assistant_turns_early_window, 5)
+        self.assertEqual(multi_turn.randomized_max_assistant_turns_per_turn_probability, 0.05)
+        self.assertEqual(multi_turn.randomized_max_assistant_turns_seed, 42)
+        self.assertFalse(multi_turn.randomized_max_assistant_turns_enable_validation)
+        reward_kwargs = cfg.reward.custom_reward_function.reward_kwargs
+        self.assertEqual(reward_kwargs.tool_efficiency_concave_k, 10.0)
+        self.assertEqual(reward_kwargs.tool_efficiency_concave_q, 0.75)
+        self.assertEqual(
+            cfg.trainer.experiment_name,
+            "branchstrata20_fresh_randomturncap_p05_x5_q075_20260803",
+        )
+
 
 class TestPrintCfgCommand(unittest.TestCase):
     """Test suite for the print_cfg.py command-line tool."""

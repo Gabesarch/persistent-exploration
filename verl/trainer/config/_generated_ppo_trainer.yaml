@@ -91,6 +91,7 @@ actor_rollout_ref:
           enabled: false
           max_branches_per_parent: null
           seed: 42
+          selection: random
       retry_sft:
         _target_: verl.workers.config.RetrySFTLossConfig
         enabled: false
@@ -319,6 +320,11 @@ actor_rollout_ref:
       force_tool_calls_until_final_turn: false
       force_answer_on_final_turn: false
       force_answer_on_final_turn_validation: null
+      randomized_max_assistant_turns_enabled: false
+      randomized_max_assistant_turns_early_window: 0
+      randomized_max_assistant_turns_per_turn_probability: 0.0
+      randomized_max_assistant_turns_seed: 42
+      randomized_max_assistant_turns_enable_validation: false
       final_answer_token_margin: 2048
       force_final_answer_think_prefill: ''
       force_final_answer_think_prefill_trainable: false
@@ -342,6 +348,7 @@ actor_rollout_ref:
       conditional_answer_retry_assistant_prefill: ''
       conditional_answer_retry_assistant_prefill_trainable: false
       conditional_answer_retry_teacher_only_prefill: false
+      conditional_answer_retry_teacher_suffix_gspo_enabled: false
       conditional_answer_retry_sft_enabled: false
       conditional_answer_retry_sft_target_selection: all
       conditional_answer_retry_correct_accuracy_threshold: 0.0

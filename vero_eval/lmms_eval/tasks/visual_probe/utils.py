@@ -291,7 +291,7 @@ def _aggregate_judge_results(results: List[Dict[str, Any]], target_fn, strict: b
         if is_equivalent:
             correct += 1
         resp_key = str(meta.get("resp_key") or f"sample_{idx}")
-        details[resp_key] = {
+        detail = {
             "question": meta.get("question"),
             "reference": meta.get("reference"),
             "prediction": meta.get("prediction"),
@@ -302,6 +302,19 @@ def _aggregate_judge_results(results: List[Dict[str, Any]], target_fn, strict: b
             "generation_failed": generation_failed,
             "score": 1.0 if is_equivalent else 0.0,
         }
+        details[resp_key] = detail
+        # ``meta`` is also referenced by the logged sample assembled before
+        # aggregation. Mutating it here persists the actual per-sample judge
+        # decision into the samples JSONL instead of retaining only the final
+        # aggregate accuracy.
+        meta.update(
+            {
+                "judge_output": raw,
+                "extracted_answer": meta.get("prediction", ""),
+                "generation_failed": generation_failed,
+                "score": detail["score"],
+            }
+        )
 
     target_fn.details = list(details.values())
     target_fn.individual_scores = details

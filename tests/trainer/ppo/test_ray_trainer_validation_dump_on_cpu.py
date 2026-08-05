@@ -414,6 +414,14 @@ class TestRayTrainerBranchSubsamplingOnCPU(unittest.TestCase):
 
         self.assertEqual(first.batch["row_id"].tolist(), second.batch["row_id"].tolist())
 
+    def test_subsampling_can_retain_last_branch_per_parent(self):
+        self.trainer.config.actor_rollout_ref.actor.policy_loss.branch_strata.subsampling.selection = "last"
+
+        sampled = self.trainer._subsample_branch_training_rows(self._batch(), {})
+        retained_branch_mask = np.asarray(sampled.non_tensor_batch["is_branch"], dtype=bool)
+
+        self.assertEqual(sampled.non_tensor_batch["payload"][retained_branch_mask].tolist(), ["a-3", "b-2"])
+
     def test_subsampling_no_branch_batch_is_unchanged(self):
         batch = self._batch().select_idxs(np.array([0, 1, 2]))
         metrics = {}
