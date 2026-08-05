@@ -33,10 +33,12 @@ algorithm:
     kl_coef: 0
 
 data:
-  # Gemini GT-filtered correct-only counting set (7,785 train / 227 val, full count range).
-  # The rollout-based hard subset (pass rate <= 0.5 over 8 base-model rollouts) swaps in via a
-  # data.train_files= override at submit time once the hard-filter pipeline has produced it.
-  train_files: /scratch/gpfs/ZHUANGL/lc1556/vero2/dataset_filter_runs/full_sync/filtered_correct_only/combined_counting_train.correct.partial.verl.jsonl
+  # Train: the rollout-based HARD subset of the Gemini GT-filtered correct-only counting set —
+  # 5,698 rows with base-model pass rate <= 0.5 over 8 sampled drawing rollouts (mean pass 0.32;
+  # produced by vero2_scripts/drawing/experiments/rollout_hard_filter/, runs 11947099/102/105/108).
+  # Rows carry avg_pass_rate/n_correct/mean_graded_accuracy annotations (inert for training).
+  # Val: the full unfiltered 227-row val set, kept intact for cross-arm comparability.
+  train_files: /scratch/gpfs/ZHUANGL/lc1556/vero2/hard_filter_runs/output/combined_counting_train.correct.partial.rollout_passrate_leq05.verl.jsonl
   val_files: /scratch/gpfs/ZHUANGL/lc1556/vero2/dataset_filter_runs/full_sync/filtered_correct_only/combined_counting_val.correct.partial.verl.jsonl
   filter_overlong_prompts_workers: 64
   image_root: ${oc.env:IMAGE_ROOT}
