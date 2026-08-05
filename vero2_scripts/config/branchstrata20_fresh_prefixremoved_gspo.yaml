@@ -345,7 +345,7 @@ reward:
       tool_efficiency_reward_mode: concave_length_penalty
       tool_efficiency_free_calls: 1
       tool_efficiency_concave_k: 10.0
-      tool_efficiency_concave_q: 0.95
+      tool_efficiency_concave_q: 0.85
       tool_repeat_overlap_iou_threshold: 0.9
       tool_repeat_overlap_small_crop_area_threshold: 0.0002
       tool_repeat_overlap_repeat_weight: 1.0

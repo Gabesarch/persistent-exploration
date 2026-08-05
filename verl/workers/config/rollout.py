@@ -99,6 +99,14 @@ class MultiTurnConfig(BaseConfig):
     # Validation-only override. None preserves the legacy behavior of inheriting
     # force_answer_on_final_turn; a boolean controls validation independently.
     force_answer_on_final_turn_validation: Optional[bool] = None
+    # Opt-in per-trajectory assistant-turn cap randomization. When enabled, the
+    # effective cap is sampled from the final `early_window` turns using a
+    # deterministic per-turn hazard and otherwise remains max_assistant_turns.
+    randomized_max_assistant_turns_enabled: bool = False
+    randomized_max_assistant_turns_early_window: int = 0
+    randomized_max_assistant_turns_per_turn_probability: float = 0.0
+    randomized_max_assistant_turns_seed: int = 42
+    randomized_max_assistant_turns_enable_validation: bool = False
     final_answer_token_margin: int = 2048
     # Text appended inside the forced final turn's `<think>` block before generation.
     # Empty string leaves forced final-answer generation unchanged.

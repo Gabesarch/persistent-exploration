@@ -227,6 +227,14 @@ multi_turn:
   # shared setting for backward compatibility; true/false controls validation independently.
   force_answer_on_final_turn_validation: null
 
+  # Opt-in deterministic per-trajectory randomization of the final assistant-turn cap.
+  # Disabled defaults preserve the configured max_assistant_turns for existing runs.
+  randomized_max_assistant_turns_enabled: False
+  randomized_max_assistant_turns_early_window: 0
+  randomized_max_assistant_turns_per_turn_probability: 0.0
+  randomized_max_assistant_turns_seed: 42
+  randomized_max_assistant_turns_enable_validation: False
+
   # Token headroom reserved for the final <answer> turn; if remaining response budget
   # drops below this, switch to forcing an answer to avoid an answerless overflow.
   final_answer_token_margin: 2048

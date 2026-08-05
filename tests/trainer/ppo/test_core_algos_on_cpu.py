@@ -966,6 +966,28 @@ def test_tool_efficiency_concave_penalty_log_limit_for_q_one():
     assert reward == pytest.approx(-torch.log1p(torch.tensor(20.0)).item() / 10.0)
 
 
+def test_tool_efficiency_q075_strengthens_late_turn_marginals():
+    from verl.utils.reward_score.math_verify_reward_type_multiturn_tool_calling_optional_think import (
+        tool_efficiency_reward,
+    )
+
+    def reward(tool_calls, q):
+        return tool_efficiency_reward(
+            tool_calls,
+            mode="concave_length_penalty",
+            free_calls=1,
+            concave_k=10.0,
+            concave_q=q,
+        )
+
+    q075_rewards = [reward(tool_calls, 0.75) for tool_calls in range(1, 11)]
+    assert all(q075_rewards[index] >= q075_rewards[index + 1] for index in range(len(q075_rewards) - 1))
+    assert reward(8, 0.75) - reward(9, 0.75) == pytest.approx(0.038887, abs=1e-6)
+    assert reward(9, 0.75) - reward(10, 0.75) == pytest.approx(0.035436, abs=1e-6)
+    assert reward(8, 0.75) - reward(9, 0.75) > reward(8, 0.95) - reward(9, 0.95)
+    assert reward(9, 0.75) - reward(10, 0.75) > reward(9, 0.95) - reward(10, 0.95)
+
+
 def test_branch_strata_weights_parent_balance_and_fraction():
     response_mask = torch.ones((6, 2), dtype=torch.float32)
     branch_flags = np.asarray([False, False, False, True, True, True], dtype=object)
