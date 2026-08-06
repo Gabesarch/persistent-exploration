@@ -30,7 +30,7 @@ export SKIP_SQUEUE=1
 export VERO2_COMPREHENSIVE_DEBUG_LOGGING=1
 export WANDB_MODE=offline                          # smoke: offline, no proxy needed
 # Real training config, not a debug256 clone; the retry prefill comes from the yaml.
-export CONFIG_NAME="gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_branch_donly_pointbox_forcedprefill_branchstrata_base_noforceanswer_turn4k_inferenceval"
+export CONFIG_NAME="branchstrata20_fresh_counting"
 export TRAINER_EXPERIMENT_NAME="drawonly_brstrata_smoke_${SMOKE_ID}"
 export TRAINER_DEFAULT_LOCAL_DIR="${SAVE_PATH}/checkpoints/vero2_verl/drawonly_brstrata_smoke_${SMOKE_ID}"
 

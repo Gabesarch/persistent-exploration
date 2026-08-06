@@ -49,12 +49,12 @@ HYDRA_ARGS=("$@")
 # The drawing-worded retry prefill is hardcoded in the yaml (source of truth). Exporting
 # ANSWER_RETRY_ASSISTANT_PREFILL is an opt-in override, injected further below.
 
-CHECKPOINT_DATE_TIME="${CHECKPOINT_DATE_TIME:-20260803_050000}"
+CHECKPOINT_DATE_TIME="${CHECKPOINT_DATE_TIME:-20260806_140000}"
 RUN_UNIQUE_ID="${RUN_UNIQUE_ID:-${SLURM_JOB_ID:-pid_$$}}"
 NUM_GPUS="${NUM_GPUS:-${SLURM_GPUS_ON_NODE:-8}}"
 
 ALGORITHM_TAG="${ALGORITHM_TAG:-GDPO_HDPOtool_GSPO_fp16_math_verify}"
-TRAINER_EXPERIMENT_SUFFIX="${TRAINER_EXPERIMENT_SUFFIX:-qwen3vl_visual_probe_drawonly_gdpo_hdpotool_hard_answer_retry_branch_donly_pointbox_branchstrata20_base_noforceanswer}"
+TRAINER_EXPERIMENT_SUFFIX="${TRAINER_EXPERIMENT_SUFFIX:-qwen3vl_counting_drawonly_branchstrata20_fresh_pointbox}"
 CHECKPOINT_EXPERIMENT_NAME="${CHECKPOINT_EXPERIMENT_NAME:-${ALGORITHM_TAG}_${TRAINER_EXPERIMENT_SUFFIX}_${CHECKPOINT_DATE_TIME}}"
 TRAINER_EXPERIMENT_NAME="${TRAINER_EXPERIMENT_NAME:-${CHECKPOINT_EXPERIMENT_NAME}_${RUN_UNIQUE_ID}}"
 TRAINER_PROJECT_NAME="${TRAINER_PROJECT_NAME:-vero2_verl}"
@@ -131,7 +131,7 @@ if [ -n "${ANSWER_RETRY_ASSISTANT_PREFILL:-}" ] && \
   )
 fi
 
-CONFIG_NAME="${CONFIG_NAME:-gdpo_hdpotool_gspo_chart_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_branch_donly_pointbox_forcedprefill_branchstrata_base_noforceanswer_turn4k_inferenceval}"
+CONFIG_NAME="${CONFIG_NAME:-branchstrata20_fresh_counting}"
 
 echo "CONFIG_NAME=$CONFIG_NAME"
 echo "TRAINER_PROJECT_NAME=$TRAINER_PROJECT_NAME"

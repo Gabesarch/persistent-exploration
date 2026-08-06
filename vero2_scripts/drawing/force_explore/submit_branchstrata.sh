@@ -48,7 +48,7 @@ esac
 # Target-tagged experiment suffix -> distinct checkpoint dir + W&B run per partition, so
 # parallel submissions to different partitions never write the same directory. Override the
 # env (see header) to resume one partition's checkpoints on another.
-export TRAINER_EXPERIMENT_SUFFIX="${TRAINER_EXPERIMENT_SUFFIX:-qwen3vl_visual_probe_drawonly_gdpo_hdpotool_hard_answer_retry_branch_donly_pointbox_branchstrata20_base_noforceanswer_${TARGET}}"
+export TRAINER_EXPERIMENT_SUFFIX="${TRAINER_EXPERIMENT_SUFFIX:-qwen3vl_counting_drawonly_branchstrata20_fresh_pointbox_${TARGET}}"
 
 # Optional inference-only rollout speedups (no effect on the training objective): prefix + mm
 # caching so 11-turn drawing trajectories don't re-prefill the growing context / re-embed the

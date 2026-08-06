@@ -8,10 +8,12 @@ hydra:
 
 algorithm:
   adv_estimator: gdpo
-  # Haoyang's tested counting point-box blend + the branchstrata reference's overlong penalty.
+  # branchstrata20_fresh blend, counting-adapted: Haoyang's point-box weights for acc/fmt/point_box,
+  # fresh's stronger tool_efficiency (0.25, concave_q 0.85), assistant_turn_overlong dropped like fresh.
+  # (fresh's tool_repeat_overlap is zoom-only and stays out; point_box is the counting analogue.)
   # point_box_applicable is an eligibility gate, not a component — it must NOT appear in the keys.
-  gdpo_reward_keys: [accuracy, format, point_box, tool_efficiency, assistant_turn_overlong]
-  gdpo_reward_weights: [0.5, 0.1, 0.3, 0.1, 0.2]
+  gdpo_reward_keys: [accuracy, format, point_box, tool_efficiency]
+  gdpo_reward_weights: [0.5, 0.1, 0.3, 0.25]
   gdpo_reward_eligibility:
     tool_efficiency:
       key: accuracy
@@ -37,9 +39,11 @@ data:
   # 5,698 rows with base-model pass rate <= 0.5 over 8 sampled drawing rollouts (mean pass 0.32;
   # produced by vero2_scripts/drawing/experiments/rollout_hard_filter/, runs 11947099/102/105/108).
   # Rows carry avg_pass_rate/n_correct/mean_graded_accuracy annotations (inert for training).
-  # Val: the full unfiltered 227-row val set, kept intact for cross-arm comparability.
+  # Val: 256-row stratified CountQA subset (one row per question, integer answers, ~51 per count
+  # bucket; built by vero2_scripts/drawing/experiments/make_countqa_val_subset.py) — an external
+  # benchmark-style validation instead of a held-out slice of the training distribution.
   train_files: /scratch/gpfs/ZHUANGL/lc1556/vero2/hard_filter_runs/output/combined_counting_train.correct.partial.rollout_passrate_leq05.verl.jsonl
-  val_files: /scratch/gpfs/ZHUANGL/lc1556/vero2/dataset_filter_runs/full_sync/filtered_correct_only/combined_counting_val.correct.partial.verl.jsonl
+  val_files: /scratch/gpfs/ZHUANGL/lc1556/vero2/datasets/countqa_val/countqa_val_256.verl.jsonl
   filter_overlong_prompts_workers: 64
   image_root: ${oc.env:IMAGE_ROOT}
   system_prompt: ${oc.env:VERL_ROOT}/vero2_scripts/prompts/system_prompt_chatting_tool_calling.txt
@@ -217,7 +221,10 @@ actor_rollout_ref:
         parent_id_key: request_id
         subsampling:
           enabled: true
-          max_branches_per_parent: 1
+          # fresh recipe: keep up to the LAST 2 wrong answers per parent (with uncapped
+          # retries a parent can produce many; 'last' keeps the most-informed failures).
+          max_branches_per_parent: 2
+          selection: last
           seed: 42
     use_kl_loss: false
     kl_loss_coef: 0.0
@@ -266,11 +273,13 @@ actor_rollout_ref:
       max_tool_response_length: 256
       tool_response_truncate_side: middle
       format: hermes
-      # Force-explore / answer-retry: normal rollout first; an incorrect <answer> is removed and
-      # followed by a forced tool-call retry. Training never forces an answer on the final turn
-      # (noforceanswer); validation does, and runs retry/branch-free like plain inference (inferenceval).
+      # Force-explore / answer-retry (branchstrata20_fresh recipe): normal rollout first; an
+      # incorrect <answer> is removed and followed by a forced tool-call retry, UNCAPPED
+      # (max_retries null — bounded only by the turn budget). Training now also forces an
+      # answer on the final turn (fresh reverted the noforceanswer arm); validation runs
+      # retry/branch-free like plain inference (inferenceval).
       force_tool_calls_until_final_turn: false
-      force_answer_on_final_turn: false
+      force_answer_on_final_turn: true
       force_answer_on_final_turn_validation: true
       force_final_answer_think_prefill: "This is the final turn, so I need to answer from the evidence gathered so far."
       final_answer_token_margin: 2048
@@ -280,7 +289,7 @@ actor_rollout_ref:
       conditional_answer_retry_suffix: ""
       conditional_answer_retry_assistant_prefill: "Let's see, I do not have enough information to answer yet. My current annotations may be inaccurate or incomplete — let me use the drawing tools to correct and complete my markings, then re-examine the image before answering."
       conditional_answer_retry_correct_accuracy_threshold: 0.0
-      conditional_answer_retry_max_retries: 4
+      conditional_answer_retry_max_retries: null
       # Wrong-answer branching: the trajectory containing the wrong <answer> is kept as a separate
       # training row (divergence-only loss mask, excluded from the GDPO group baseline).
       conditional_answer_retry_branch_enabled: true
@@ -350,12 +359,7 @@ reward:
       tool_efficiency_reward_mode: concave_length_penalty
       tool_efficiency_free_calls: 1
       tool_efficiency_concave_k: 10.0
-      tool_efficiency_concave_q: 0.95
-      # Must stay equal to actor_rollout_ref.rollout.multi_turn.max_assistant_turns.
-      assistant_turn_overlong_enabled: true
-      assistant_turn_overlong_max_turns: 11
-      assistant_turn_overlong_buffer_turns: 2
-      assistant_turn_overlong_penalty_factor: 1.0
+      tool_efficiency_concave_q: 0.85
       allow_unboxed_answer_for_accuracy: true
       require_boxed_answer_for_full_format: true
       unboxed_answer_format_score: 0.5
