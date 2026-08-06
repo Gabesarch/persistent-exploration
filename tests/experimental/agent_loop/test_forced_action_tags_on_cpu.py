@@ -270,8 +270,13 @@ class _FakeServerManager:
 
 
 class _SequencedFakeServerManager:
-    def __init__(self, token_ids_by_call: list[list[int]]):
+    def __init__(
+        self,
+        token_ids_by_call: list[list[int]],
+        log_probs_by_call: Optional[list[list[float]]] = None,
+    ):
         self.token_ids_by_call = list(token_ids_by_call)
+        self.log_probs_by_call = list(log_probs_by_call) if log_probs_by_call is not None else None
         self.sampling_params_by_call: list[dict[str, Any]] = []
         self.prompt_ids_by_call: list[list[int]] = []
 
@@ -288,7 +293,8 @@ class _SequencedFakeServerManager:
         self.prompt_ids_by_call.append(list(prompt_ids))
         self.sampling_params_by_call.append(sampling_params)
         token_ids = self.token_ids_by_call.pop(0)
-        return TokenOutput(token_ids=token_ids, extra_fields={}, log_probs=[0.0] * len(token_ids))
+        log_probs = self.log_probs_by_call.pop(0) if self.log_probs_by_call is not None else [0.0] * len(token_ids)
+        return TokenOutput(token_ids=token_ids, extra_fields={}, log_probs=log_probs)
 
 
 class _FakeToolParser:
@@ -328,6 +334,7 @@ def _make_loop(tokenizer: _FakeTokenizer, server_manager: _FakeServerManager, to
     loop.force_final_answer_prefix = ""
     loop.max_assistant_turns = 11
     loop.max_assistant_tokens_per_turn = None
+    loop.max_assistant_response_length = None
     loop.max_user_turns = 10
     loop.response_length = 24576
     loop.server_manager = server_manager
@@ -357,6 +364,7 @@ def _make_conditional_retry_loop(
     loop.force_final_answer_prefix = ""
     loop.max_assistant_turns = 11
     loop.max_assistant_tokens_per_turn = None
+    loop.max_assistant_response_length = None
     loop.max_user_turns = 10
     loop.response_length = 64
     loop.server_manager = server_manager
@@ -374,6 +382,7 @@ def _make_conditional_retry_loop(
     loop.conditional_answer_retry_assistant_prefill = ""
     loop.conditional_answer_retry_assistant_prefill_trainable = False
     loop.conditional_answer_retry_teacher_only_prefill = False
+    loop.conditional_answer_retry_teacher_suffix_gspo_enabled = False
     loop.conditional_answer_retry_sft_enabled = False
     loop.conditional_answer_retry_sft_target_selection = "all"
     loop.conditional_answer_retry_correct_accuracy_threshold = 0.0
@@ -462,6 +471,12 @@ def test_tool_agent_loop_init_tolerates_missing_optional_multi_turn_keys(monkeyp
     assert loop.conditional_answer_retry_force_next_tool_call is True
     assert loop.conditional_answer_retry_assistant_prefill == ""
     assert loop.conditional_answer_retry_assistant_prefill_trainable is False
+    assert loop.conditional_answer_retry_teacher_suffix_gspo_enabled is False
+    assert loop.randomized_max_assistant_turns_enabled is False
+    assert loop.randomized_max_assistant_turns_early_window == 0
+    assert loop.randomized_max_assistant_turns_per_turn_probability == 0.0
+    assert loop.randomized_max_assistant_turns_seed == 42
+    assert loop.randomized_max_assistant_turns_enable_validation is False
     assert loop.llm_judge_enabled is False
     assert loop.llm_judge_reward_types == {"search"}
     assert loop.llm_judge_assistant_prefill == "{"
@@ -662,6 +677,140 @@ def test_validation_final_answer_override_does_not_force_early_turns():
 
     assert loop._force_answer_on_final_turn_active({"_debug_trajectory": {"validate": True}}) is True
     assert loop._must_answer_now(agent_data) is False
+
+
+def _configure_randomized_turn_caps(loop, *, probability=0.05, enable_validation=False):
+    loop.max_assistant_turns = 11
+    loop.randomized_max_assistant_turns_enabled = True
+    loop.randomized_max_assistant_turns_early_window = 5
+    loop.randomized_max_assistant_turns_per_turn_probability = probability
+    loop.randomized_max_assistant_turns_seed = 42
+    loop.randomized_max_assistant_turns_enable_validation = enable_validation
+
+
+def test_randomized_turn_caps_disabled_preserves_configured_cap():
+    loop = object.__new__(ToolAgentLoop)
+    loop.max_assistant_turns = 11
+    loop.randomized_max_assistant_turns_enabled = False
+
+    assert loop._sample_effective_max_assistant_turns({"step": 3, "sample_index": 7, "rollout_n": 2}) == 11
+
+
+def test_randomized_turn_caps_probability_extremes_and_validation_isolation():
+    loop = object.__new__(ToolAgentLoop)
+    trajectory = {"step": 3, "sample_index": 7, "rollout_n": 2, "validate": False}
+    _configure_randomized_turn_caps(loop, probability=0.0)
+    assert loop._sample_effective_max_assistant_turns(trajectory) == 11
+
+    loop.randomized_max_assistant_turns_per_turn_probability = 1.0
+    assert loop._sample_effective_max_assistant_turns(trajectory) == 6
+    assert loop._sample_effective_max_assistant_turns({**trajectory, "validate": True}) == 11
+
+    loop.randomized_max_assistant_turns_enable_validation = True
+    assert loop._sample_effective_max_assistant_turns({**trajectory, "validate": True}) == 6
+
+
+def test_randomized_turn_caps_are_reproducible_and_distinguish_rollout_repetitions():
+    loop = object.__new__(ToolAgentLoop)
+    _configure_randomized_turn_caps(loop, probability=0.5)
+    trajectory = {"step": 9, "sample_index": 13, "rollout_n": 4, "validate": False}
+
+    assert loop._sample_effective_max_assistant_turns(trajectory) == loop._sample_effective_max_assistant_turns(
+        dict(trajectory)
+    )
+    sampled_caps = {
+        loop._sample_effective_max_assistant_turns({**trajectory, "rollout_n": rollout_n})
+        for rollout_n in range(16)
+    }
+    assert len(sampled_caps) > 1
+    assert sampled_caps <= set(range(6, 12))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_assistant_turns", None),
+        ("max_assistant_turns", 0),
+        ("randomized_max_assistant_turns_early_window", 0),
+        ("randomized_max_assistant_turns_early_window", 11),
+        ("randomized_max_assistant_turns_per_turn_probability", -0.01),
+        ("randomized_max_assistant_turns_per_turn_probability", 1.01),
+        ("randomized_max_assistant_turns_seed", True),
+    ],
+)
+def test_randomized_turn_cap_config_validation(field, value):
+    loop = object.__new__(ToolAgentLoop)
+    _configure_randomized_turn_caps(loop)
+    setattr(loop, field, value)
+
+    with pytest.raises(ValueError):
+        loop._validate_randomized_max_assistant_turns_config()
+
+
+def test_effective_turn_cap_is_per_trajectory_and_controls_forced_answer_timing():
+    loop = object.__new__(ToolAgentLoop)
+    loop.max_assistant_turns = 11
+    loop.max_user_turns = 10
+    loop.final_answer_token_margin = 4
+    loop.response_length = 64
+    early_agent_data = _make_agent_data()
+    full_agent_data = _make_agent_data()
+    early_agent_data.assistant_turns = full_agent_data.assistant_turns = 5
+    early_agent_data.effective_max_assistant_turns = 6
+    full_agent_data.effective_max_assistant_turns = 11
+
+    assert loop._must_answer_now(early_agent_data) is True
+    assert loop._must_answer_now(full_agent_data) is False
+
+
+def test_effective_turn_cap_controls_retry_capacity():
+    loop = object.__new__(ToolAgentLoop)
+    loop.max_assistant_turns = 11
+    loop.max_user_turns = 10
+    loop.final_answer_token_margin = 4
+    loop.response_length = 64
+    loop.conditional_answer_retry_max_retries = None
+    agent_data = _make_agent_data()
+    agent_data.effective_max_assistant_turns = 6
+
+    assert (
+        loop._incorrect_answer_retry_skipped_reason(
+            agent_data,
+            {"assistant_turns": 5, "response_mask_len": 0},
+            retry_count=0,
+        )
+        == "max_assistant_turns"
+    )
+
+
+def test_randomized_turn_cap_metadata_is_copied_to_retry_branches():
+    loop = object.__new__(ToolAgentLoop)
+    _configure_randomized_turn_caps(loop)
+    loop.conditional_answer_retry_branch_enabled = True
+    loop.conditional_answer_retry_branch_enable_validation = False
+    loop.conditional_answer_retry_branch_mask_mode = "divergence_only"
+    loop.conditional_answer_retry_branch_baseline_weight_key = "gdpo_baseline_weight"
+    loop.conditional_answer_retry_branch_use_graded_rewards = True
+    loop.response_length = 64
+    agent_data = _make_agent_data()
+    agent_data.effective_max_assistant_turns = 8
+    agent_data.response_mask = [1]
+    agent_data.retry_sft_mask = [0]
+    agent_data.prompt_ids = [100, 50]
+    agent_data.assistant_turns = 1
+
+    loop._maybe_append_wrong_answer_branch(
+        agent_data=agent_data,
+        generation_snapshot={"response_mask_len": 0},
+        grade={"accuracy": 0.0, "score": 0.0},
+        retry_count=1,
+        removed_assistant_text="wrong",
+        rollout_kwargs={"_debug_trajectory": {"validate": False}},
+    )
+
+    assert len(agent_data.branch_outputs) == 1
+    assert agent_data.branch_outputs[0].extra_fields["configured_max_assistant_turns"] == 11
+    assert agent_data.branch_outputs[0].extra_fields["effective_max_assistant_turns"] == 8
 
 
 def test_forced_final_turn_forces_boxed_answer_prefix():
@@ -1192,6 +1341,83 @@ def test_teacher_only_retry_prefill_is_not_stored_or_seen_by_later_student():
     assert candidate["static_rejection_reasons"] == []
     assert candidate["response_start"] == 0
     assert candidate["response_end"] == teacher_len
+
+
+def test_teacher_only_retry_suffix_is_gspo_trained_without_storing_prefill():
+    tokenizer = _FakeTokenizer()
+    teacher_tokens = [31, 1, 2, 10, 41, 11]
+    student_tokens = [30, 31, 1, 2, 20, 21, 22, 23]
+    server_manager = _SequencedFakeServerManager(
+        [
+            [30, 31, 1, 2, 20, 21, 22, 50],
+            teacher_tokens,
+            student_tokens,
+        ],
+        log_probs_by_call=[
+            [-0.1] * 8,
+            [-0.2] * len(teacher_tokens),
+            [-0.3] * len(student_tokens),
+        ],
+    )
+    tool_parser = _SequencedFakeToolParser(
+        [
+            [],
+            [
+                FunctionCall(
+                    name="image_zoom_in_tool",
+                    arguments='{"label":"shelf","bbox_2d":[100,100,500,500],"img_idx":0}',
+                )
+            ],
+            [],
+        ]
+    )
+    agent_data = _make_agent_data()
+
+    async def run_test():
+        loop = _make_conditional_retry_loop(
+            tokenizer,
+            server_manager,
+            tool_parser,
+            lambda **kwargs: {"accuracy": 0.0, "score": 0.0},
+        )
+        loop.conditional_answer_retry_assistant_prefill = "retry prefill"
+        loop.conditional_answer_retry_teacher_only_prefill = True
+        loop.conditional_answer_retry_teacher_suffix_gspo_enabled = True
+        first_state = await loop._handle_generating_state(
+            agent_data,
+            {"temperature": 1.0},
+            rollout_kwargs={"data_source": "unit", "reward_model": {"ground_truth": "ok"}, "extra_info": {}},
+        )
+        teacher_state = await loop._handle_generating_state(
+            agent_data,
+            {"temperature": 1.0},
+            rollout_kwargs={"data_source": "unit", "reward_model": {"ground_truth": "ok"}, "extra_info": {}},
+        )
+        agent_data.prompt_ids += [90]
+        agent_data.response_mask += [0]
+        agent_data.retry_sft_mask += [0]
+        agent_data.response_logprobs += [0.0]
+        loop.conditional_answer_retry_enabled = False
+        student_state = await loop._handle_generating_state(
+            agent_data,
+            {"temperature": 1.0},
+            rollout_kwargs={"data_source": "unit", "reward_model": {"ground_truth": "ok"}, "extra_info": {}},
+        )
+        return first_state, teacher_state, student_state
+
+    first_state, teacher_state, student_state = asyncio.run(run_test())
+
+    assert first_state == AgentState.GENERATING
+    assert teacher_state == AgentState.PROCESSING_TOOLS
+    assert student_state == AgentState.TERMINATED
+    assert server_manager.prompt_ids_by_call[1][-2:] == [70, 71]
+    assert 70 not in server_manager.prompt_ids_by_call[2]
+    assert 71 not in server_manager.prompt_ids_by_call[2]
+    assert 70 not in agent_data.prompt_ids
+    assert 71 not in agent_data.prompt_ids
+    assert agent_data.response_mask == [1] * len(teacher_tokens) + [0] + [1] * len(student_tokens)
+    assert agent_data.retry_sft_mask == [0] * len(agent_data.response_mask)
+    assert agent_data.response_logprobs == [-0.2] * len(teacher_tokens) + [0.0] + [-0.3] * len(student_tokens)
 
 
 def test_conditional_answer_retry_assistant_prefill_is_trainable_when_enabled():

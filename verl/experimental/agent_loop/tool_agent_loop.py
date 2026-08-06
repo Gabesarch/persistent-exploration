@@ -16,6 +16,7 @@ import inspect
 import json
 import logging
 import os
+import random
 import re
 from enum import Enum
 from typing import Any, Optional
@@ -135,6 +136,7 @@ class AgentData:
         self.tool_rewards: list[float] = []
         self.user_turns = 0
         self.assistant_turns = 0
+        self.effective_max_assistant_turns: int | None = None
 
         # Temporary state for tool calls
         self.tool_calls: list[FunctionCall] = []
@@ -187,6 +189,22 @@ class ToolAgentLoop(AgentLoopBase):
         self.force_answer_on_final_turn_validation = getattr(
             multi_turn_config, "force_answer_on_final_turn_validation", None
         )
+        self.randomized_max_assistant_turns_enabled = bool(
+            getattr(multi_turn_config, "randomized_max_assistant_turns_enabled", False)
+        )
+        self.randomized_max_assistant_turns_early_window = getattr(
+            multi_turn_config, "randomized_max_assistant_turns_early_window", 0
+        )
+        self.randomized_max_assistant_turns_per_turn_probability = getattr(
+            multi_turn_config, "randomized_max_assistant_turns_per_turn_probability", 0.0
+        )
+        self.randomized_max_assistant_turns_seed = getattr(
+            multi_turn_config, "randomized_max_assistant_turns_seed", 42
+        )
+        self.randomized_max_assistant_turns_enable_validation = bool(
+            getattr(multi_turn_config, "randomized_max_assistant_turns_enable_validation", False)
+        )
+        self._validate_randomized_max_assistant_turns_config()
         self.final_answer_token_margin = getattr(multi_turn_config, "final_answer_token_margin", 2048)
         self.force_final_answer_think_prefill = getattr(multi_turn_config, "force_final_answer_think_prefill", "")
         self.force_final_answer_think_prefill_trainable = bool(
@@ -225,6 +243,9 @@ class ToolAgentLoop(AgentLoopBase):
         self.conditional_answer_retry_teacher_only_prefill = bool(
             getattr(multi_turn_config, "conditional_answer_retry_teacher_only_prefill", False)
         )
+        self.conditional_answer_retry_teacher_suffix_gspo_enabled = bool(
+            getattr(multi_turn_config, "conditional_answer_retry_teacher_suffix_gspo_enabled", False)
+        )
         self.conditional_answer_retry_sft_enabled = bool(
             getattr(multi_turn_config, "conditional_answer_retry_sft_enabled", False)
         )
@@ -242,6 +263,13 @@ class ToolAgentLoop(AgentLoopBase):
                 raise ValueError("teacher-only retry prefill is incompatible with trainable injected prefills")
         if self.conditional_answer_retry_sft_enabled and not self.conditional_answer_retry_teacher_only_prefill:
             raise ValueError("retry SFT requires conditional_answer_retry_teacher_only_prefill=true")
+        if self.conditional_answer_retry_teacher_suffix_gspo_enabled:
+            if not self.conditional_answer_retry_teacher_only_prefill:
+                raise ValueError(
+                    "retry teacher-suffix GSPO requires conditional_answer_retry_teacher_only_prefill=true"
+                )
+            if self.conditional_answer_retry_sft_enabled:
+                raise ValueError("retry teacher-suffix GSPO is incompatible with retry SFT")
         self.conditional_answer_retry_correct_accuracy_threshold = getattr(
             multi_turn_config, "conditional_answer_retry_correct_accuracy_threshold", 0.0
         )
@@ -388,6 +416,9 @@ class ToolAgentLoop(AgentLoopBase):
             interaction=interaction,
             interaction_kwargs=interaction_kwargs,
         )
+        agent_data.effective_max_assistant_turns = self._sample_effective_max_assistant_turns(debug_trajectory)
+        if self.randomized_max_assistant_turns_enabled:
+            agent_data.extra_fields.update(self._randomized_turn_cap_metadata(agent_data))
         debug_enabled = self._debug_enabled_for_trajectory(debug_trajectory)
         agent_data.debug_logging_enabled = debug_enabled
         if debug_enabled:
@@ -441,6 +472,7 @@ class ToolAgentLoop(AgentLoopBase):
                 "assistant_turns": agent_data.assistant_turns,
                 "turn_scores": agent_data.turn_scores,
                 "tool_rewards": agent_data.tool_rewards,
+                **self._randomized_turn_cap_metadata(agent_data),
                 CROP_IMAGE_REFS_KEY: agent_data.crop_image_refs,
                 "__agent_loop_retry_sft_candidates": list(agent_data.retry_sft_candidates),
                 "retry_sft_candidate_count": len(agent_data.retry_sft_candidates),
@@ -478,6 +510,71 @@ class ToolAgentLoop(AgentLoopBase):
         )
         return AgentState.GENERATING
 
+    def _validate_randomized_max_assistant_turns_config(self) -> None:
+        if not self.randomized_max_assistant_turns_enabled:
+            return
+        configured_cap = self.max_assistant_turns
+        if isinstance(configured_cap, bool) or not isinstance(configured_cap, int) or configured_cap <= 0:
+            raise ValueError(
+                "multi_turn.max_assistant_turns must be a positive integer when randomized caps are enabled"
+            )
+        early_window = self.randomized_max_assistant_turns_early_window
+        if isinstance(early_window, bool) or not isinstance(early_window, int):
+            raise ValueError("randomized_max_assistant_turns_early_window must be an integer")
+        if not 1 <= early_window < configured_cap:
+            raise ValueError(
+                "randomized_max_assistant_turns_early_window must be in "
+                f"[1, {configured_cap - 1}], got {early_window!r}"
+            )
+        probability = self.randomized_max_assistant_turns_per_turn_probability
+        if isinstance(probability, bool) or not isinstance(probability, int | float):
+            raise ValueError("randomized_max_assistant_turns_per_turn_probability must be numeric")
+        if not 0.0 <= float(probability) <= 1.0:
+            raise ValueError(
+                "randomized_max_assistant_turns_per_turn_probability must be in "
+                f"[0, 1], got {probability!r}"
+            )
+        seed = self.randomized_max_assistant_turns_seed
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise ValueError("randomized_max_assistant_turns_seed must be an integer")
+
+    def _sample_effective_max_assistant_turns(self, debug_trajectory: Optional[dict[str, Any]]) -> int | None:
+        configured_cap = self.max_assistant_turns
+        if not self.randomized_max_assistant_turns_enabled:
+            return configured_cap
+        debug_trajectory = debug_trajectory or {}
+        if debug_trajectory.get("validate") and not self.randomized_max_assistant_turns_enable_validation:
+            return configured_cap
+        seed_material = json.dumps(
+            [
+                self.randomized_max_assistant_turns_seed,
+                debug_trajectory.get("step"),
+                debug_trajectory.get("sample_index"),
+                debug_trajectory.get("rollout_n"),
+            ],
+            separators=(",", ":"),
+            default=str,
+        )
+        rng = random.Random(seed_material)
+        earliest_cap = configured_cap - self.randomized_max_assistant_turns_early_window
+        probability = float(self.randomized_max_assistant_turns_per_turn_probability)
+        for candidate_cap in range(earliest_cap, configured_cap):
+            if rng.random() < probability:
+                return candidate_cap
+        return configured_cap
+
+    def _effective_max_assistant_turns(self, agent_data: AgentData) -> int | None:
+        effective_cap = getattr(agent_data, "effective_max_assistant_turns", None)
+        return self.max_assistant_turns if effective_cap is None else effective_cap
+
+    def _randomized_turn_cap_metadata(self, agent_data: AgentData) -> dict[str, Any]:
+        if not getattr(self, "randomized_max_assistant_turns_enabled", False):
+            return {}
+        return {
+            "configured_max_assistant_turns": self.max_assistant_turns,
+            "effective_max_assistant_turns": self._effective_max_assistant_turns(agent_data),
+        }
+
     def _must_answer_now(self, agent_data: AgentData) -> bool:
         """Whether the upcoming assistant turn must produce a final answer rather than a tool call.
 
@@ -485,7 +582,10 @@ class ToolAgentLoop(AgentLoopBase):
         remaining response budget is too small to safely fit another tool round plus a final answer.
         """
         return (
-            (self.max_assistant_turns and agent_data.assistant_turns + 1 >= self.max_assistant_turns)
+            (
+                self._effective_max_assistant_turns(agent_data)
+                and agent_data.assistant_turns + 1 >= self._effective_max_assistant_turns(agent_data)
+            )
             or (self.max_user_turns and agent_data.user_turns >= self.max_user_turns)
             or (len(agent_data.response_mask) + self.final_answer_token_margin >= self.response_length)
         )
@@ -650,14 +750,21 @@ class ToolAgentLoop(AgentLoopBase):
         response_start = len(agent_data.response_mask)
         agent_data.prompt_ids += agent_data.response_ids
         is_teacher_retry_turn = bool(teacher_only_prefill_ids)
-        agent_data.response_mask += [0 if is_teacher_retry_turn else 1] * len(agent_data.response_ids)
+        train_teacher_suffix_with_gspo = (
+            is_teacher_retry_turn
+            and bool(getattr(self, "conditional_answer_retry_teacher_suffix_gspo_enabled", False))
+        )
+        teacher_suffix_loss_mask = int(train_teacher_suffix_with_gspo or not is_teacher_retry_turn)
+        agent_data.response_mask += [teacher_suffix_loss_mask] * len(agent_data.response_ids)
         agent_data.retry_sft_mask += [0] * len(agent_data.response_ids)
         if output.log_probs:
             if assistant_prefill_ids:
                 agent_data.response_logprobs += [0.0] * len(assistant_prefill_ids)
-            if is_teacher_retry_turn:
+            if is_teacher_retry_turn and not train_teacher_suffix_with_gspo:
                 agent_data.response_logprobs += [0.0] * len(agent_data.response_ids)
             else:
+                # Preserve the actual H+prefill behavior likelihood for diagnostics.
+                # GSPO's old-policy anchor is recomputed separately under stored H.
                 agent_data.response_logprobs += output.log_probs
 
         if output.routed_experts is not None:
@@ -740,7 +847,8 @@ class ToolAgentLoop(AgentLoopBase):
         # Check termination conditions
         if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
             return AgentState.TERMINATED
-        if self.max_assistant_turns and agent_data.assistant_turns >= self.max_assistant_turns:
+        effective_max_assistant_turns = self._effective_max_assistant_turns(agent_data)
+        if effective_max_assistant_turns and agent_data.assistant_turns >= effective_max_assistant_turns:
             return AgentState.TERMINATED
         if self.max_user_turns and agent_data.user_turns >= self.max_user_turns:
             return AgentState.TERMINATED
@@ -1027,6 +1135,7 @@ class ToolAgentLoop(AgentLoopBase):
                 "reward_extra_info": reward_extra_info,
                 "turn_scores": list(agent_data.turn_scores),
                 "tool_rewards": list(agent_data.tool_rewards),
+                **self._randomized_turn_cap_metadata(agent_data),
                 CROP_IMAGE_REFS_KEY: list(agent_data.crop_image_refs),
             },
         )
@@ -1346,7 +1455,8 @@ class ToolAgentLoop(AgentLoopBase):
         max_retries = self.conditional_answer_retry_max_retries
         if max_retries is not None and retry_count >= int(max_retries):
             return "max_retries"
-        if self.max_assistant_turns and snapshot["assistant_turns"] + 2 > self.max_assistant_turns:
+        effective_max_assistant_turns = self._effective_max_assistant_turns(agent_data)
+        if effective_max_assistant_turns and snapshot["assistant_turns"] + 2 > effective_max_assistant_turns:
             return "max_assistant_turns"
         if self.max_user_turns and agent_data.user_turns >= self.max_user_turns:
             return "max_user_turns"

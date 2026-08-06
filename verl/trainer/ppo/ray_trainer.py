@@ -346,6 +346,7 @@ class RayPPOTrainer:
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
         self._validate_branch_strata_config()
         self._validate_retry_sft_config()
+        self._validate_teacher_suffix_gspo_config()
         self._validate_lazy_multi_modal_inputs_config()
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
@@ -375,6 +376,34 @@ class RayPPOTrainer:
             raise ValueError("policy_loss.retry_sft currently requires trainer.use_legacy_worker_impl != 'disable'.")
         if self.config.actor_rollout_ref.actor.policy_loss.loss_mode != "gspo":
             raise ValueError("policy_loss.retry_sft requires policy_loss.loss_mode='gspo'.")
+
+    def _validate_teacher_suffix_gspo_config(self) -> None:
+        multi_turn = self.config.actor_rollout_ref.rollout.multi_turn
+        if not bool(multi_turn.get("conditional_answer_retry_teacher_suffix_gspo_enabled", False)):
+            return
+        if not bool(multi_turn.get("conditional_answer_retry_enabled", False)):
+            raise ValueError("retry teacher-suffix GSPO requires conditional_answer_retry_enabled=true.")
+        if not bool(multi_turn.get("conditional_answer_retry_teacher_only_prefill", False)):
+            raise ValueError(
+                "retry teacher-suffix GSPO requires conditional_answer_retry_teacher_only_prefill=true."
+            )
+        if not str(multi_turn.get("conditional_answer_retry_assistant_prefill", "")).strip():
+            raise ValueError("retry teacher-suffix GSPO requires a nonempty retry assistant prefill.")
+        if bool(multi_turn.get("conditional_answer_retry_assistant_prefill_trainable", False)):
+            raise ValueError("retry teacher-suffix GSPO is incompatible with trainable injected prefills.")
+        if bool(multi_turn.get("conditional_answer_retry_sft_enabled", False)):
+            raise ValueError("retry teacher-suffix GSPO is incompatible with rollout retry SFT.")
+        retry_sft = self.config.actor_rollout_ref.actor.get("policy_loss", {}).get("retry_sft", {})
+        if retry_sft and bool(retry_sft.get("enabled", False)):
+            raise ValueError("retry teacher-suffix GSPO is incompatible with actor retry SFT.")
+        if self.config.actor_rollout_ref.actor.policy_loss.loss_mode != "gspo":
+            raise ValueError("retry teacher-suffix GSPO requires policy_loss.loss_mode='gspo'.")
+        rollout_correction = self.config.algorithm.get("rollout_correction", {})
+        if rollout_correction and bool(rollout_correction.get("bypass_mode", False)):
+            raise ValueError(
+                "retry teacher-suffix GSPO requires decoupled old-log-probability recomputation; "
+                "algorithm.rollout_correction.bypass_mode must be false."
+            )
 
     def _attach_branch_strata_loss_weights(self, batch: DataProto, metrics: dict) -> None:
         strata = self._branch_strata_config()
@@ -416,7 +445,7 @@ class RayPPOTrainer:
             metrics[f"branch_strata/{name}"] = value
 
     def _subsample_branch_training_rows(self, batch: DataProto, metrics: dict) -> DataProto:
-        """Uniformly cap branch rows per parent while retaining every canonical row."""
+        """Cap branch rows per parent while retaining every canonical row."""
         strata = self._branch_strata_config()
         subsampling = strata.get("subsampling", {}) if strata else {}
         if not subsampling or not bool(subsampling.get("enabled", False)):
@@ -466,12 +495,20 @@ class RayPPOTrainer:
 
         max_per_parent = int(subsampling.get("max_branches_per_parent"))
         seed = int(subsampling.get("seed", 42))
+        selection = str(subsampling.get("selection", "random"))
+        if selection not in {"random", "last"}:
+            raise ValueError(
+                "policy_loss.branch_strata.subsampling.selection must be either 'random' or 'last', "
+                f"got {selection!r}."
+            )
         rng = np.random.default_rng(np.random.SeedSequence([seed, int(self.global_steps)]))
         keep = np.logical_not(np.asarray(branch_flags, dtype=bool))
         retained_branch_rows = 0
         for rows in branches_by_parent.values():
             if len(rows) <= max_per_parent:
                 selected = rows
+            elif selection == "last":
+                selected = rows[-max_per_parent:]
             else:
                 selected = rng.choice(rows, size=max_per_parent, replace=False).tolist()
             keep[np.asarray(selected, dtype=np.int64)] = True
