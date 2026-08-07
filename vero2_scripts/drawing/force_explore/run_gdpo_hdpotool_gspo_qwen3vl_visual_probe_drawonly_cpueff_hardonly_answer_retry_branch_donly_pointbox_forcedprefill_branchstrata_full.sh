@@ -49,7 +49,7 @@ HYDRA_ARGS=("$@")
 # The drawing-worded retry prefill is hardcoded in the yaml (source of truth). Exporting
 # ANSWER_RETRY_ASSISTANT_PREFILL is an opt-in override, injected further below.
 
-CHECKPOINT_DATE_TIME="${CHECKPOINT_DATE_TIME:-20260806_140000}"
+CHECKPOINT_DATE_TIME="${CHECKPOINT_DATE_TIME:-20260806_180000}"
 RUN_UNIQUE_ID="${RUN_UNIQUE_ID:-${SLURM_JOB_ID:-pid_$$}}"
 NUM_GPUS="${NUM_GPUS:-${SLURM_GPUS_ON_NODE:-8}}"
 
