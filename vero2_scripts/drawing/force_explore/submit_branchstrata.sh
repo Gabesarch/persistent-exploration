@@ -28,7 +28,7 @@
 #   target | partition | account | gres        | cpus | mem   | save_freq
 #   plilc  | pli-lc    | pli_xl  | gpu:h100:8  | 96   | 960G  | 5
 #   pli    | pli       | vlmrl   | gpu:h100:8  | 96   | 960G  | 5
-#   ailab  | ailab     | zhuangl | gpu:h200:8  | 64   | 1450G | 1   (reap-safe: ckpt every step)
+#   ailab  | ailab     | zhuangl | gpu:h200:8  | 64   | 1450G | 5   (reaped tasks resume via array)
 # save_freq=5 not 20: at this step cost a 24h task can't reach step 20, so save_freq=20
 # would make every resume restart from scratch.
 set -euo pipefail
@@ -41,7 +41,7 @@ if [ "$#" -gt 0 ] && [[ "$1" != *=* ]]; then TARGET="$1"; shift; fi
 case "$TARGET" in
   plilc) SBFLAGS=(--partition=pli-lc --account=pli_xl --gres=gpu:h100:8 --cpus-per-task=96 --mem=960G --job-name=brstrata_plilc); SAVE_FREQ=5;;
   pli)   SBFLAGS=(--partition=pli    --account=vlmrl  --gres=gpu:h100:8 --cpus-per-task=96 --mem=960G --job-name=brstrata_pli);   SAVE_FREQ=5;;
-  ailab) SBFLAGS=(--partition=ailab  --account=zhuangl --gres=gpu:h200:8 --cpus-per-task=64 --mem=1450G --job-name=brstrata_ailab); SAVE_FREQ=1;;
+  ailab) SBFLAGS=(--partition=ailab  --account=zhuangl --gres=gpu:h200:8 --cpus-per-task=64 --mem=1450G --job-name=brstrata_ailab); SAVE_FREQ=5;;
   *) echo "ERROR: unknown target '$TARGET' (plilc|pli|ailab)" >&2; exit 2;;
 esac
 
