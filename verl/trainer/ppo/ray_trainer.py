@@ -1879,8 +1879,6 @@ class RayPPOTrainer:
         with self._gpu_memory_stage("checkpoint_update_weights_initial"):
             self.checkpoint_manager.update_weights(self.global_steps)
 
-        current_epoch = self.global_steps // len(self.train_dataloader)
-
         # perform validation before training
         # currently, we only support validation using the reward_function.
         if self.config.trainer.get("val_before_train", True):
@@ -1890,6 +1888,19 @@ class RayPPOTrainer:
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
                 return
+
+        # A resumed checkpoint may already have reached (or passed) a newly
+        # configured training-step limit. Keep the existing initial-validation
+        # behavior above, but return before entering the loop so a completed run
+        # cannot perform and save one additional update.
+        if self.global_steps >= self.total_training_steps:
+            pprint(
+                f"Training is already complete at global step {self.global_steps} "
+                f"(total_training_steps={self.total_training_steps}); exiting without another update."
+            )
+            return
+
+        current_epoch = self.global_steps // len(self.train_dataloader)
 
         if self.config.actor_rollout_ref.rollout.skip.get("enable", False):
             rollout_skip = RolloutSkip(self.config, self.async_rollout_manager)

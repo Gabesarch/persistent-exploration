@@ -382,7 +382,7 @@ trainer:
   project_name: vero2_verl
   experiment_name: branchstrata20_fresh_prefixremoved_gspo_20260803
   total_epochs: 1000
-  total_training_steps: 400
+  total_training_steps: 200
   log_val_generations: 0
   esi_redundant_time: 2000
   resume_mode: auto
