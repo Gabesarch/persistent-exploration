@@ -288,7 +288,10 @@ actor_rollout_ref:
       conditional_answer_retry_force_next_tool_call: true
       conditional_answer_retry_suffix: ""
       conditional_answer_retry_assistant_prefill: "Let's see, I do not have enough information to answer yet. My current annotations may be inaccurate or incomplete — let me use the drawing tools to correct and complete my markings, then re-examine the image before answering."
-      conditional_answer_retry_correct_accuracy_threshold: 0.0
+      # 0.0 only fires on float-underflow (miss > ~27 sigma of the scale-aware decay);
+      # 0.2 makes the interruption fire on ordinarily-wrong answers (e.g. 0 vs GT 31).
+      # Raised 2026-08-12 mid-run: applies from array task 4 (~step 115) onward.
+      conditional_answer_retry_correct_accuracy_threshold: 0.2
       conditional_answer_retry_max_retries: null
       # Wrong-answer branching: the trajectory containing the wrong <answer> is kept as a separate
       # training row (divergence-only loss mask, excluded from the GDPO group baseline).

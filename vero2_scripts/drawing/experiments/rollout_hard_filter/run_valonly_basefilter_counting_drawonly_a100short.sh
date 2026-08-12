@@ -25,4 +25,4 @@ set -o pipefail
 cd "${SLURM_SUBMIT_DIR:-$(pwd)}" || exit 2
 export NUM_GPUS=4
 
-exec bash vero2_scripts/drawing/experiments/rollout_hard_filter/run_valonly_basefilter_counting_drawonly_full.sh
+exec bash vero2_scripts/drawing/experiments/rollout_hard_filter/run_valonly_basefilter_counting_drawonly_full.sh "$@"
