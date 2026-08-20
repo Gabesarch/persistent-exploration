@@ -129,6 +129,17 @@ policy_loss:
     # Fraction of total loss assigned to retry SFT when eligible targets exist.
     loss_fraction: 0.05
 
+  # Same-model A/R retry-critic supervised-loss stratum.
+  retry_critic:
+
+    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+    _target_: verl.workers.config.RetryCriticLossConfig
+
+    enabled: false
+    loss_fraction: 0.03
+    class_balance: true
+    parent_balance: true
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 

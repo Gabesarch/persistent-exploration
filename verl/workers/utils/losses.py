@@ -62,6 +62,69 @@ def combine_retry_sft_loss(
     return (1.0 - fraction) * rl_loss + fraction * retry_sft_loss
 
 
+def parent_balanced_retry_critic_loss(
+    log_prob: torch.Tensor,
+    critic_mask: torch.Tensor,
+    is_retry: torch.Tensor,
+    parent_weight: torch.Tensor,
+    *,
+    global_accept_parent_mass: int | float | torch.Tensor,
+    global_retry_parent_mass: int | float | torch.Tensor,
+    dp_size: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool, bool]:
+    """Return class-balanced A/R NLL after averaging attempts per parent.
+
+    ``parent_weight`` is one over the number of retained attempts for the
+    row's (parent, class). Its globally summed mass is therefore the number of
+    represented parents in that class.
+    """
+
+    critic_mask = critic_mask.to(dtype=torch.bool)
+    is_retry = is_retry.to(device=log_prob.device, dtype=torch.bool)
+    parent_weight = parent_weight.to(device=log_prob.device, dtype=log_prob.dtype)
+    row_nll = -(log_prob * critic_mask.to(dtype=log_prob.dtype)).sum(dim=-1)
+
+    def _class_loss(row_selector: torch.Tensor, denominator_value) -> tuple[torch.Tensor, bool]:
+        denominator = torch.as_tensor(denominator_value, device=log_prob.device, dtype=log_prob.dtype)
+        present = bool(denominator.item() > 0)
+        if not present:
+            return log_prob.sum() * 0.0, False
+        numerator = (row_nll * parent_weight * row_selector.to(dtype=log_prob.dtype)).sum()
+        return numerator / denominator * dp_size, True
+
+    accept_nll, has_accept = _class_loss(~is_retry, global_accept_parent_mass)
+    retry_nll, has_retry = _class_loss(is_retry, global_retry_parent_mass)
+    if has_accept and has_retry:
+        critic_loss = 0.5 * (accept_nll + retry_nll)
+    elif has_accept:
+        critic_loss = accept_nll
+    elif has_retry:
+        critic_loss = retry_nll
+    else:
+        critic_loss = log_prob.sum() * 0.0
+    return critic_loss, accept_nll, retry_nll, has_accept, has_retry
+
+
+def combine_retry_critic_loss(
+    existing_loss: torch.Tensor,
+    critic_loss: torch.Tensor,
+    *,
+    loss_fraction: float,
+    has_existing: bool,
+    has_critic: bool,
+) -> torch.Tensor:
+    """Mix the shared-weight critic CE with the already-composed actor loss."""
+
+    if not has_critic:
+        return existing_loss
+    if not has_existing:
+        return critic_loss
+    fraction = float(loss_fraction)
+    if not 0.0 <= fraction < 1.0:
+        raise ValueError(f"retry critic loss_fraction must satisfy 0 <= value < 1, got {fraction!r}")
+    return (1.0 - fraction) * existing_loss + fraction * critic_loss
+
+
 def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
     pad_mode = tu.get_non_tensor_data(data=data, key="pad_mode", default=DatasetPadMode.NO_PADDING)
     dp_size = data["dp_size"]

@@ -9,7 +9,9 @@ hydra:
 algorithm:
   adv_estimator: gdpo
   gdpo_reward_keys: [accuracy, format, tool_efficiency, tool_repeat_overlap]
-  gdpo_reward_weights: [0.8, 0.2, 0.25, 0.2]
+  # Reduced from 0.25 after the original 1e-5 run oscillated from the
+  # 10-call-cap mode into a predominantly one-call mode after step 70.
+  gdpo_reward_weights: [0.8, 0.2, 0.10, 0.2]
   gdpo_reward_eligibility:
     tool_efficiency:
       key: accuracy

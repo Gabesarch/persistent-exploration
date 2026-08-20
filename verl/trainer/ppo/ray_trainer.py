@@ -346,6 +346,7 @@ class RayPPOTrainer:
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
         self._validate_branch_strata_config()
         self._validate_retry_sft_config()
+        self._validate_retry_critic_config()
         self._validate_teacher_suffix_gspo_config()
         self._validate_lazy_multi_modal_inputs_config()
 
@@ -376,6 +377,23 @@ class RayPPOTrainer:
             raise ValueError("policy_loss.retry_sft currently requires trainer.use_legacy_worker_impl != 'disable'.")
         if self.config.actor_rollout_ref.actor.policy_loss.loss_mode != "gspo":
             raise ValueError("policy_loss.retry_sft requires policy_loss.loss_mode='gspo'.")
+
+    def _retry_critic_config(self):
+        return self.config.actor_rollout_ref.actor.get("policy_loss", {}).get("retry_critic", {})
+
+    def _validate_retry_critic_config(self) -> None:
+        critic = self._retry_critic_config()
+        if not critic or not bool(critic.get("enabled", False)):
+            return
+        if self.use_legacy_worker_impl == "disable":
+            raise ValueError("policy_loss.retry_critic currently requires trainer.use_legacy_worker_impl != 'disable'.")
+        if not bool(critic.get("class_balance", True)):
+            raise ValueError("policy_loss.retry_critic currently requires class_balance=true.")
+        if not bool(critic.get("parent_balance", True)):
+            raise ValueError("policy_loss.retry_critic currently requires parent_balance=true.")
+        multi_turn = self.config.actor_rollout_ref.rollout.multi_turn
+        if not bool(multi_turn.get("conditional_answer_retry_critic_enabled", False)):
+            raise ValueError("actor retry critic loss requires rollout retry critic enablement.")
 
     def _validate_teacher_suffix_gspo_config(self) -> None:
         multi_turn = self.config.actor_rollout_ref.rollout.multi_turn
@@ -443,6 +461,46 @@ class RayPPOTrainer:
         batch.batch["branch_policy_loss_is_branch"] = is_branch
         for name, value in diagnostics.items():
             metrics[f"branch_strata/{name}"] = value
+
+    def _attach_retry_critic_loss_weights(self, batch: DataProto, metrics: dict) -> None:
+        critic = self._retry_critic_config()
+        if not critic or not bool(critic.get("enabled", False)):
+            return
+        for key in ("retry_critic_label", "request_id"):
+            if key not in batch.non_tensor_batch:
+                raise ValueError(f"Retry critic loss requires non-tensor batch key {key!r}.")
+        if "retry_critic_mask" not in batch.batch:
+            raise ValueError("Retry critic loss requires tensor batch key 'retry_critic_mask'.")
+
+        labels = np.asarray(batch.non_tensor_batch["retry_critic_label"], dtype=object)
+        parent_ids = np.asarray(batch.non_tensor_batch["request_id"], dtype=object)
+        padding_mask = np.asarray(
+            batch.non_tensor_batch.get("__branch_padding_row", np.zeros(len(batch), dtype=bool)), dtype=bool
+        )
+        active_rows = batch.batch["retry_critic_mask"].to(dtype=torch.bool).any(dim=-1).cpu().numpy()
+        groups: dict[tuple[str, Any], list[int]] = defaultdict(list)
+        is_retry = torch.zeros(len(batch), dtype=torch.bool)
+        for row, (label, parent_id) in enumerate(zip(labels, parent_ids, strict=True)):
+            if padding_mask[row] or not active_rows[row]:
+                continue
+            if label not in {"A", "R"}:
+                raise ValueError(f"Active retry critic row {row} has invalid label {label!r}.")
+            if parent_id is None or (isinstance(parent_id, str) and not parent_id.strip()):
+                raise ValueError(f"Active retry critic row {row} has an empty request_id.")
+            groups[(str(label), parent_id)].append(row)
+            is_retry[row] = label == "R"
+
+        parent_weight = torch.zeros(len(batch), dtype=torch.float32)
+        for rows in groups.values():
+            parent_weight[rows] = 1.0 / len(rows)
+        batch.batch["retry_critic_is_retry"] = is_retry
+        batch.batch["retry_critic_parent_weight"] = parent_weight
+        for label, name in (("A", "accept"), ("R", "retry")):
+            example_count = sum(len(rows) for (group_label, _), rows in groups.items() if group_label == label)
+            parent_count = sum(1 for group_label, _ in groups if group_label == label)
+            metrics[f"retry_critic/{name}_examples"] = example_count
+            metrics[f"retry_critic/{name}_parents"] = parent_count
+            metrics[f"retry_critic/missing_{name}_class"] = float(example_count == 0)
 
     def _subsample_branch_training_rows(self, batch: DataProto, metrics: dict) -> DataProto:
         """Cap branch rows per parent while retaining every canonical row."""
@@ -1689,6 +1747,8 @@ class RayPPOTrainer:
             batch.batch["response_mask"][pad_slice] = 0
         if "retry_sft_mask" in batch.batch:
             batch.batch["retry_sft_mask"][pad_slice] = 0
+        if "retry_critic_mask" in batch.batch:
+            batch.batch["retry_critic_mask"][pad_slice] = 0
         if "rm_scores" in batch.batch:
             batch.batch["rm_scores"][pad_slice] = 0
 
@@ -2017,6 +2077,7 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+                    self._attach_retry_critic_loss_weights(batch, metrics)
                     self._attach_branch_strata_loss_weights(batch, metrics)
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,

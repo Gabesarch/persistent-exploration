@@ -48,7 +48,12 @@ from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
-from verl.workers.utils.losses import combine_retry_sft_loss, masked_sft_nll
+from verl.workers.utils.losses import (
+    combine_retry_critic_loss,
+    combine_retry_sft_loss,
+    masked_sft_nll,
+    parent_balanced_retry_critic_loss,
+)
 
 __all__ = ["DataParallelPPOActor"]
 
@@ -609,6 +614,12 @@ class DataParallelPPOActor(BasePPOActor):
             if "retry_sft_mask" not in data.batch.keys():
                 raise ValueError("Enabled retry SFT requires tensor batch key 'retry_sft_mask'.")
             select_keys.append("retry_sft_mask")
+        retry_critic_enabled = bool(self.config.policy_loss.retry_critic.enabled)
+        if retry_critic_enabled:
+            for key in ("retry_critic_mask", "retry_critic_is_retry", "retry_critic_parent_weight"):
+                if key not in data.batch.keys():
+                    raise ValueError(f"Enabled retry critic requires tensor batch key {key!r}.")
+                select_keys.append(key)
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = []
@@ -636,6 +647,10 @@ class DataParallelPPOActor(BasePPOActor):
             "actor/kl_loss": 0.0,
             "actor/retry_sft_loss": 0.0,
             "actor/retry_sft_weighted_loss": 0.0,
+            "actor/retry_critic_loss": 0.0,
+            "actor/retry_critic_accept_nll": 0.0,
+            "actor/retry_critic_retry_nll": 0.0,
+            "actor/retry_critic_weighted_loss": 0.0,
             "actor/combined_policy_loss": 0.0,
         }
         for _ in range(self.config.ppo_epochs):
@@ -643,10 +658,10 @@ class DataParallelPPOActor(BasePPOActor):
                 dp_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
                 global_retry_sft_tokens = 0
                 global_rl_tokens = 0
-                if retry_sft_enabled:
+                if retry_sft_enabled or retry_critic_enabled:
                     token_counts = torch.tensor(
                         [
-                            int(mini_batch.batch["retry_sft_mask"].sum().item()),
+                            int(mini_batch.batch["retry_sft_mask"].sum().item()) if retry_sft_enabled else 0,
                             int(mini_batch.batch["response_mask"].sum().item()),
                         ],
                         dtype=torch.long,
@@ -656,6 +671,26 @@ class DataParallelPPOActor(BasePPOActor):
                         torch.distributed.all_reduce(token_counts, op=torch.distributed.ReduceOp.SUM)
                     global_retry_sft_tokens = int(token_counts[0].item())
                     global_rl_tokens = int(token_counts[1].item())
+                global_critic_examples = [0, 0]
+                global_critic_parent_mass = [0.0, 0.0]
+                if retry_critic_enabled:
+                    critic_rows = mini_batch.batch["retry_critic_mask"].to(dtype=torch.bool).any(dim=-1)
+                    critic_is_retry = mini_batch.batch["retry_critic_is_retry"].to(dtype=torch.bool)
+                    critic_parent_weight = mini_batch.batch["retry_critic_parent_weight"].to(dtype=torch.float32)
+                    critic_stats = torch.tensor(
+                        [
+                            int((critic_rows & ~critic_is_retry).sum().item()),
+                            int((critic_rows & critic_is_retry).sum().item()),
+                            float((critic_parent_weight * (critic_rows & ~critic_is_retry)).sum().item()),
+                            float((critic_parent_weight * (critic_rows & critic_is_retry)).sum().item()),
+                        ],
+                        dtype=torch.float64,
+                        device=get_device_id(),
+                    )
+                    if torch.distributed.is_initialized():
+                        torch.distributed.all_reduce(critic_stats, op=torch.distributed.ReduceOp.SUM)
+                    global_critic_examples = [int(critic_stats[0].item()), int(critic_stats[1].item())]
+                    global_critic_parent_mass = [float(critic_stats[2].item()), float(critic_stats[3].item())]
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(
@@ -679,6 +714,15 @@ class DataParallelPPOActor(BasePPOActor):
                         response_mask.to(dtype=torch.bool) & retry_sft_mask.to(dtype=torch.bool)
                     ):
                         raise ValueError("response_mask and retry_sft_mask must be disjoint")
+                    retry_critic_mask = model_inputs.get("retry_critic_mask", None)
+                    if retry_critic_mask is not None:
+                        critic_bool = retry_critic_mask.to(dtype=torch.bool)
+                        if torch.any(response_mask.to(dtype=torch.bool) & critic_bool):
+                            raise ValueError("response_mask and retry_critic_mask must be disjoint")
+                        if retry_sft_mask is not None and torch.any(
+                            retry_sft_mask.to(dtype=torch.bool) & critic_bool
+                        ):
+                            raise ValueError("retry_sft_mask and retry_critic_mask must be disjoint")
                     old_log_prob = model_inputs["old_log_probs"]
                     advantages = model_inputs["advantages"]
 
@@ -802,6 +846,37 @@ class DataParallelPPOActor(BasePPOActor):
                             has_rl=global_rl_tokens > 0 if retry_sft_enabled else True,
                             has_retry_sft=False,
                         )
+                    retry_critic_loss = log_prob.sum() * 0.0
+                    retry_critic_accept_nll = log_prob.sum() * 0.0
+                    retry_critic_retry_nll = log_prob.sum() * 0.0
+                    retry_critic_fraction = 0.0
+                    has_critic = any(global_critic_examples)
+                    if retry_critic_enabled and has_critic:
+                        (
+                            retry_critic_loss,
+                            retry_critic_accept_nll,
+                            retry_critic_retry_nll,
+                            _,
+                            _,
+                        ) = parent_balanced_retry_critic_loss(
+                            log_prob,
+                            retry_critic_mask,
+                            model_inputs["retry_critic_is_retry"],
+                            model_inputs["retry_critic_parent_weight"],
+                            global_accept_parent_mass=global_critic_parent_mass[0],
+                            global_retry_parent_mass=global_critic_parent_mass[1],
+                            dp_size=dp_size,
+                        )
+                        retry_critic_fraction = float(self.config.policy_loss.retry_critic.loss_fraction)
+                    loss = combine_retry_critic_loss(
+                        loss,
+                        retry_critic_loss,
+                        loss_fraction=float(self.config.policy_loss.retry_critic.loss_fraction)
+                        if retry_critic_enabled
+                        else 0.0,
+                        has_existing=(global_rl_tokens > 0 or global_retry_sft_tokens > 0),
+                        has_critic=retry_critic_enabled and has_critic,
+                    )
                     if self.scaler is not None:
                         self.scaler.scale(loss).backward()
                     else:
@@ -812,11 +887,28 @@ class DataParallelPPOActor(BasePPOActor):
                     metrics["actor/retry_sft_weighted_loss"] += (
                         retry_sft_loss.detach().item() * retry_sft_fraction
                     )
+                    metrics["actor/retry_critic_loss"] += retry_critic_loss.detach().item()
+                    metrics["actor/retry_critic_accept_nll"] += retry_critic_accept_nll.detach().item()
+                    metrics["actor/retry_critic_retry_nll"] += retry_critic_retry_nll.detach().item()
+                    metrics["actor/retry_critic_weighted_loss"] += (
+                        retry_critic_loss.detach().item() * retry_critic_fraction
+                    )
                     metrics["actor/combined_policy_loss"] += loss.detach().item()
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
+                if retry_critic_enabled:
+                    mini_batch_metrics.update(
+                        {
+                            "actor/retry_critic_accept_examples": global_critic_examples[0],
+                            "actor/retry_critic_retry_examples": global_critic_examples[1],
+                            "actor/retry_critic_accept_parents": global_critic_parent_mass[0],
+                            "actor/retry_critic_retry_parents": global_critic_parent_mass[1],
+                            "actor/retry_critic_missing_accept": float(global_critic_examples[0] == 0),
+                            "actor/retry_critic_missing_retry": float(global_critic_examples[1] == 0),
+                        }
+                    )
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
         return metrics
