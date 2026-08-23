@@ -10,7 +10,9 @@ protocol baked into the tool description: mark candidates, don't redraw, continu
 interruption. The `experiments/` zoomdraw variant uses the combined
 [`config/tool_config/image_zoom_in_draw_tool.yaml`](../config/tool_config/image_zoom_in_draw_tool.yaml)
 (zoom + all five draw tools — draw_lines/boxes/texts/polygons live on there and in git history).
-Trained with GDPO advantage (`accuracy/format/tool_efficiency` = 0.8/0.1/0.1) + GSPO loss via
+Trained with GDPO advantage (vanilla lane: `accuracy/format/tool_efficiency` = 0.8/0.1/0.1; the
+branchstrata counting recipe uses four components `accuracy/format/point_box/tool_efficiency` =
+0.5/0.1/0.3/0.25 — see `config/branchstrata20_fresh_counting.yaml`) + GSPO loss via
 `python -m verl.trainer.main_ppo`.
 
 All configs live **flat** in [`../config/`](../config/) (launchers pass
@@ -148,6 +150,15 @@ per-partition files needed):
 ```bash
 bash vero2_scripts/drawing/force_explore/submit.sh              # pli-lc (default, primary)
 bash vero2_scripts/drawing/force_explore/submit.sh pli          # pli (vlmrl) — best allocation odds
+```
+
+**`submit_branchstrata.sh`** is the same partition-picker for the *branchstrata counting* recipe
+(`run_..._pointbox_forcedprefill_branchstrata_full.sh`, config `branchstrata20_fresh_counting.yaml`):
+branch-strata answer-retry (threshold 0.2 on the scale-aware accuracy), point-in-box reward, and the
+rollout-mined hard training set. Companion difficulty pipeline in `experiments/rollout_hard_filter/`:
+`make_shards.py` → `submit_all_shards.sh` (8 base rollouts/question via the valonly config) →
+`aggregate_pass_rates.py` (annotates pass rates, cuts the ≤0.5 hard subset).
+```bash
 bash vero2_scripts/drawing/force_explore/submit.sh ailab        # ailab H200 — reap-safe save_freq=1
 bash vero2_scripts/drawing/force_explore/submit.sh plilc data.train_files=/abs/train.jsonl   # + overrides
 ```

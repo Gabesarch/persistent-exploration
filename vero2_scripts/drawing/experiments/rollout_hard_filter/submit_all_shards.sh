@@ -7,10 +7,10 @@
 set -euo pipefail
 
 [ -f ./set_paths.sh ] || { echo "ERROR: run from the repo root" >&2; exit 2; }
-source ./set_paths.sh >/dev/null 2>&1 || true
-SAVE_PATH="${SAVE_PATH:-/scratch/gpfs/ZHUANGL/lc1556}"
+source ./set_paths.sh >/dev/null 2>&1 || { echo "ERROR: set_paths.sh failed" >&2; exit 2; }
+: "${SAVE_PATH:?set_paths.sh must export SAVE_PATH}"
 
-SHARD_DIR="${SHARD_DIR:-/scratch/gpfs/ZHUANGL/lc1556/vero2/hard_filter_runs/shards}"
+SHARD_DIR="${SHARD_DIR:-${SAVE_PATH}/vero2/hard_filter_runs/shards}"
 LAUNCHER="vero2_scripts/drawing/experiments/rollout_hard_filter/run_valonly_basefilter_counting_drawonly_full.sh"
 
 shopt -s nullglob
