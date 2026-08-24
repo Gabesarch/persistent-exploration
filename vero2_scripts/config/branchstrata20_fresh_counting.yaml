@@ -13,7 +13,7 @@ algorithm:
   # (fresh's tool_repeat_overlap is zoom-only and stays out; point_box is the counting analogue.)
   # point_box_applicable is an eligibility gate, not a component — it must NOT appear in the keys.
   gdpo_reward_keys: [accuracy, format, point_box, tool_efficiency]
-  gdpo_reward_weights: [0.5, 0.1, 0.3, 0.25]
+  gdpo_reward_weights: [0.5, 0.1, 0.3, 0.10]  # tool_efficiency 0.25->0.10: encourage multi-turn checking (2026-08-24)
   gdpo_reward_eligibility:
     tool_efficiency:
       key: accuracy
@@ -51,7 +51,7 @@ data:
   train_batch_size: 256
   val_batch_size: 256
   max_prompt_length: 16384
-  max_response_length: 16384
+  max_response_length: 24576  # aligned with zoom branchstrata20_fresh (was 16384; short budget punished long multi-turn rollouts)
   max_pixels: 4194304
   filter_overlong_prompts: false
   truncation: error
@@ -360,7 +360,7 @@ reward:
       min_tool_calls_for_bonus: null
       tool_call_bonus: 0.0
       tool_efficiency_reward_mode: concave_length_penalty
-      tool_efficiency_free_calls: 1
+      tool_efficiency_free_calls: 4  # was 1: first 4 draws tax-free so re-checking is not punished
       tool_efficiency_concave_k: 10.0
       tool_efficiency_concave_q: 0.85
       allow_unboxed_answer_for_accuracy: true
