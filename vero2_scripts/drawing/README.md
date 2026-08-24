@@ -12,7 +12,9 @@ interruption. The `experiments/` zoomdraw variant uses the combined
 (zoom + all five draw tools — draw_lines/boxes/texts/polygons live on there and in git history).
 Trained with GDPO advantage (vanilla lane: `accuracy/format/tool_efficiency` = 0.8/0.1/0.1; the
 branchstrata counting recipe uses four components `accuracy/format/point_box/tool_efficiency` =
-0.5/0.1/0.3/0.25 — see `config/branchstrata20_fresh_counting.yaml`) + GSPO loss via
+0.5/0.1/0.3/0.10 — the reported 0.439-CountQA run used 0.25 for tool_efficiency; the current yaml
+softens the multi-turn tax, see the dated comments in `config/branchstrata20_fresh_counting.yaml`)
++ GSPO loss via
 `python -m verl.trainer.main_ppo`.
 
 All configs live **flat** in [`../config/`](../config/) (launchers pass
@@ -152,7 +154,15 @@ bash vero2_scripts/drawing/force_explore/submit.sh              # pli-lc (defaul
 bash vero2_scripts/drawing/force_explore/submit.sh pli          # pli (vlmrl) — best allocation odds
 ```
 
-**`submit_branchstrata.sh`** is the same partition-picker for the *branchstrata counting* recipe
+**`submit_branchstrata.sh`** is the same partition-picker for the *force-explore-with-branching*
+counting recipe (a.k.a. branchstrata). The name means two coupled mechanisms: (1) **force-explore** —
+an answer whose scale-aware accuracy is ≤ `conditional_answer_retry_correct_accuracy_threshold` (0.2)
+is interrupted: the answer turn is removed from context, a drawing call is forced, and the model
+re-answers (uncapped); and (2) **branching** — the removed FALSE rollout branch is NOT discarded: it
+is retained in the training batch as a negative-advantage branch row (divergence-only loss masking,
+capped at `branch_fraction` 20% of the batch, `gdpo_baseline_weight 0` so branches never enter the
+group baselines). The model therefore learns from both the corrected continuation and the retained
+mistake. Launcher:
 (`run_..._pointbox_forcedprefill_branchstrata_full.sh`, config `branchstrata20_fresh_counting.yaml`):
 branch-strata answer-retry (threshold 0.2 on the scale-aware accuracy), point-in-box reward, and the
 rollout-mined hard training set. Companion difficulty pipeline in `experiments/rollout_hard_filter/`:
