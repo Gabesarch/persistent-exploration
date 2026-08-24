@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import json
 
 import pytest
 
@@ -9,6 +10,7 @@ from verl.utils.reward_score.math_verify_reward_type_multiturn_tool_calling_opti
     compute_score_from_data_source,
     extract_answer_for_accuracy,
     format_reward,
+    point_box_reward,
     tool_repeat_overlap_call_diagnostics,
     tool_repeat_overlap_reward,
 )
@@ -877,3 +879,165 @@ def test_mandatory_think_tool_call_bonus_requires_valid_format():
         "tool_repeat_overlap": 0.0,
         "tool_call_bonus": 0.0,
     }
+
+
+def draw_points_solution(points, include_answer=True, answer_count=2):
+    parts = [
+        "<think>I will mark each object I can see.</think>",
+        "<tool_call>",
+        json.dumps({"name": "draw_points", "arguments": {"img_idx": 0, "points": points}}),
+        "</tool_call>",
+        "<tool_response>",
+        "Annotated image returned.",
+        "</tool_response>",
+    ]
+    if include_answer:
+        parts.append("<think>All objects are marked now.</think>")
+        parts.append(f"<answer>I count \\boxed{{{answer_count}}} objects.</answer>")
+    return "\n".join(parts)
+
+
+def test_point_box_reward_rescales_points_into_processed_size_hit():
+    solution = draw_points_solution([[500, 500]])
+    extra_info = {"metadata": {"boxes": [[90, 40, 110, 60]], "processed_size": [200, 100]}}
+
+    score, applicable, gt_boxes, predicted, matched_boxes, matched_points = point_box_reward(solution, extra_info)
+
+    assert score == pytest.approx(1.0)
+    assert applicable == 1.0
+    assert (gt_boxes, predicted, matched_boxes, matched_points) == (1, 1, 1, 1)
+
+
+def test_point_box_reward_rescaled_point_outside_box_misses():
+    solution = draw_points_solution([[500, 500]])
+    extra_info = {"metadata": {"boxes": [[0, 0, 50, 50]], "processed_size": [200, 100]}}
+
+    score, applicable, gt_boxes, predicted, matched_boxes, matched_points = point_box_reward(solution, extra_info)
+
+    assert score == pytest.approx(0.0)
+    assert applicable == 1.0
+    assert (gt_boxes, predicted, matched_boxes, matched_points) == (1, 1, 0, 0)
+
+
+def test_point_box_reward_duplicate_points_match_one_box_only():
+    solution = draw_points_solution([[100, 100], [100, 100]])
+    extra_info = {
+        "metadata": {"boxes": [[0, 0, 40, 40], [150, 80, 190, 95]], "processed_size": [200, 100]}
+    }
+
+    score, applicable, gt_boxes, predicted, matched_boxes, matched_points = point_box_reward(solution, extra_info)
+
+    assert score == pytest.approx(0.5)  # recall 1/2, precision 1/2
+    assert applicable == 1.0
+    assert (gt_boxes, predicted, matched_boxes, matched_points) == (2, 2, 1, 1)
+
+
+def test_point_box_reward_without_gt_boxes_is_not_applicable():
+    solution = draw_points_solution([[500, 500]])
+
+    score, applicable, gt_boxes, predicted, matched_boxes, matched_points = point_box_reward(
+        solution, {"metadata": {}}
+    )
+
+    assert score == 0.0
+    assert applicable == 0.0
+    assert (gt_boxes, predicted, matched_boxes, matched_points) == (0, 1, 0, 0)
+
+
+def test_point_box_reward_with_boxes_but_no_draw_calls_scores_zero_but_applicable():
+    solution = "<think>No tools needed.</think>\n<answer>I count \\boxed{1} objects.</answer>"
+    extra_info = {"metadata": {"boxes": [[90, 40, 110, 60]], "processed_size": [200, 100]}}
+
+    score, applicable, gt_boxes, predicted, matched_boxes, matched_points = point_box_reward(solution, extra_info)
+
+    assert score == 0.0
+    assert applicable == 1.0
+    assert (gt_boxes, predicted, matched_boxes, matched_points) == (1, 0, 0, 0)
+
+
+def test_point_box_reward_tolerance_px_expands_match_window():
+    solution = draw_points_solution([[500, 500]])  # rescales to pixel (100, 50)
+    extra_info = {"metadata": {"boxes": [[104, 54, 110, 60]], "processed_size": [200, 100]}}
+
+    strict_score, strict_applicable, *_ = point_box_reward(solution, extra_info, tolerance_px=0.0)
+    tolerant_score, tolerant_applicable, *_ = point_box_reward(solution, extra_info, tolerance_px=5.0)
+
+    assert strict_score == pytest.approx(0.0)
+    assert tolerant_score == pytest.approx(1.0)
+    assert strict_applicable == tolerant_applicable == 1.0
+
+
+def test_point_box_component_returned_only_when_enabled():
+    solution = draw_points_solution([[500, 500]], answer_count=1)
+    extra_info = {
+        "reward_type": "counting",
+        "metadata": {"boxes": [[90, 40, 110, 60]], "processed_size": [200, 100]},
+    }
+
+    enabled = compute_score_from_data_source(
+        data_source="qwen3vl_filtering",
+        solution_str=solution,
+        ground_truth="1",
+        extra_info=extra_info,
+        format_score=0.1,
+        point_box_reward_enabled=True,
+    )
+    disabled = compute_score_from_data_source(
+        data_source="qwen3vl_filtering",
+        solution_str=solution,
+        ground_truth="1",
+        extra_info=extra_info,
+        format_score=0.1,
+    )
+
+    assert enabled["accuracy"] == pytest.approx(1.0)
+    assert enabled["point_box"] == pytest.approx(1.0)
+    assert enabled["point_box_applicable"] == 1.0
+    assert enabled["point_box_gt_boxes"] == 1.0
+    assert enabled["point_box_predicted_points"] == 1.0
+    assert enabled["point_box_matched_boxes"] == 1.0
+    assert enabled["point_box_matched_points"] == 1.0
+    assert all(not key.startswith("point_box") for key in disabled)
+
+
+def test_point_box_component_zeroed_on_invalid_trajectory_but_keeps_applicable():
+    solution = draw_points_solution([[500, 500]], include_answer=False)
+    extra_info = {
+        "reward_type": "counting",
+        "metadata": {"boxes": [[90, 40, 110, 60]], "processed_size": [200, 100]},
+    }
+
+    result = compute_score_from_data_source(
+        data_source="qwen3vl_filtering",
+        solution_str=solution,
+        ground_truth="1",
+        extra_info=extra_info,
+        format_score=0.1,
+        point_box_reward_enabled=True,
+    )
+
+    assert result["format"] == 0.0
+    assert result["point_box"] == 0.0
+    assert result["point_box_applicable"] == 1.0
+    assert result["point_box_matched_boxes"] == 1.0  # diagnostics keep the raw match
+
+
+def test_point_box_component_async_entrypoint_matches_sync():
+    solution = draw_points_solution([[500, 500]], answer_count=1)
+    extra_info = {
+        "reward_type": "counting",
+        "metadata": {"boxes": [[90, 40, 110, 60]], "processed_size": [200, 100]},
+    }
+    kwargs = {
+        "data_source": "qwen3vl_filtering",
+        "solution_str": solution,
+        "ground_truth": "1",
+        "extra_info": extra_info,
+        "format_score": 0.1,
+        "point_box_reward_enabled": True,
+    }
+
+    sync_result = compute_score_from_data_source(**kwargs)
+    async_result = asyncio.run(async_compute_score_from_data_source(**kwargs))
+
+    assert async_result == sync_result
