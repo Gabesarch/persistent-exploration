@@ -25,6 +25,7 @@ from scoring import (  # noqa: E402
     inject_submit_from_bbox,
     parse_bboxes_from_text,
     score_final_answer_bbox,
+    score_final_answer_point,
 )
 
 _VAGEN = None
@@ -110,6 +111,9 @@ def _use_panorama_strip(doc: Dict[str, Any], kwargs: Optional[Dict[str, Any]] = 
 
 
 def _panorama_strip_image(doc: Dict[str, Any]) -> Image.Image:
+    embedded = doc.get("panorama_strip")
+    if isinstance(embedded, Image.Image):
+        return embedded.convert("RGB")
     loaded = _load_image(doc.get("panorama_strip_path", ""), doc)
     if loaded is not None:
         return loaded
@@ -312,7 +316,10 @@ def hstarbench_doc_to_visual(doc: Dict[str, Any], lmms_eval_specific_kwargs: Opt
     visuals: List[Image.Image] = []
     if include_global:
         if use_strip:
-            strip = _load_image(doc.get("panorama_strip_path", ""), doc)
+            embedded = doc.get("panorama_strip")
+            strip = embedded.convert("RGB") if isinstance(embedded, Image.Image) else None
+            if strip is None:
+                strip = _load_image(doc.get("panorama_strip_path", ""), doc)
             if strip is None and doc.get("erp_path"):
                 strip = erp_to_strip_pil(doc["erp_path"], start_yaw_deg=doc.get("start_yaw"))
             if strip is not None:
@@ -325,7 +332,9 @@ def hstarbench_doc_to_visual(doc: Dict[str, Any], lmms_eval_specific_kwargs: Opt
     if view is not None:
         visuals.append(view)
     elif not visuals:
-        fallback = _load_image(doc.get("panorama_strip_path", ""), doc) or _load_image(doc.get("erp_path", ""), doc)
+        embedded = doc.get("panorama_strip")
+        fallback = embedded.convert("RGB") if isinstance(embedded, Image.Image) else None
+        fallback = fallback or _load_image(doc.get("panorama_strip_path", ""), doc) or _load_image(doc.get("erp_path", ""), doc)
         if fallback is not None:
             visuals.append(fallback)
     return visuals
@@ -338,7 +347,10 @@ def hstarbench_bbox_zoom_doc_to_visual(
     """Panorama strip only — single global image for zoom-in tool (img_idx=0)."""
     kwargs = lmms_eval_specific_kwargs or {}
     if _use_panorama_strip(doc, kwargs):
-        strip = _load_image(doc.get("panorama_strip_path", ""), doc)
+        embedded = doc.get("panorama_strip")
+        strip = embedded.convert("RGB") if isinstance(embedded, Image.Image) else None
+        if strip is None:
+            strip = _load_image(doc.get("panorama_strip_path", ""), doc)
         if strip is None and doc.get("erp_path"):
             strip = erp_to_strip_pil(doc["erp_path"], start_yaw_deg=doc.get("start_yaw"))
         if strip is not None:
@@ -391,6 +403,38 @@ def hstarbench_bbox_zoom_doc_to_messages_vero(
     return [{"role": "user", "content": user_content}]
 
 
+def hstarbench_point_zoom_doc_to_text(
+    doc: Dict[str, Any],
+    lmms_eval_specific_kwargs: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Joint3-trained HStar point-clicking prompt on the original panorama strip."""
+    instruction = str(doc.get("task", "")).strip()
+    if instruction:
+        instruction = instruction[0].upper() + instruction[1:]
+        if not instruction.endswith((".", "?", "!")):
+            instruction += "."
+    return (
+        f"{instruction} Use coordinates relative to the original full image: x and y must each be "
+        "normalized to the 0-1000 range. In the <answer> block, output only this JSON array: "
+        '[{"point_2d": [x, y]}].'
+    )
+
+
+def hstarbench_point_zoom_doc_to_messages_vero(
+    doc: Dict[str, Any],
+    lmms_eval_specific_kwargs: Optional[Dict[str, Any]] = None,
+):
+    """User turn for joint3-style point output; system/tool schema come from metadata."""
+    kwargs = lmms_eval_specific_kwargs or {}
+    pre = str(kwargs.get("pre_prompt", ""))
+    post = str(kwargs.get("post_prompt", ""))
+    question = pre + hstarbench_point_zoom_doc_to_text(doc, kwargs) + post
+    visuals = hstarbench_bbox_zoom_doc_to_visual(doc, kwargs)
+    user_content = [{"type": "image", "url": visual} for visual in visuals]
+    user_content.append({"type": "text", "text": question})
+    return [{"role": "user", "content": user_content}]
+
+
 def hstarbench_bbox_zoom_process_results(doc: Dict[str, Any], results: List[str]) -> Dict[str, float]:
     raw = results[0] if results else ""
     if isinstance(raw, list):
@@ -418,6 +462,25 @@ def hstarbench_bbox_zoom_process_results(doc: Dict[str, Any], results: List[str]
         f"hstarbench_level_{level}_success": cone_success,
         f"hstarbench_level_{level}_cone_success": cone_success,
         f"hstarbench_level_{level}_iou_success": iou_success,
+    }
+
+
+def hstarbench_point_zoom_process_results(doc: Dict[str, Any], results: List[str]) -> Dict[str, float]:
+    """Report binary accuracy for a strict point prediction inside any target box."""
+    raw = results[0] if results else ""
+    if isinstance(raw, list):
+        raw = raw[0] if raw else ""
+    outcome = score_final_answer_point(doc, str(raw))
+    level = int(doc.get("level", 0))
+    split = str(doc.get("split", "unknown"))
+    accuracy = 1.0 if outcome["point_in_box_success"] else 0.0
+    has_point = 1.0 if outcome["has_answer_point"] else 0.0
+    return {
+        "hstarbench_point_in_box_acc": accuracy,
+        "hstarbench_success": accuracy,
+        "hstarbench_has_answer_point": has_point,
+        f"hstarbench_{split}_point_in_box_acc": accuracy,
+        f"hstarbench_level_{level}_point_in_box_acc": accuracy,
     }
 
 

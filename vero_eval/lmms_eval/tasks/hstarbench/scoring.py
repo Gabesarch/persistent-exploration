@@ -1,8 +1,9 @@
-"""Scoring for hstarbench: env rotate/submit vs panorama-strip zoom bbox IoU."""
+"""HStarBench scoring for env actions, panorama bboxes, and point clicks."""
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -52,6 +53,92 @@ def get_doc_ground_bboxes(doc: Dict[str, Any]) -> List[Tuple[float, float, float
     target_yaw = doc.get("target_yaw") or [0, 360]
     target_pitch = doc.get("target_pitch") or [-90, 90]
     return target_cone_to_strip_bboxes(target_yaw, target_pitch)
+
+
+def _extract_last_boxed_content(text: str) -> Optional[str]:
+    r"""Return the payload of the last balanced ``\boxed{...}`` expression."""
+    cursor = 0
+    last_content: Optional[str] = None
+    while True:
+        start = text.find(r"\boxed", cursor)
+        if start < 0:
+            return last_content
+        brace = start + len(r"\boxed")
+        while brace < len(text) and text[brace].isspace():
+            brace += 1
+        if brace >= len(text) or text[brace] != "{":
+            cursor = brace + 1
+            continue
+
+        depth = 1
+        content_start = brace + 1
+        cursor = content_start
+        while cursor < len(text) and depth:
+            if text[cursor] == "{":
+                depth += 1
+            elif text[cursor] == "}":
+                depth -= 1
+            cursor += 1
+        if depth:
+            return last_content
+        candidate = text[content_start : cursor - 1].strip()
+        if candidate:
+            last_content = candidate
+
+
+def parse_final_answer_point(text: str) -> Optional[Tuple[float, float]]:
+    r"""Parse the strict joint3 clicking contract from the last answer block.
+
+    The accepted payload is one JSON-array item whose only key is ``point_2d``.
+    As in the training reward, either the raw answer or the last balanced
+    ``\boxed{...}`` payload may contain that JSON.
+    """
+    answer_matches = list(ANSWER_BLOCK_PATTERN.finditer(text or ""))
+    if not answer_matches:
+        return None
+    answer_text = answer_matches[-1].group(1).strip()
+    candidate = _extract_last_boxed_content(answer_text) or answer_text
+    try:
+        prediction = json.loads(candidate)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(prediction, list) or len(prediction) != 1:
+        return None
+    item = prediction[0]
+    if not isinstance(item, dict) or set(item) != {"point_2d"}:
+        return None
+    point = item["point_2d"]
+    if not isinstance(point, list) or len(point) != 2:
+        return None
+    try:
+        x, y = (float(value) for value in point)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(x) and math.isfinite(y) and 0.0 <= x <= 1000.0 and 0.0 <= y <= 1000.0):
+        return None
+    return x, y
+
+
+def score_final_answer_point(doc: Dict[str, Any], response_text: str) -> Dict[str, Any]:
+    """Score joint3-style HStar output as point-in-any-target-box accuracy."""
+    ground_bboxes = get_doc_ground_bboxes(doc)
+    answer_point = parse_final_answer_point(response_text)
+    correct = bool(
+        answer_point is not None
+        and any(
+            float(x1) <= answer_point[0] <= float(x2)
+            and float(y1) <= answer_point[1] <= float(y2)
+            for x1, y1, x2, y2 in ground_bboxes
+        )
+    )
+    return {
+        "success": correct,
+        "point_in_box_success": correct,
+        "has_answer_point": answer_point is not None,
+        "answer_point": list(answer_point) if answer_point is not None else None,
+        "ground_bboxes": [list(box) for box in ground_bboxes],
+        "score_mode": "point_in_any_target_box",
+    }
 
 
 def bbox_iou_vs_ground(
