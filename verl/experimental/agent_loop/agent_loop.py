@@ -711,7 +711,9 @@ class AgentLoopWorker:
             internal_outputs = [await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)]
             for branch_output in output.branch_outputs or []:
                 branch_output.extra_fields["__agent_loop_input_row"] = source_row
-                internal_outputs.append(await self._agent_loop_postprocess(branch_output, trajectory["validate"], **kwargs))
+                internal_outputs.append(
+                    await self._agent_loop_postprocess(branch_output, trajectory["validate"], **kwargs)
+                )
             return internal_outputs
 
     async def _agent_loop_postprocess(self, output, validate, **kwargs) -> _InternalAgentLoopOutput:
@@ -1196,6 +1198,7 @@ class AgentLoopWorker:
             "retry_sft_token_count",
             "retry_critic_label",
             "retry_critic_token_count",
+            "retry_critic_supervision_skipped_reason",
             "retry_critic_validation_decision_log",
             "retry_critic_validation_decisions",
             "retry_critic_validation_accepts",

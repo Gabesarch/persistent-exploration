@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 _TASK_DIR = Path(__file__).resolve().parent
 if str(_TASK_DIR) not in sys.path:
     sys.path.insert(0, str(_TASK_DIR))
+from hstar_instruction import naturalize_hstar_instruction  # noqa: E402
 from image_io import patched_hstar_cv2_imread  # noqa: E402
 from panorama_strip import erp_to_strip_pil  # noqa: E402
 from scoring import (  # noqa: E402
@@ -408,16 +409,15 @@ def hstarbench_point_zoom_doc_to_text(
     lmms_eval_specific_kwargs: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Joint3-trained HStar point-clicking prompt on the original panorama strip."""
-    instruction = str(doc.get("task", "")).strip()
-    if instruction:
-        instruction = instruction[0].upper() + instruction[1:]
-        if not instruction.endswith((".", "?", "!")):
-            instruction += "."
-    return (
-        f"{instruction} Use coordinates relative to the original full image: x and y must each be "
-        "normalized to the 0-1000 range. In the <answer> block, output only this JSON array: "
-        '[{"point_2d": [x, y]}].'
-    )
+    kwargs = lmms_eval_specific_kwargs or {}
+    instruction = naturalize_hstar_instruction(str(doc.get("task", "")))
+    pre = str(kwargs.get("pre_prompt", ""))
+    post = str(kwargs.get("post_prompt", ""))
+    if pre and not pre.endswith((" ", "\n", "\t")):
+        pre += " "
+    if post and not post.startswith((" ", "\n", "\t")):
+        post = " " + post
+    return f"{pre}{instruction}{post}"
 
 
 def hstarbench_point_zoom_doc_to_messages_vero(
@@ -426,9 +426,7 @@ def hstarbench_point_zoom_doc_to_messages_vero(
 ):
     """User turn for joint3-style point output; system/tool schema come from metadata."""
     kwargs = lmms_eval_specific_kwargs or {}
-    pre = str(kwargs.get("pre_prompt", ""))
-    post = str(kwargs.get("post_prompt", ""))
-    question = pre + hstarbench_point_zoom_doc_to_text(doc, kwargs) + post
+    question = hstarbench_point_zoom_doc_to_text(doc, kwargs)
     visuals = hstarbench_bbox_zoom_doc_to_visual(doc, kwargs)
     user_content = [{"type": "image", "url": visual} for visual in visuals]
     user_content.append({"type": "text", "text": question})

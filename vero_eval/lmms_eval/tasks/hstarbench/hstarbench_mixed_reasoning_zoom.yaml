@@ -21,7 +21,7 @@ lmms_eval_specific_kwargs:
   default:
     use_panorama_strip: true
     pre_prompt: "\n"
-    post_prompt: ""
+    post_prompt: "Use coordinates relative to the original full image: x and y must each be normalized to the 0-1000 range. In the <answer> block, output only this JSON array: [{\"point_2d\": [x, y]}].\n\n\n\n"
 metric_list:
   - metric: hstarbench_point_in_box_acc
     aggregation: !function utils.hstarbench_aggregate_success

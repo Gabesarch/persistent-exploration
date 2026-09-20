@@ -79,30 +79,74 @@ def parent_balanced_retry_critic_loss(
     represented parents in that class.
     """
 
-    critic_mask = critic_mask.to(dtype=torch.bool)
     is_retry = is_retry.to(device=log_prob.device, dtype=torch.bool)
+    stratum_id = is_retry.to(dtype=torch.long)
+    critic_loss, stratum_nll, present = parent_balanced_retry_critic_strata_loss(
+        log_prob,
+        critic_mask,
+        stratum_id,
+        parent_weight,
+        global_stratum_parent_mass=[global_accept_parent_mass, global_retry_parent_mass],
+        dp_size=dp_size,
+    )
+    accept_nll, retry_nll = stratum_nll.unbind()
+    has_accept, has_retry = (bool(value.item()) for value in present)
+    return critic_loss, accept_nll, retry_nll, has_accept, has_retry
+
+
+def parent_balanced_retry_critic_strata_loss(
+    log_prob: torch.Tensor,
+    critic_mask: torch.Tensor,
+    stratum_id: torch.Tensor,
+    parent_weight: torch.Tensor,
+    *,
+    global_stratum_parent_mass: list[int | float] | torch.Tensor,
+    dp_size: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return the equally weighted mean NLL over globally present critic strata.
+
+    Attempts are averaged per parent before this reducer. ``stratum_id`` is a
+    zero-based row assignment, with negative values reserved for inactive rows.
+    Missing strata contribute no mass; the target weights are renormalized over
+    the strata represented in the current distributed PPO minibatch.
+    """
+
+    critic_mask = critic_mask.to(device=log_prob.device, dtype=torch.bool)
+    stratum_id = stratum_id.to(device=log_prob.device, dtype=torch.long)
     parent_weight = parent_weight.to(device=log_prob.device, dtype=log_prob.dtype)
+    if isinstance(global_stratum_parent_mass, torch.Tensor):
+        denominators = global_stratum_parent_mass.to(device=log_prob.device, dtype=log_prob.dtype).flatten()
+    else:
+        denominators = torch.stack(
+            [
+                torch.as_tensor(value, device=log_prob.device, dtype=log_prob.dtype)
+                for value in global_stratum_parent_mass
+            ]
+        ).flatten()
+    if denominators.numel() == 0:
+        raise ValueError("global_stratum_parent_mass must contain at least one stratum.")
+
+    active_rows = critic_mask.any(dim=-1)
+    invalid_active = active_rows & ((stratum_id < 0) | (stratum_id >= denominators.numel()))
+    if bool(invalid_active.any().item()):
+        invalid_ids = sorted(set(stratum_id[invalid_active].detach().cpu().tolist()))
+        raise ValueError(
+            f"Active retry critic rows have stratum ids outside [0, {denominators.numel()}): {invalid_ids}."
+        )
+
     row_nll = -(log_prob * critic_mask.to(dtype=log_prob.dtype)).sum(dim=-1)
-
-    def _class_loss(row_selector: torch.Tensor, denominator_value) -> tuple[torch.Tensor, bool]:
-        denominator = torch.as_tensor(denominator_value, device=log_prob.device, dtype=log_prob.dtype)
-        present = bool(denominator.item() > 0)
-        if not present:
-            return log_prob.sum() * 0.0, False
-        numerator = (row_nll * parent_weight * row_selector.to(dtype=log_prob.dtype)).sum()
-        return numerator / denominator * dp_size, True
-
-    accept_nll, has_accept = _class_loss(~is_retry, global_accept_parent_mass)
-    retry_nll, has_retry = _class_loss(is_retry, global_retry_parent_mass)
-    if has_accept and has_retry:
-        critic_loss = 0.5 * (accept_nll + retry_nll)
-    elif has_accept:
-        critic_loss = accept_nll
-    elif has_retry:
-        critic_loss = retry_nll
+    safe_stratum_id = stratum_id.clamp(min=0, max=denominators.numel() - 1)
+    weighted_row_nll = row_nll * parent_weight * active_rows.to(dtype=log_prob.dtype)
+    numerators = torch.zeros_like(denominators).scatter_add(0, safe_stratum_id, weighted_row_nll)
+    present = denominators > 0
+    safe_denominators = torch.where(present, denominators, torch.ones_like(denominators))
+    stratum_nll = numerators / safe_denominators * dp_size
+    stratum_nll = torch.where(present, stratum_nll, torch.zeros_like(stratum_nll))
+    if bool(present.any().item()):
+        critic_loss = stratum_nll[present].mean()
     else:
         critic_loss = log_prob.sum() * 0.0
-    return critic_loss, accept_nll, retry_nll, has_accept, has_retry
+    return critic_loss, stratum_nll, present
 
 
 def combine_retry_critic_loss(

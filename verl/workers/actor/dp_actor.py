@@ -53,6 +53,7 @@ from verl.workers.utils.losses import (
     combine_retry_sft_loss,
     masked_sft_nll,
     parent_balanced_retry_critic_loss,
+    parent_balanced_retry_critic_strata_loss,
 )
 
 __all__ = ["DataParallelPPOActor"]
@@ -615,11 +616,28 @@ class DataParallelPPOActor(BasePPOActor):
                 raise ValueError("Enabled retry SFT requires tensor batch key 'retry_sft_mask'.")
             select_keys.append("retry_sft_mask")
         retry_critic_enabled = bool(self.config.policy_loss.retry_critic.enabled)
+        retry_critic_dataset_balance_config = self.config.policy_loss.retry_critic.get("dataset_balance", {})
+        retry_critic_dataset_balance = bool(
+            retry_critic_enabled
+            and retry_critic_dataset_balance_config
+            and retry_critic_dataset_balance_config.get("enabled", False)
+        )
+        retry_critic_stratum_names = tuple(data.meta_info.get("retry_critic_stratum_names", ()))
         if retry_critic_enabled:
             for key in ("retry_critic_mask", "retry_critic_is_retry", "retry_critic_parent_weight"):
                 if key not in data.batch.keys():
                     raise ValueError(f"Enabled retry critic requires tensor batch key {key!r}.")
                 select_keys.append(key)
+            if retry_critic_dataset_balance:
+                if "retry_critic_stratum_id" not in data.batch.keys():
+                    raise ValueError(
+                        "Dataset-balanced retry critic requires tensor batch key 'retry_critic_stratum_id'."
+                    )
+                if not retry_critic_stratum_names:
+                    raise ValueError(
+                        "Dataset-balanced retry critic requires nonempty retry_critic_stratum_names metadata."
+                    )
+                select_keys.append("retry_critic_stratum_id")
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = []
@@ -673,24 +691,64 @@ class DataParallelPPOActor(BasePPOActor):
                     global_rl_tokens = int(token_counts[1].item())
                 global_critic_examples = [0, 0]
                 global_critic_parent_mass = [0.0, 0.0]
+                global_critic_stratum_examples: list[int] = []
+                global_critic_stratum_parent_mass: list[float] = []
                 if retry_critic_enabled:
                     critic_rows = mini_batch.batch["retry_critic_mask"].to(dtype=torch.bool).any(dim=-1)
                     critic_is_retry = mini_batch.batch["retry_critic_is_retry"].to(dtype=torch.bool)
                     critic_parent_weight = mini_batch.batch["retry_critic_parent_weight"].to(dtype=torch.float32)
-                    critic_stats = torch.tensor(
-                        [
-                            int((critic_rows & ~critic_is_retry).sum().item()),
-                            int((critic_rows & critic_is_retry).sum().item()),
-                            float((critic_parent_weight * (critic_rows & ~critic_is_retry)).sum().item()),
-                            float((critic_parent_weight * (critic_rows & critic_is_retry)).sum().item()),
-                        ],
-                        dtype=torch.float64,
-                        device=get_device_id(),
-                    )
+                    if retry_critic_dataset_balance:
+                        num_strata = len(retry_critic_stratum_names)
+                        critic_stratum_id = mini_batch.batch["retry_critic_stratum_id"].to(dtype=torch.long)
+                        invalid_rows = critic_rows & (
+                            (critic_stratum_id < 0) | (critic_stratum_id >= num_strata)
+                        )
+                        if bool(invalid_rows.any().item()):
+                            raise ValueError("Active retry critic rows contain invalid dataset stratum ids.")
+                        active_stratum_id = critic_stratum_id[critic_rows]
+                        stratum_examples = torch.bincount(active_stratum_id, minlength=num_strata).to(
+                            dtype=torch.float64
+                        )
+                        stratum_parent_mass = torch.bincount(
+                            active_stratum_id,
+                            weights=critic_parent_weight[critic_rows].to(dtype=torch.float64),
+                            minlength=num_strata,
+                        )
+                        critic_stats = torch.cat((stratum_examples, stratum_parent_mass)).to(
+                            device=get_device_id()
+                        )
+                    else:
+                        critic_stats = torch.tensor(
+                            [
+                                int((critic_rows & ~critic_is_retry).sum().item()),
+                                int((critic_rows & critic_is_retry).sum().item()),
+                                float((critic_parent_weight * (critic_rows & ~critic_is_retry)).sum().item()),
+                                float((critic_parent_weight * (critic_rows & critic_is_retry)).sum().item()),
+                            ],
+                            dtype=torch.float64,
+                            device=get_device_id(),
+                        )
                     if torch.distributed.is_initialized():
                         torch.distributed.all_reduce(critic_stats, op=torch.distributed.ReduceOp.SUM)
-                    global_critic_examples = [int(critic_stats[0].item()), int(critic_stats[1].item())]
-                    global_critic_parent_mass = [float(critic_stats[2].item()), float(critic_stats[3].item())]
+                    if retry_critic_dataset_balance:
+                        num_strata = len(retry_critic_stratum_names)
+                        global_critic_stratum_examples = [
+                            int(value) for value in critic_stats[:num_strata].tolist()
+                        ]
+                        global_critic_stratum_parent_mass = [
+                            float(value) for value in critic_stats[num_strata:].tolist()
+                        ]
+                        global_critic_examples = [
+                            sum(global_critic_stratum_examples[0::2]),
+                            sum(global_critic_stratum_examples[1::2]),
+                        ]
+                        global_critic_parent_mass = [
+                            sum(global_critic_stratum_parent_mass[0::2]),
+                            sum(global_critic_stratum_parent_mass[1::2]),
+                        ]
+                    else:
+                        global_critic_examples = [int(critic_stats[0].item()), int(critic_stats[1].item())]
+                        global_critic_parent_mass = [float(critic_stats[2].item()), float(critic_stats[3].item())]
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(
@@ -852,21 +910,45 @@ class DataParallelPPOActor(BasePPOActor):
                     retry_critic_fraction = 0.0
                     has_critic = any(global_critic_examples)
                     if retry_critic_enabled and has_critic:
-                        (
-                            retry_critic_loss,
-                            retry_critic_accept_nll,
-                            retry_critic_retry_nll,
-                            _,
-                            _,
-                        ) = parent_balanced_retry_critic_loss(
-                            log_prob,
-                            retry_critic_mask,
-                            model_inputs["retry_critic_is_retry"],
-                            model_inputs["retry_critic_parent_weight"],
-                            global_accept_parent_mass=global_critic_parent_mass[0],
-                            global_retry_parent_mass=global_critic_parent_mass[1],
-                            dp_size=dp_size,
-                        )
+                        if retry_critic_dataset_balance:
+                            retry_critic_loss, stratum_nll, present_strata = (
+                                parent_balanced_retry_critic_strata_loss(
+                                    log_prob,
+                                    retry_critic_mask,
+                                    model_inputs["retry_critic_stratum_id"],
+                                    model_inputs["retry_critic_parent_weight"],
+                                    global_stratum_parent_mass=global_critic_stratum_parent_mass,
+                                    dp_size=dp_size,
+                                )
+                            )
+                            accept_present = present_strata[0::2]
+                            retry_present = present_strata[1::2]
+                            if bool(accept_present.any().item()):
+                                retry_critic_accept_nll = stratum_nll[0::2][accept_present].mean()
+                            if bool(retry_present.any().item()):
+                                retry_critic_retry_nll = stratum_nll[1::2][retry_present].mean()
+                            for stratum_index, stratum_name in enumerate(retry_critic_stratum_names):
+                                if bool(present_strata[stratum_index].item()):
+                                    metrics[f"actor/retry_critic_strata/{stratum_name}_nll"] = (
+                                        metrics.get(f"actor/retry_critic_strata/{stratum_name}_nll", 0.0)
+                                        + stratum_nll[stratum_index].detach().item()
+                                    )
+                        else:
+                            (
+                                retry_critic_loss,
+                                retry_critic_accept_nll,
+                                retry_critic_retry_nll,
+                                _,
+                                _,
+                            ) = parent_balanced_retry_critic_loss(
+                                log_prob,
+                                retry_critic_mask,
+                                model_inputs["retry_critic_is_retry"],
+                                model_inputs["retry_critic_parent_weight"],
+                                global_accept_parent_mass=global_critic_parent_mass[0],
+                                global_retry_parent_mass=global_critic_parent_mass[1],
+                                dp_size=dp_size,
+                            )
                         retry_critic_fraction = float(self.config.policy_loss.retry_critic.loss_fraction)
                     loss = combine_retry_critic_loss(
                         loss,
@@ -909,6 +991,24 @@ class DataParallelPPOActor(BasePPOActor):
                             "actor/retry_critic_missing_retry": float(global_critic_examples[1] == 0),
                         }
                     )
+                    if retry_critic_dataset_balance:
+                        mini_batch_metrics["actor/retry_critic_configured_strata"] = len(
+                            retry_critic_stratum_names
+                        )
+                        mini_batch_metrics["actor/retry_critic_present_strata"] = sum(
+                            count > 0 for count in global_critic_stratum_examples
+                        )
+                        for stratum_index, stratum_name in enumerate(retry_critic_stratum_names):
+                            prefix = f"actor/retry_critic_strata/{stratum_name}"
+                            mini_batch_metrics[f"{prefix}_examples"] = global_critic_stratum_examples[
+                                stratum_index
+                            ]
+                            mini_batch_metrics[f"{prefix}_parents"] = global_critic_stratum_parent_mass[
+                                stratum_index
+                            ]
+                            mini_batch_metrics[f"{prefix}_missing"] = float(
+                                global_critic_stratum_examples[stratum_index] == 0
+                            )
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
         return metrics

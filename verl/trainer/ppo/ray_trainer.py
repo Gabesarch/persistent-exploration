@@ -381,6 +381,42 @@ class RayPPOTrainer:
     def _retry_critic_config(self):
         return self.config.actor_rollout_ref.actor.get("policy_loss", {}).get("retry_critic", {})
 
+    def _retry_critic_dataset_balance_config(self):
+        return self._retry_critic_config().get("dataset_balance", {})
+
+    def _configured_retry_critic_datasets(self) -> tuple[str, ...]:
+        raw_weights = self.config.data.get("per_batch_domain_weights", None)
+        if OmegaConf.is_config(raw_weights):
+            raw_weights = OmegaConf.to_container(raw_weights, resolve=True)
+        if not isinstance(raw_weights, Mapping) or not raw_weights:
+            raise ValueError(
+                "policy_loss.retry_critic.dataset_balance.enabled requires a nonempty "
+                "data.per_batch_domain_weights mapping."
+            )
+
+        dataset_names = []
+        for raw_name, raw_weight in raw_weights.items():
+            name = str(raw_name).strip()
+            if not name:
+                raise ValueError("data.per_batch_domain_weights contains an empty dataset name.")
+            try:
+                weight = float(raw_weight)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"data.per_batch_domain_weights has an invalid weight for dataset {name!r}: {raw_weight!r}."
+                ) from None
+            if math.isfinite(weight) and weight > 0:
+                dataset_names.append(name)
+
+        if not dataset_names:
+            raise ValueError(
+                "policy_loss.retry_critic.dataset_balance.enabled requires at least one positive "
+                "data.per_batch_domain_weights entry."
+            )
+        if len(dataset_names) != len(set(dataset_names)):
+            raise ValueError("data.per_batch_domain_weights dataset names must be unique after string normalization.")
+        return tuple(sorted(dataset_names))
+
     def _validate_retry_critic_config(self) -> None:
         critic = self._retry_critic_config()
         if not critic or not bool(critic.get("enabled", False)):
@@ -391,6 +427,12 @@ class RayPPOTrainer:
             raise ValueError("policy_loss.retry_critic currently requires class_balance=true.")
         if not bool(critic.get("parent_balance", True)):
             raise ValueError("policy_loss.retry_critic currently requires parent_balance=true.")
+        dataset_balance = self._retry_critic_dataset_balance_config()
+        if dataset_balance and bool(dataset_balance.get("enabled", False)):
+            dataset_key = str(dataset_balance.get("key", "mixture_source")).strip()
+            if not dataset_key:
+                raise ValueError("policy_loss.retry_critic.dataset_balance.key must be nonempty.")
+            self._configured_retry_critic_datasets()
         multi_turn = self.config.actor_rollout_ref.rollout.multi_turn
         if not bool(multi_turn.get("conditional_answer_retry_critic_enabled", False)):
             raise ValueError("actor retry critic loss requires rollout retry critic enablement.")
@@ -466,7 +508,13 @@ class RayPPOTrainer:
         critic = self._retry_critic_config()
         if not critic or not bool(critic.get("enabled", False)):
             return
-        for key in ("retry_critic_label", "request_id"):
+        dataset_balance = self._retry_critic_dataset_balance_config()
+        dataset_balance_enabled = bool(dataset_balance and dataset_balance.get("enabled", False))
+        dataset_key = str(dataset_balance.get("key", "mixture_source")).strip()
+        required_keys = ["retry_critic_label", "request_id"]
+        if dataset_balance_enabled:
+            required_keys.append(dataset_key)
+        for key in required_keys:
             if key not in batch.non_tensor_batch:
                 raise ValueError(f"Retry critic loss requires non-tensor batch key {key!r}.")
         if "retry_critic_mask" not in batch.batch:
@@ -474,12 +522,18 @@ class RayPPOTrainer:
 
         labels = np.asarray(batch.non_tensor_batch["retry_critic_label"], dtype=object)
         parent_ids = np.asarray(batch.non_tensor_batch["request_id"], dtype=object)
+        datasets = (
+            np.asarray(batch.non_tensor_batch[dataset_key], dtype=object) if dataset_balance_enabled else None
+        )
+        dataset_names = self._configured_retry_critic_datasets() if dataset_balance_enabled else ()
+        dataset_to_index = {name: index for index, name in enumerate(dataset_names)}
         padding_mask = np.asarray(
             batch.non_tensor_batch.get("__branch_padding_row", np.zeros(len(batch), dtype=bool)), dtype=bool
         )
         active_rows = batch.batch["retry_critic_mask"].to(dtype=torch.bool).any(dim=-1).cpu().numpy()
-        groups: dict[tuple[str, Any], list[int]] = defaultdict(list)
+        groups: dict[tuple[Any, ...], list[int]] = defaultdict(list)
         is_retry = torch.zeros(len(batch), dtype=torch.bool)
+        stratum_id = torch.full((len(batch),), -1, dtype=torch.long)
         for row, (label, parent_id) in enumerate(zip(labels, parent_ids, strict=True)):
             if padding_mask[row] or not active_rows[row]:
                 continue
@@ -487,20 +541,60 @@ class RayPPOTrainer:
                 raise ValueError(f"Active retry critic row {row} has invalid label {label!r}.")
             if parent_id is None or (isinstance(parent_id, str) and not parent_id.strip()):
                 raise ValueError(f"Active retry critic row {row} has an empty request_id.")
-            groups[(str(label), parent_id)].append(row)
             is_retry[row] = label == "R"
+            if dataset_balance_enabled:
+                raw_dataset = datasets[row]
+                if not isinstance(raw_dataset, str) or not raw_dataset.strip():
+                    raise ValueError(
+                        f"Active retry critic row {row} has an empty dataset value in {dataset_key!r}."
+                    )
+                dataset = raw_dataset.strip()
+                if dataset not in dataset_to_index:
+                    raise ValueError(
+                        f"Active retry critic row {row} has unknown dataset {dataset!r} in {dataset_key!r}; "
+                        f"configured datasets are {list(dataset_names)!r}."
+                    )
+                label_index = 1 if label == "R" else 0
+                stratum_id[row] = 2 * dataset_to_index[dataset] + label_index
+                groups[(dataset, str(label), parent_id)].append(row)
+            else:
+                groups[(str(label), parent_id)].append(row)
 
         parent_weight = torch.zeros(len(batch), dtype=torch.float32)
         for rows in groups.values():
             parent_weight[rows] = 1.0 / len(rows)
         batch.batch["retry_critic_is_retry"] = is_retry
         batch.batch["retry_critic_parent_weight"] = parent_weight
+        if dataset_balance_enabled:
+            batch.batch["retry_critic_stratum_id"] = stratum_id
+            batch.meta_info["retry_critic_stratum_names"] = [
+                f"{dataset}/{label_name}"
+                for dataset in dataset_names
+                for label_name in ("accept", "retry")
+            ]
+        label_group_index = 1 if dataset_balance_enabled else 0
         for label, name in (("A", "accept"), ("R", "retry")):
-            example_count = sum(len(rows) for (group_label, _), rows in groups.items() if group_label == label)
-            parent_count = sum(1 for group_label, _ in groups if group_label == label)
+            example_count = sum(
+                len(rows) for group, rows in groups.items() if group[label_group_index] == label
+            )
+            parent_count = sum(1 for group in groups if group[label_group_index] == label)
             metrics[f"retry_critic/{name}_examples"] = example_count
             metrics[f"retry_critic/{name}_parents"] = parent_count
             metrics[f"retry_critic/missing_{name}_class"] = float(example_count == 0)
+        if dataset_balance_enabled:
+            metrics["retry_critic/configured_strata"] = 2 * len(dataset_names)
+            for dataset in dataset_names:
+                for label, name in (("A", "accept"), ("R", "retry")):
+                    example_count = sum(
+                        len(rows)
+                        for group, rows in groups.items()
+                        if group[0] == dataset and group[1] == label
+                    )
+                    parent_count = sum(1 for group in groups if group[0] == dataset and group[1] == label)
+                    prefix = f"retry_critic/strata/{dataset}/{name}"
+                    metrics[f"{prefix}_examples"] = example_count
+                    metrics[f"{prefix}_parents"] = parent_count
+                    metrics[f"{prefix}_missing"] = float(example_count == 0)
 
     def _subsample_branch_training_rows(self, batch: DataProto, metrics: dict) -> DataProto:
         """Cap branch rows per parent while retaining every canonical row."""
@@ -974,8 +1068,21 @@ class RayPPOTrainer:
         # Log to each configured logger
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
-    def _get_gen_batch(self, batch: DataProto) -> DataProto:
+    def _get_gen_batch(self, batch: DataProto, *, validate: bool = False) -> DataProto:
         reward_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+        dataset_balance = self._retry_critic_dataset_balance_config()
+        if dataset_balance and bool(dataset_balance.get("enabled", False)):
+            dataset_key = str(dataset_balance.get("key", "mixture_source")).strip()
+            if dataset_key in batch.non_tensor_batch:
+                # ``batch.pop`` below moves generation-only fields out of the
+                # batch retained for training. Keep dataset provenance on that
+                # batch while also forwarding it to the agent loop.
+                reward_keys.add(dataset_key)
+            elif not validate:
+                raise ValueError(
+                    "Dataset-balanced retry critic requires the configured non-tensor "
+                    f"batch key {dataset_key!r} before rollout."
+                )
 
         # pop those keys for generation
         batch_keys_to_pop = []
@@ -1096,7 +1203,7 @@ class RayPPOTrainer:
             ]
             sample_gts.extend(ground_truths)
 
-            test_gen_batch = self._get_gen_batch(test_batch)
+            test_gen_batch = self._get_gen_batch(test_batch, validate=True)
             test_gen_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
                 "pad_token_id": self.tokenizer.pad_token_id,

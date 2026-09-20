@@ -375,7 +375,7 @@ trainer:
   project_name: vero2_verl
   experiment_name: branchstrata20_fresh_lr1e5_20260806
   total_epochs: 1000
-  total_training_steps: 100
+  total_training_steps: 200
   log_val_generations: 0
   esi_redundant_time: 2000
   resume_mode: auto

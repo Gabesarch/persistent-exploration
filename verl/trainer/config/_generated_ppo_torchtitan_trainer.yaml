@@ -93,6 +93,10 @@ actor_rollout_ref:
         loss_fraction: 0.03
         class_balance: true
         parent_balance: true
+        dataset_balance:
+          _target_: verl.workers.config.RetryCriticDatasetBalanceConfig
+          enabled: false
+          key: mixture_source
     clip_ratio_c: 3.0
     loss_agg_mode: token-mean
     loss_scale_factor: null

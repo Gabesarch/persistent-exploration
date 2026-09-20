@@ -62,6 +62,15 @@ export CRITIC_GUIDED_ANSWER_RETRY_PREFILL_PROFILE="${CRITIC_GUIDED_ANSWER_RETRY_
 DEFAULT_FORCE_FINAL_ANSWER_THINK_PREFILL="This is the final turn, so I need to answer from the evidence gathered so far."
 export FORCE_FINAL_ANSWER_THINK_PREFILL="${FORCE_FINAL_ANSWER_THINK_PREFILL:-$DEFAULT_FORCE_FINAL_ANSWER_THINK_PREFILL}"
 
+# The selected training recipe is authoritative, including the served template.
+if [[ -n "${VERO_TRAINING_CONFIG:-}" ]]; then
+  ALIGNMENT_DIR="$(mktemp -d /tmp/vero-training-alignment.XXXXXX)"
+  python "$VERO_EVAL_DIR/lmms_eval/models/model_utils/training_alignment.py" \
+    --template "$ALIGNMENT_DIR/chat_template.jinja" > "$ALIGNMENT_DIR/environment.sh"
+  source "$ALIGNMENT_DIR/environment.sh"
+  echo "Training-aligned evaluation: $VERO_TRAINING_CONFIG"
+fi
+
 has_hf_weights() {
   local hf_dir="$1"
   shopt -s nullglob

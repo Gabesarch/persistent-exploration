@@ -140,6 +140,17 @@ policy_loss:
     class_balance: true
     parent_balance: true
 
+    # Optionally balance every configured dataset/label cell equally.
+    dataset_balance:
+
+      # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+      _target_: verl.workers.config.RetryCriticDatasetBalanceConfig
+
+      enabled: false
+
+      # Non-tensor batch key whose values match data.per_batch_domain_weights.
+      key: mixture_source
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 

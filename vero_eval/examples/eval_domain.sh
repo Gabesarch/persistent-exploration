@@ -163,6 +163,7 @@ echo "Output:     $OUTPUT_PATH"
 echo "Model args: $MODEL_ARGS"
 echo "Final think prefill: ${FORCE_FINAL_ANSWER_THINK_PREFILL:-<empty>}"
 echo "Critic retry: enabled=$CRITIC_GUIDED_ANSWER_RETRY threshold=$CRITIC_GUIDED_ANSWER_RETRY_THRESHOLD prefill_profile=$CRITIC_GUIDED_ANSWER_RETRY_PREFILL_PROFILE"
+echo "Critic domain thresholds: ${VERO_EVAL_CRITIC_DOMAIN_THRESHOLDS:-<none; using fallback>}"
 echo ""
 
 python -m lmms_eval \
