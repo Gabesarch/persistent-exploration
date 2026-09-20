@@ -31,6 +31,7 @@ PORT="${PORT:-9001}"; MODEL_NAME="${MODEL_NAME:-qwen_vllm}"
 API_KEY="${API_KEY:-qwen}"; NUM_GPUS="${NUM_GPUS:-1}"
 # Set CUSTOM_CHAT_TEMPLATE to use a custom template (e.g., one that doesn't auto-inject tools)
 CUSTOM_CHAT_TEMPLATE="${CUSTOM_CHAT_TEMPLATE:-}"
+FORCE_TOOL_CALLS_UNTIL_FINAL_TURN="${FORCE_TOOL_CALLS_UNTIL_FINAL_TURN:-false}"
 FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS="${FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS:-false}"
 
 LOG_DIR="${LOG_DIR:-$VERO_EVAL_DIR/logs/vllm}"
@@ -66,14 +67,25 @@ if [[ -n "$MM_MIN_PIXELS" ]]; then
 fi
 
 LOGITS_PROCESSOR_ARGS=()
-case "${FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS,,}" in
+FORCED_ACTION_PROCESSOR_ENABLED=false
+FORCED_TOOL_CALLS_ENABLED=false
+case "${FORCE_TOOL_CALLS_UNTIL_FINAL_TURN,,}" in
   1|true|yes|on)
-    VERO2_ROOT="$(cd "$VERO_EVAL_DIR/.." && pwd)"
-    export PYTHONPATH="$VERO2_ROOT${PYTHONPATH:+:$PYTHONPATH}"
-    LOGITS_PROCESSOR_ARGS=(--logits-processors "verl.utils.vllm_forced_action_logits_processor:ForceActionTagAfterThinkLogitsProcessor")
-    echo "Using forced final-answer logits processor: ${LOGITS_PROCESSOR_ARGS[1]}"
+    FORCED_ACTION_PROCESSOR_ENABLED=true
+    FORCED_TOOL_CALLS_ENABLED=true
     ;;
 esac
+case "${FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS,,}" in
+  1|true|yes|on)
+    FORCED_ACTION_PROCESSOR_ENABLED=true
+    ;;
+esac
+if [[ "$FORCED_ACTION_PROCESSOR_ENABLED" == true ]]; then
+  VERO2_ROOT="$(cd "$VERO_EVAL_DIR/.." && pwd)"
+  export PYTHONPATH="$VERO2_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+  LOGITS_PROCESSOR_ARGS=(--logits-processors "verl.utils.vllm_forced_action_logits_processor:ForceActionTagAfterThinkLogitsProcessor")
+  echo "Using forced-action logits processor: ${LOGITS_PROCESSOR_ARGS[1]}"
+fi
 
 echo "Starting vLLM server (log: $LOGFILE)..."
 CHAT_TEMPLATE_ARG=""
@@ -118,15 +130,22 @@ echo "Waiting for vLLM to be ready (up to ${VLLM_WAIT_MIN} min)..."
 for _ in $(seq 1 $(( VLLM_WAIT_MIN * 12 ))); do
   if curl --max-time 2 -s -o /dev/null "http://localhost:${PORT}/v1/models"; then
     echo "vLLM is up at http://localhost:${PORT}"
-    case "${FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS,,}" in
-      1|true|yes|on)
-        "${PYTHON:-python}" "$VERO_EVAL_DIR/scripts/probe_forced_final_answer.py" \
-          --base-url "http://localhost:${PORT}/v1" \
-          --api-key "$API_KEY" \
-          --model "$MODEL_NAME" \
-          --tokenizer "${LMMS_EVAL_HF_TOKENIZER:-$CHECKPOINT_PATH}"
-        ;;
-    esac
+    if [[ "$FORCED_ACTION_PROCESSOR_ENABLED" == true ]]; then
+      "${PYTHON:-python}" "$VERO_EVAL_DIR/scripts/probe_forced_final_answer.py" \
+        --base-url "http://localhost:${PORT}/v1" \
+        --api-key "$API_KEY" \
+        --model "$MODEL_NAME" \
+        --tokenizer "${LMMS_EVAL_HF_TOKENIZER:-$CHECKPOINT_PATH}" \
+        --required-tag "<answer>"
+    fi
+    if [[ "$FORCED_TOOL_CALLS_ENABLED" == true ]]; then
+      "${PYTHON:-python}" "$VERO_EVAL_DIR/scripts/probe_forced_final_answer.py" \
+        --base-url "http://localhost:${PORT}/v1" \
+        --api-key "$API_KEY" \
+        --model "$MODEL_NAME" \
+        --tokenizer "${LMMS_EVAL_HF_TOKENIZER:-$CHECKPOINT_PATH}" \
+        --required-tag "<tool_call>"
+    fi
     exit 0
   fi
   sleep 5

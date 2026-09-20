@@ -4,12 +4,11 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 import numpy as np
 
-from verl.utils.reward_score import grounding_reward
-from verl.utils.reward_score import string_match
+from verl.utils.reward_score import grounding_reward, string_match
 
 __all__ = [
     "compute_score_accuracy",
@@ -61,7 +60,7 @@ def _parse_ground_truth_bboxes(
     img_width: Optional[int] = None,
     img_height: Optional[int] = None,
     assume_qwen_normalized: Optional[bool] = None,
-) -> List[np.ndarray]:
+) -> list[np.ndarray]:
     return [
         item["bbox"]
         for item in grounding_reward.parse_ground_truth_items(
@@ -148,9 +147,9 @@ def compute_score_from_data_source(
     data_source: str,
     solution_str: str,
     ground_truth: str,
-    extra_info: Optional[Dict] = None,
+    extra_info: Optional[dict] = None,
     format_score: float = 0.5,
-    **kwargs: Dict[str, Any],
+    **kwargs: dict[str, Any],
 ) -> float:
     image_path = None
     image_size = None

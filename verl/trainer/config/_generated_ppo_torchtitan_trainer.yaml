@@ -87,6 +87,16 @@ actor_rollout_ref:
         _target_: verl.workers.config.RetrySFTLossConfig
         enabled: false
         loss_fraction: 0.05
+      retry_critic:
+        _target_: verl.workers.config.RetryCriticLossConfig
+        enabled: false
+        loss_fraction: 0.03
+        class_balance: true
+        parent_balance: true
+        dataset_balance:
+          _target_: verl.workers.config.RetryCriticDatasetBalanceConfig
+          enabled: false
+          key: mixture_source
     clip_ratio_c: 3.0
     loss_agg_mode: token-mean
     loss_scale_factor: null
@@ -350,6 +360,23 @@ actor_rollout_ref:
       conditional_answer_retry_branch_reward_components: {}
       conditional_answer_retry_branch_use_graded_rewards: false
       conditional_answer_retry_branch_baseline_weight_key: gdpo_baseline_weight
+      conditional_answer_retry_critic_enabled: false
+      conditional_answer_retry_critic_oracle_supervision_enabled: true
+      conditional_answer_retry_critic_enable_validation: false
+      conditional_answer_retry_critic_question: Assuming another tool round is available,
+        should the preceding candidate be accepted or retried? In the <answer> block,
+        output only "A" or "R".
+      conditional_answer_retry_critic_assistant_prefill: 'I need to classify whether
+        the preceding candidate should be accepted or retried.
+
+        </think>
+
+        <answer>
+
+        '
+      conditional_answer_retry_critic_accept_token: A
+      conditional_answer_retry_critic_retry_token: R
+      conditional_answer_retry_critic_decision_threshold: 0.5
     calculate_log_probs: false
     lazy_multi_modal_inputs:
       _target_: verl.workers.config.LazyMultiModalInputsConfig

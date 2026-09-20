@@ -36,6 +36,8 @@ __all__ = [
     "BranchSubsamplingConfig",
     "BranchLossStrataConfig",
     "RetrySFTLossConfig",
+    "RetryCriticDatasetBalanceConfig",
+    "RetryCriticLossConfig",
     "PolicyLossConfig",
     "RouterReplayConfig",
     "ActorConfig",
@@ -141,6 +143,36 @@ class RetrySFTLossConfig(BaseConfig):
 
 
 @dataclass
+class RetryCriticDatasetBalanceConfig(BaseConfig):
+    """Optional equal weighting over retry-critic dataset/label strata."""
+
+    enabled: bool = False
+    key: str = "mixture_source"
+
+    def __post_init__(self):
+        if not str(self.key).strip():
+            raise ValueError("policy_loss.retry_critic.dataset_balance.key must be nonempty.")
+
+
+@dataclass
+class RetryCriticLossConfig(BaseConfig):
+    """Shared-weight A/R retry-critic supervised-loss stratum."""
+
+    enabled: bool = False
+    loss_fraction: float = 0.03
+    class_balance: bool = True
+    parent_balance: bool = True
+    dataset_balance: RetryCriticDatasetBalanceConfig = field(default_factory=RetryCriticDatasetBalanceConfig)
+
+    def __post_init__(self):
+        if not 0.0 <= float(self.loss_fraction) < 1.0:
+            raise ValueError(
+                "policy_loss.retry_critic.loss_fraction must satisfy 0 <= value < 1, "
+                f"got {self.loss_fraction!r}."
+            )
+
+
+@dataclass
 class PolicyLossConfig(BaseConfig):
     """Configuration for policy loss computation.
 
@@ -165,6 +197,7 @@ class PolicyLossConfig(BaseConfig):
     rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
     branch_strata: BranchLossStrataConfig = field(default_factory=BranchLossStrataConfig)
     retry_sft: RetrySFTLossConfig = field(default_factory=RetrySFTLossConfig)
+    retry_critic: RetryCriticLossConfig = field(default_factory=RetryCriticLossConfig)
 
 
 @dataclass

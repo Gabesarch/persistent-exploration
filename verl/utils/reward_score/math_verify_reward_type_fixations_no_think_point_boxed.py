@@ -229,7 +229,7 @@ def _has_interleaved_non_point_text(think_text: str) -> bool:
     if len(point_matches) < 2:
         return False
 
-    for left, right in zip(point_matches, point_matches[1:]):
+    for left, right in zip(point_matches, point_matches[1:], strict=False):
         between_points = think_text[left.end() : right.start()]
         if _ALPHANUMERIC_PATTERN.search(between_points):
             return True
@@ -356,7 +356,7 @@ def _multiple_choice_reward(predicted: str, truth: str, **_: Any) -> float:
 
     if parsed is None:
         parsed_values = []
-    elif isinstance(parsed, (list, tuple, set)):
+    elif isinstance(parsed, list | tuple | set):
         parsed_values = list(parsed)
     else:
         parsed_values = [parsed]
@@ -435,7 +435,13 @@ def compute_score_from_data_source(
     **_: dict,
 ) -> dict[str, float]:
     """Adapter for custom_reward_function configs that expect default signature."""
-    return compute_score(solution_str, ground_truth, use_boxed=use_boxed, format_score=format_score, extra_info=extra_info)
+    return compute_score(
+        solution_str,
+        ground_truth,
+        use_boxed=use_boxed,
+        format_score=format_score,
+        extra_info=extra_info,
+    )
 
 
 async def async_compute_score_from_data_source(
@@ -454,4 +460,10 @@ async def async_compute_score_from_data_source(
     worker's main thread instead of an executor thread.
     """
 
-    return compute_score(solution_str, ground_truth, use_boxed=use_boxed, format_score=format_score, extra_info=extra_info)
+    return compute_score(
+        solution_str,
+        ground_truth,
+        use_boxed=use_boxed,
+        format_score=format_score,
+        extra_info=extra_info,
+    )

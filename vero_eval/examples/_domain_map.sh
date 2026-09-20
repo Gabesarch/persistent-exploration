@@ -25,6 +25,8 @@ declare -gA DOMAIN_TASK_BASES=(
   # Visual-search-only group (NOT in `all`): for a checkpoint sweep focused on VisualProbe,
   # e.g. submit_eval_checkpoints.sh --domain visual_probe --model-suffix reasoning_zoom.
   [visual_probe]="visual_probe_easy visual_probe_medium visual_probe_hard"
+  # Fixed public 500-example subsets for fast checkpoint screening.
+  [visual_search_lite]="hstarbench_mixed_lite screenspotpro_point_in_box_lite"
 )
 # The canonical content domains (order matters for `all`).
 VERO_DOMAINS=(chart_ocr stem spatial_action knowledge_rec grounding_counting_search instruction_following)

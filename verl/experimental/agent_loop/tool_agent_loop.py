@@ -15,6 +15,7 @@ import asyncio
 import inspect
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -131,6 +132,7 @@ class AgentData:
         self.response_ids: list[int] = []
         self.response_mask: list[int] = []
         self.retry_sft_mask: list[int] = []
+        self.retry_critic_mask: list[int] = []
         self.response_logprobs: list[float] = []
         self.turn_scores: list[float] = []
         self.tool_rewards: list[float] = []
@@ -294,10 +296,63 @@ class ToolAgentLoop(AgentLoopBase):
         self.conditional_answer_retry_branch_baseline_weight_key = getattr(
             multi_turn_config, "conditional_answer_retry_branch_baseline_weight_key", "gdpo_baseline_weight"
         )
+        self.conditional_answer_retry_critic_enabled = bool(
+            getattr(multi_turn_config, "conditional_answer_retry_critic_enabled", False)
+        )
+        self.conditional_answer_retry_critic_oracle_supervision_enabled = bool(
+            getattr(multi_turn_config, "conditional_answer_retry_critic_oracle_supervision_enabled", True)
+        )
+        self.conditional_answer_retry_critic_enable_validation = bool(
+            getattr(multi_turn_config, "conditional_answer_retry_critic_enable_validation", False)
+        )
+        self.conditional_answer_retry_critic_question = str(
+            getattr(multi_turn_config, "conditional_answer_retry_critic_question", "")
+        )
+        self.conditional_answer_retry_critic_assistant_prefill = str(
+            getattr(multi_turn_config, "conditional_answer_retry_critic_assistant_prefill", "")
+        )
+        self.conditional_answer_retry_critic_accept_token = str(
+            getattr(multi_turn_config, "conditional_answer_retry_critic_accept_token", "A")
+        )
+        self.conditional_answer_retry_critic_retry_token = str(
+            getattr(multi_turn_config, "conditional_answer_retry_critic_retry_token", "R")
+        )
+        self.conditional_answer_retry_critic_decision_threshold = float(
+            getattr(multi_turn_config, "conditional_answer_retry_critic_decision_threshold", 0.5)
+        )
+        self._retry_critic_accept_token_id = None
+        self._retry_critic_retry_token_id = None
+        if self.conditional_answer_retry_critic_enabled:
+            accept_ids = self.tokenizer.encode(
+                self.conditional_answer_retry_critic_accept_token, add_special_tokens=False
+            )
+            retry_ids = self.tokenizer.encode(
+                self.conditional_answer_retry_critic_retry_token, add_special_tokens=False
+            )
+            if len(accept_ids) != 1 or len(retry_ids) != 1 or accept_ids[0] == retry_ids[0]:
+                raise ValueError(
+                    "retry critic accept/retry labels must encode as distinct single tokens; "
+                    f"got {accept_ids!r} and {retry_ids!r}"
+                )
+            if not self.conditional_answer_retry_critic_question.strip():
+                raise ValueError("retry critic question must be nonempty")
+            if not self.conditional_answer_retry_critic_assistant_prefill.strip():
+                raise ValueError("retry critic assistant prefill must be nonempty")
+            if not 0.0 <= self.conditional_answer_retry_critic_decision_threshold <= 1.0:
+                raise ValueError("retry critic decision threshold must be in [0, 1]")
+            self._retry_critic_accept_token_id = accept_ids[0]
+            self._retry_critic_retry_token_id = retry_ids[0]
         self.llm_judge_enabled = bool(getattr(multi_turn_config, "llm_judge_enabled", False))
         self.conditional_answer_retry_reward_fn = (
             get_custom_reward_fn(self.config)
-            if self.conditional_answer_retry_enabled or self.llm_judge_enabled
+            if (
+                self.conditional_answer_retry_enabled
+                or self.llm_judge_enabled
+                or (
+                    self.conditional_answer_retry_critic_enabled
+                    and self.conditional_answer_retry_critic_oracle_supervision_enabled
+                )
+            )
             else None
         )
         self.llm_judge_prompt_path = getattr(multi_turn_config, "llm_judge_prompt_path", None)
@@ -454,6 +509,7 @@ class ToolAgentLoop(AgentLoopBase):
             response_ids=response_ids[: self.response_length],
             response_mask=agent_data.response_mask[: self.response_length],
             retry_sft_mask=agent_data.retry_sft_mask[: self.response_length],
+            retry_critic_mask=agent_data.retry_critic_mask[: self.response_length],
             multi_modal_data=multi_modal_data,
             response_logprobs=agent_data.response_logprobs[: self.response_length]
             if agent_data.response_logprobs
@@ -478,8 +534,12 @@ class ToolAgentLoop(AgentLoopBase):
                 "retry_sft_candidate_count": len(agent_data.retry_sft_candidates),
             }
         )
-        final_grade = await self._maybe_score_final_with_llm_judge(agent_data, kwargs)
+        final_grade = output.extra_fields.pop("__agent_loop_precritic_grade", None)
+        agent_data.extra_fields.pop("__agent_loop_precritic_grade", None)
+        if final_grade is None:
+            final_grade = await self._maybe_score_final_with_llm_judge(agent_data, kwargs)
         if final_grade is not None:
+            final_grade = {**final_grade, **self._retry_critic_validation_summary(agent_data)}
             output.reward_score = float(final_grade.get("score", 0.0) or 0.0)
             output.extra_fields["reward_extra_info"] = final_grade
         output.branch_outputs = agent_data.branch_outputs
@@ -617,6 +677,14 @@ class ToolAgentLoop(AgentLoopBase):
         is_validation = bool(debug_trajectory.get("validate"))
         return not is_validation or getattr(self, "conditional_answer_retry_enable_validation", True)
 
+    def _retry_critic_validation_active(self, rollout_kwargs: Optional[dict[str, Any]]) -> bool:
+        debug_trajectory = (rollout_kwargs or {}).get("_debug_trajectory", {}) or {}
+        return bool(
+            getattr(self, "conditional_answer_retry_critic_enabled", False)
+            and getattr(self, "conditional_answer_retry_critic_enable_validation", False)
+            and debug_trajectory.get("validate")
+        )
+
     def _force_answer_on_final_turn_active(self, rollout_kwargs: Optional[dict[str, Any]]) -> bool:
         debug_trajectory = (rollout_kwargs or {}).get("_debug_trajectory", {}) or {}
         if debug_trajectory.get("validate"):
@@ -693,7 +761,7 @@ class ToolAgentLoop(AgentLoopBase):
         elif self._force_answer_on_final_turn_active(rollout_kwargs) and self._must_answer_now(agent_data):
             forced_required_tag = "<answer>"
             sampling_params = self._with_forced_action_extra_args(sampling_params, forced_required_tag)
-        elif self._conditional_answer_retry_active(rollout_kwargs) and agent_data.force_next_tool_call:
+        elif agent_data.force_next_tool_call:
             forced_required_tag = "<tool_call>"
             sampling_params = self._with_forced_action_extra_args(sampling_params, forced_required_tag)
             if getattr(self, "conditional_answer_retry_teacher_only_prefill", False):
@@ -757,6 +825,7 @@ class ToolAgentLoop(AgentLoopBase):
         teacher_suffix_loss_mask = int(train_teacher_suffix_with_gspo or not is_teacher_retry_turn)
         agent_data.response_mask += [teacher_suffix_loss_mask] * len(agent_data.response_ids)
         agent_data.retry_sft_mask += [0] * len(agent_data.response_ids)
+        agent_data.retry_critic_mask += [0] * len(agent_data.response_ids)
         if output.log_probs:
             if assistant_prefill_ids:
                 agent_data.response_logprobs += [0.0] * len(assistant_prefill_ids)
@@ -825,7 +894,10 @@ class ToolAgentLoop(AgentLoopBase):
                 return AgentState.TERMINATED
 
         if (
-            self._conditional_answer_retry_active(rollout_kwargs)
+            (
+                self._conditional_answer_retry_active(rollout_kwargs)
+                or self._retry_critic_validation_active(rollout_kwargs)
+            )
             and not agent_data.tool_calls
             and rollout_kwargs is not None
         ):
@@ -834,13 +906,21 @@ class ToolAgentLoop(AgentLoopBase):
             )
             assistant_message = apply_response_display_prefix(assistant_message, self.response_display_prefix)
             if "<answer>" in assistant_message:
-                retry_state = await self._maybe_retry_incorrect_answer(
-                    agent_data=agent_data,
-                    generation_snapshot=generation_snapshot,
-                    assistant_message=assistant_message,
-                    rollout_kwargs=rollout_kwargs,
-                    ignore_termination=ignore_termination,
-                )
+                if self._retry_critic_validation_active(rollout_kwargs):
+                    retry_state = await self._maybe_retry_answer_with_critic(
+                        agent_data=agent_data,
+                        generation_snapshot=generation_snapshot,
+                        assistant_message=assistant_message,
+                        ignore_termination=ignore_termination,
+                    )
+                else:
+                    retry_state = await self._maybe_retry_incorrect_answer(
+                        agent_data=agent_data,
+                        generation_snapshot=generation_snapshot,
+                        assistant_message=assistant_message,
+                        rollout_kwargs=rollout_kwargs,
+                        ignore_termination=ignore_termination,
+                    )
                 if retry_state is not None:
                     return retry_state
 
@@ -905,6 +985,7 @@ class ToolAgentLoop(AgentLoopBase):
         # enabling them must recompute old-policy likelihoods rather than use rollout IS.
         agent_data.response_mask += [int(trainable)] * len(prefill_ids)
         agent_data.retry_sft_mask += [0] * len(prefill_ids)
+        agent_data.retry_critic_mask += [0] * len(prefill_ids)
         return prefill_ids
 
     @staticmethod
@@ -996,6 +1077,7 @@ class ToolAgentLoop(AgentLoopBase):
             "prompt_ids_len": len(agent_data.prompt_ids),
             "response_mask_len": len(agent_data.response_mask),
             "retry_sft_mask_len": len(agent_data.retry_sft_mask),
+            "retry_critic_mask_len": len(agent_data.retry_critic_mask),
             "response_logprobs_len": len(agent_data.response_logprobs),
             "assistant_turns": agent_data.assistant_turns,
             "extra_fields": dict(agent_data.extra_fields),
@@ -1007,6 +1089,7 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.response_ids = []
         agent_data.response_mask = agent_data.response_mask[: snapshot["response_mask_len"]]
         agent_data.retry_sft_mask = agent_data.retry_sft_mask[: snapshot["retry_sft_mask_len"]]
+        agent_data.retry_critic_mask = agent_data.retry_critic_mask[: snapshot["retry_critic_mask_len"]]
         agent_data.response_logprobs = agent_data.response_logprobs[: snapshot["response_logprobs_len"]]
         agent_data.assistant_turns = snapshot["assistant_turns"]
         agent_data.tool_calls = []
@@ -1025,6 +1108,9 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.extra_fields["conditional_answer_retry_last_grade"] = grade
         accuracy = self._grade_accuracy(grade)
         if accuracy > float(self.conditional_answer_retry_correct_accuracy_threshold):
+            appended = await self._append_retry_critic_supervision(agent_data, grade=grade, label="A")
+            if appended:
+                agent_data.extra_fields["__agent_loop_precritic_grade"] = grade
             return None
 
         retry_count = int(agent_data.extra_fields.get("conditional_answer_retry_count") or 0)
@@ -1035,9 +1121,13 @@ class ToolAgentLoop(AgentLoopBase):
         )
         if skipped_reason is not None:
             agent_data.extra_fields["conditional_answer_retry_skipped_reason"] = skipped_reason
+            appended = await self._append_retry_critic_supervision(agent_data, grade=grade, label="R")
+            if appended:
+                agent_data.extra_fields["__agent_loop_precritic_grade"] = grade
             self._log_incorrect_answer_retry_skipped(agent_data, grade, retry_count, skipped_reason)
             return None
 
+        await self._append_retry_critic_supervision(agent_data, grade=grade, label="R")
         self._maybe_append_wrong_answer_branch(
             agent_data=agent_data,
             generation_snapshot=generation_snapshot,
@@ -1067,6 +1157,213 @@ class ToolAgentLoop(AgentLoopBase):
         if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
             return AgentState.TERMINATED
         return AgentState.GENERATING
+
+    def _retry_critic_grade_is_supervisable(self, grade: Any) -> bool:
+        if not isinstance(grade, dict) or grade.get("error"):
+            return False
+        accuracy = grade.get("accuracy")
+        return isinstance(accuracy, int | float) and not isinstance(accuracy, bool) and math.isfinite(float(accuracy))
+
+    async def _retry_critic_prompt_prefix_ids(self) -> list[int]:
+        question_ids = await self.apply_chat_template(
+            [{"role": "user", "content": self.conditional_answer_retry_critic_question}],
+            remove_system_prompt=True,
+        )
+        prefill_ids = self.tokenizer.encode(
+            self.conditional_answer_retry_critic_assistant_prefill,
+            add_special_tokens=False,
+        )
+        return list(question_ids) + list(prefill_ids)
+
+    async def _append_retry_critic_supervision(
+        self,
+        agent_data: AgentData,
+        *,
+        grade: dict[str, Any],
+        label: str,
+    ) -> bool:
+        if not (
+            getattr(self, "conditional_answer_retry_critic_enabled", False)
+            and getattr(self, "conditional_answer_retry_critic_oracle_supervision_enabled", False)
+            and self._retry_critic_grade_is_supervisable(grade)
+        ):
+            return False
+        token_id = (
+            self._retry_critic_accept_token_id
+            if label == "A"
+            else self._retry_critic_retry_token_id
+            if label == "R"
+            else None
+        )
+        if token_id is None:
+            raise ValueError(f"unsupported retry critic label {label!r}")
+        prefix_ids = await self._retry_critic_prompt_prefix_ids()
+        closing_ids = self.tokenizer.encode("\n</answer><|im_end|>\n", add_special_tokens=False)
+        sidecar_ids = prefix_ids + [int(token_id)] + closing_ids
+        if len(agent_data.response_mask) + len(sidecar_ids) > self.response_length:
+            agent_data.extra_fields["retry_critic_supervision_skipped_reason"] = "response_length"
+            return False
+
+        agent_data.prompt_ids += sidecar_ids
+        agent_data.response_mask += [0] * len(sidecar_ids)
+        agent_data.retry_sft_mask += [0] * len(sidecar_ids)
+        agent_data.retry_critic_mask += [0] * len(prefix_ids) + [1] + [0] * len(closing_ids)
+        if agent_data.response_logprobs:
+            agent_data.response_logprobs += [0.0] * len(sidecar_ids)
+        agent_data.extra_fields["retry_critic_label"] = label
+        agent_data.extra_fields["retry_critic_token_count"] = 1
+        return True
+
+    async def _maybe_retry_answer_with_critic(
+        self,
+        *,
+        agent_data: AgentData,
+        generation_snapshot: dict[str, Any],
+        assistant_message: str,
+        ignore_termination: bool,
+    ) -> AgentState | None:
+        retry_count = int(agent_data.extra_fields.get("conditional_answer_retry_count") or 0)
+        candidate_turn = int(generation_snapshot["assistant_turns"]) + 1
+        try:
+            prefix_ids = await self._retry_critic_prompt_prefix_ids()
+            critic_output: TokenOutput = await self.server_manager.generate(
+                request_id=f"{agent_data.request_id}-retry-critic-{uuid4().hex}",
+                prompt_ids=agent_data.prompt_ids + prefix_ids,
+                sampling_params={
+                    "max_tokens": 1,
+                    "temperature": 0.0,
+                    "top_p": 1.0,
+                    "top_k": -1,
+                    "logprobs": True,
+                    "allowed_token_ids": [
+                        int(self._retry_critic_accept_token_id),
+                        int(self._retry_critic_retry_token_id),
+                    ],
+                },
+                image_data=agent_data.image_data,
+                video_data=agent_data.video_data,
+            )
+            if len(critic_output.token_ids) != 1 or not critic_output.log_probs:
+                raise ValueError("critic generation did not return exactly one token and its log probability")
+            selected_id = int(critic_output.token_ids[0])
+            selected_logprob = float(critic_output.log_probs[0])
+            if selected_id not in {self._retry_critic_accept_token_id, self._retry_critic_retry_token_id}:
+                raise ValueError(f"critic returned disallowed token id {selected_id}")
+            selected_probability = min(max(math.exp(selected_logprob), 0.0), 1.0)
+            if selected_id == self._retry_critic_retry_token_id:
+                p_retry = selected_probability
+                model_token = "R"
+            else:
+                p_retry = 1.0 - selected_probability
+                model_token = "A"
+            p_accept = 1.0 - p_retry
+            decision = "R" if p_retry > self.conditional_answer_retry_critic_decision_threshold else "A"
+        except Exception as exc:  # noqa: BLE001 - validation critic failures must retain the candidate.
+            self._record_retry_critic_validation_decision(
+                agent_data,
+                {
+                    "candidate_turn": candidate_turn,
+                    "model_token": None,
+                    "decision": None,
+                    "selected_logprob": None,
+                    "p_accept": None,
+                    "p_retry": None,
+                    "retry_feasible": None,
+                    "controller_action": "accept_fallback",
+                    "retry_depth": retry_count,
+                    "skip_or_error_reason": f"{type(exc).__name__}: {exc}",
+                },
+                failure=True,
+            )
+            return None
+
+        skipped_reason = None
+        if decision == "R":
+            skipped_reason = self._incorrect_answer_retry_skipped_reason(
+                agent_data=agent_data,
+                snapshot=generation_snapshot,
+                retry_count=retry_count,
+            )
+        retry_feasible = decision == "R" and skipped_reason is None
+        action = "retry" if retry_feasible else "forced_accept" if decision == "R" else "accept"
+        record = {
+            "candidate_turn": candidate_turn,
+            "model_token": model_token,
+            "decision": decision,
+            "selected_logprob": selected_logprob,
+            "p_accept": p_accept,
+            "p_retry": p_retry,
+            "retry_feasible": retry_feasible,
+            "controller_action": action,
+            "retry_depth": retry_count + int(retry_feasible),
+            "skip_or_error_reason": skipped_reason,
+        }
+        if not retry_feasible:
+            self._record_retry_critic_validation_decision(
+                agent_data,
+                record,
+                forced_accept=decision == "R",
+            )
+            return None
+
+        self._rollback_generation_state(agent_data, generation_snapshot)
+        retry_count += 1
+        suffix = self.conditional_answer_retry_suffix or ""
+        await self._append_conditional_retry_suffix_to_previous_message(agent_data, suffix)
+        if self.conditional_answer_retry_force_next_tool_call:
+            agent_data.force_next_tool_call = True
+        agent_data.extra_fields["conditional_answer_retry_count"] = retry_count
+        agent_data.extra_fields["conditional_answer_retry_skipped_reason"] = None
+        self._record_retry_critic_validation_decision(agent_data, record, retried=True)
+        if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
+            return AgentState.TERMINATED
+        return AgentState.GENERATING
+
+    def _record_retry_critic_validation_decision(
+        self,
+        agent_data: AgentData,
+        record: dict[str, Any],
+        *,
+        retried: bool = False,
+        forced_accept: bool = False,
+        failure: bool = False,
+    ) -> None:
+        records = list(agent_data.extra_fields.get("retry_critic_validation_decision_log") or [])
+        records.append(record)
+        agent_data.extra_fields["retry_critic_validation_decision_log"] = records
+        agent_data.extra_fields["retry_critic_validation_decisions"] = len(records)
+        agent_data.extra_fields["retry_critic_validation_accepts"] = sum(
+            item.get("controller_action") == "accept" for item in records
+        )
+        agent_data.extra_fields["retry_critic_validation_retries"] = sum(
+            item.get("controller_action") == "retry" for item in records
+        )
+        agent_data.extra_fields["retry_critic_validation_forced_accepts"] = sum(
+            item.get("controller_action") == "forced_accept" for item in records
+        )
+        agent_data.extra_fields["retry_critic_validation_failures"] = sum(
+            item.get("controller_action") == "accept_fallback" for item in records
+        )
+        probabilities = [item.get("p_retry") for item in records if isinstance(item.get("p_retry"), int | float)]
+        agent_data.extra_fields["retry_critic_validation_mean_retry_probability"] = (
+            sum(float(value) for value in probabilities) / len(probabilities) if probabilities else None
+        )
+        if self._debug_enabled_for_agent(agent_data):
+            event = {"event": "retry_critic_validation_decision", "request_id": agent_data.request_id, **record}
+            agent_data.debug_events.append(event)
+            self._debug_append_event(event)
+
+    @staticmethod
+    def _retry_critic_validation_summary(agent_data: AgentData) -> dict[str, Any]:
+        keys = (
+            "retry_critic_validation_decisions",
+            "retry_critic_validation_accepts",
+            "retry_critic_validation_retries",
+            "retry_critic_validation_forced_accepts",
+            "retry_critic_validation_failures",
+            "retry_critic_validation_mean_retry_probability",
+        )
+        return {key: agent_data.extra_fields[key] for key in keys if key in agent_data.extra_fields}
 
     def _maybe_append_wrong_answer_branch(
         self,
@@ -1113,6 +1410,7 @@ class ToolAgentLoop(AgentLoopBase):
             response_ids=response_ids[: self.response_length],
             response_mask=branch_response_mask[: self.response_length],
             retry_sft_mask=[0] * min(len(response_ids), self.response_length),
+            retry_critic_mask=agent_data.retry_critic_mask[: min(len(response_ids), self.response_length)],
             multi_modal_data=multi_modal_data,
             response_logprobs=branch_logprobs[: self.response_length] if branch_logprobs else None,
             reward_score=float(reward_extra_info.get("score", 0.0) or 0.0),
@@ -1132,6 +1430,8 @@ class ToolAgentLoop(AgentLoopBase):
                 "conditional_answer_retry_count": retry_count,
                 "conditional_answer_retry_last_grade": grade,
                 "conditional_answer_retry_skipped_reason": None,
+                "retry_critic_label": agent_data.extra_fields.get("retry_critic_label"),
+                "retry_critic_token_count": int(sum(agent_data.retry_critic_mask)),
                 "reward_extra_info": reward_extra_info,
                 "turn_scores": list(agent_data.turn_scores),
                 "tool_rewards": list(agent_data.tool_rewards),
@@ -1532,6 +1832,7 @@ class ToolAgentLoop(AgentLoopBase):
             agent_data.prompt_ids = prompt_ids
             agent_data.response_mask = []
             agent_data.retry_sft_mask = []
+            agent_data.retry_critic_mask = []
             agent_data.response_logprobs = []
             self._record_last_user_tool_prompt_block(
                 agent_data=agent_data,
@@ -1575,6 +1876,11 @@ class ToolAgentLoop(AgentLoopBase):
                 agent_data.retry_sft_mask[:mask_start]
                 + [0] * len(replacement_ids)
                 + agent_data.retry_sft_mask[mask_end:]
+            )
+            agent_data.retry_critic_mask = (
+                agent_data.retry_critic_mask[:mask_start]
+                + [0] * len(replacement_ids)
+                + agent_data.retry_critic_mask[mask_end:]
             )
         if agent_data.response_logprobs and logprobs_end > logprobs_start:
             agent_data.response_logprobs = (
@@ -1701,6 +2007,7 @@ class ToolAgentLoop(AgentLoopBase):
             agent_data.prompt_ids += response_ids
             agent_data.response_mask += [0] * len(response_ids)
             agent_data.retry_sft_mask += [0] * len(response_ids)
+            agent_data.retry_critic_mask += [0] * len(response_ids)
             if agent_data.response_logprobs:
                 agent_data.response_logprobs += [0.0] * len(response_ids)
             agent_data.user_turns += 1
@@ -1860,6 +2167,7 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.prompt_ids += response_ids
         agent_data.response_mask += [0] * len(response_ids)
         agent_data.retry_sft_mask += [0] * len(response_ids)
+        agent_data.retry_critic_mask += [0] * len(response_ids)
         if agent_data.response_logprobs:
             agent_data.response_logprobs += [0.0] * len(response_ids)
         agent_data.user_turns += 1
@@ -1905,6 +2213,7 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.prompt_ids += response_ids
         agent_data.response_mask += [0] * len(response_ids)
         agent_data.retry_sft_mask += [0] * len(response_ids)
+        agent_data.retry_critic_mask += [0] * len(response_ids)
         if agent_data.response_logprobs:
             agent_data.response_logprobs += [0.0] * len(response_ids)
 
@@ -2097,6 +2406,8 @@ class ToolAgentLoop(AgentLoopBase):
             "raw_prompt": kwargs["raw_prompt"],
             "messages": agent_data.messages,
             "final_response": final_response,
+            "retry_critic_tokens": int(sum(output.retry_critic_mask or [])),
+            "retry_critic_label": output.extra_fields.get("retry_critic_label"),
             "num_turns": output.num_turns,
             "turn_scores": agent_data.turn_scores,
             "tool_rewards": agent_data.tool_rewards,
@@ -2104,6 +2415,8 @@ class ToolAgentLoop(AgentLoopBase):
                 {
                     "response_tokens": len(branch.response_ids),
                     "masked_tokens": int(sum(branch.response_mask)),
+                    "retry_critic_tokens": int(sum(branch.retry_critic_mask or [])),
+                    "retry_critic_label": branch.extra_fields.get("retry_critic_label"),
                     "is_conditional_answer_retry_branch": branch.extra_fields.get(
                         "is_conditional_answer_retry_branch"
                     ),
@@ -2115,6 +2428,9 @@ class ToolAgentLoop(AgentLoopBase):
                 for branch in (output.branch_outputs or [])
             ],
             "debug_events": agent_data.debug_events,
+            "retry_critic_validation_decision_log": agent_data.extra_fields.get(
+                "retry_critic_validation_decision_log", []
+            ),
             "metrics": output.metrics.model_dump(),
         }
         output.extra_fields["comprehensive_debug"] = to_jsonable(

@@ -8,6 +8,7 @@
 #SBATCH --mem=968G
 #SBATCH --time=24:00:00
 #SBATCH --array=1-5%1
+#SBATCH --dependency=afterany:11981184_5
 #SBATCH --output=slurm/output/%x_%j.log
 #SBATCH --error=slurm/error/%x_%j.log
 

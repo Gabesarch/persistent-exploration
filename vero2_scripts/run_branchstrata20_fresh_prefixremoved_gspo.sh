@@ -8,6 +8,7 @@
 #SBATCH --mem=968G
 #SBATCH --time=24:00:00
 #SBATCH --array=1-5%1
+#SBATCH --dependency=afterany:11974347_5
 #SBATCH --output=slurm/output/%x_%j.log
 #SBATCH --error=slurm/error/%x_%j.log
 
@@ -50,4 +51,3 @@ CONFIG_NAME="branchstrata20_fresh_prefixremoved_gspo"
 python3 -m verl.trainer.main_ppo \
   --config-path="$VERL_ROOT/vero2_scripts/config" \
   --config-name="$CONFIG_NAME"
-

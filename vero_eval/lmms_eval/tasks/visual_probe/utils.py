@@ -17,6 +17,7 @@ _STRICT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "judge_promp
 _PREFIXES = ("VisualProbe_Easy/", "VisualProbe_Medium/", "VisualProbe_Hard/", "VisualProbe_train/")
 _GENERATION_FAILURE_MARKERS = (
     "[LMMS_EVAL_FORCED_FINAL_ANSWER_FAILED:",
+    "[LMMS_EVAL_BUDGET_FORCING_FAILED:",
     "[LMMS_EVAL_REQUEST_FAILED",
 )
 _REPO_HINTS = {

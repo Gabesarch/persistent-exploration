@@ -29,13 +29,14 @@ class TokenCounts:
 class GenerationResult:
     """Typed wrapper returned by ``generate_until`` implementations.
 
-    Models that wish to report per-sample token counts should return a
-    list of ``GenerationResult`` instead of plain strings.  The evaluator
-    transparently handles both ``str`` and ``GenerationResult`` outputs.
+    Models that wish to report per-sample token counts or structured diagnostics
+    should return a list of ``GenerationResult`` instead of plain strings. The
+    evaluator transparently handles both ``str`` and ``GenerationResult`` outputs.
     """
 
     text: str
     token_counts: Optional[TokenCounts] = None
+    metadata: Optional[Dict[str, Any]] = None
 
 
 GenerationOutput = Union[str, GenerationResult]
@@ -77,6 +78,7 @@ class Instance:
     raw_filtered_resps: dict = field(default_factory=dict)
 
     token_counts: List[Optional[TokenCounts]] = field(default_factory=list)
+    response_metadata: List[Optional[Dict[str, Any]]] = field(default_factory=list)
 
     # initialized after init
     task_name: str = None

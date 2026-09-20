@@ -225,6 +225,8 @@ class AgentLoopOutput(BaseModel):
     """Response mask, 1 for LLM generated token, 0 for tool response token."""
     retry_sft_mask: Optional[list[int]] = None
     """Response-aligned mask for teacher-only retry SFT targets."""
+    retry_critic_mask: Optional[list[int]] = None
+    """Response-aligned mask whose sole nonzero entry is the A/R critic target."""
     response_logprobs: Optional[list[float]] = None
     """Log probabilities for the response tokens."""
     routed_experts: Optional[Any] = None
@@ -252,6 +254,9 @@ class AgentLoopOutput(BaseModel):
         retry_sft_mask = output.pop("retry_sft_mask", None)
         if retry_sft_mask is not None:
             output["retry_sft_mask"] = torch.tensor(retry_sft_mask, dtype=torch.int64)
+        retry_critic_mask = output.pop("retry_critic_mask", None)
+        if retry_critic_mask is not None:
+            output["retry_critic_mask"] = torch.tensor(retry_critic_mask, dtype=torch.int64)
         output.pop("branch_outputs", None)
 
         response_logprobs = output.pop("response_logprobs", None)
@@ -289,6 +294,8 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded response mask."""
     retry_sft_mask: Optional[torch.Tensor] = None
     """Padded teacher-only retry SFT mask."""
+    retry_critic_mask: Optional[torch.Tensor] = None
+    """Padded A/R retry-critic target mask."""
     attention_mask: torch.Tensor
     """Padded attention mask."""
     response_logprobs: Optional[torch.Tensor] = None
@@ -704,7 +711,9 @@ class AgentLoopWorker:
             internal_outputs = [await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)]
             for branch_output in output.branch_outputs or []:
                 branch_output.extra_fields["__agent_loop_input_row"] = source_row
-                internal_outputs.append(await self._agent_loop_postprocess(branch_output, trajectory["validate"], **kwargs))
+                internal_outputs.append(
+                    await self._agent_loop_postprocess(branch_output, trajectory["validate"], **kwargs)
+                )
             return internal_outputs
 
     async def _agent_loop_postprocess(self, output, validate, **kwargs) -> _InternalAgentLoopOutput:
@@ -826,6 +835,19 @@ class AgentLoopWorker:
         if retry_sft_mask_output["input_ids"].dim() == 1:
             retry_sft_mask_output["input_ids"] = retry_sft_mask_output["input_ids"].unsqueeze(0)
         retry_sft_mask = retry_sft_mask_output["input_ids"] * response_output["attention_mask"]
+        retry_critic_mask_values = output.retry_critic_mask or [0] * len(output.response_ids)
+        if len(retry_critic_mask_values) != len(output.response_ids):
+            raise ValueError("retry_critic_mask must be aligned with response_ids")
+        retry_critic_mask_output = self.tokenizer.pad(
+            {"input_ids": retry_critic_mask_values},
+            padding="max_length",
+            max_length=self.rollout_config.response_length,
+            return_tensors="pt",
+            return_attention_mask=False,
+        )
+        if retry_critic_mask_output["input_ids"].dim() == 1:
+            retry_critic_mask_output["input_ids"] = retry_critic_mask_output["input_ids"].unsqueeze(0)
+        retry_critic_mask = retry_critic_mask_output["input_ids"] * response_output["attention_mask"]
         await self._compute_teacher_logprobs(
             output,
             prompt_ids=output.prompt_ids,
@@ -857,6 +879,7 @@ class AgentLoopWorker:
             position_ids=position_ids,
             response_mask=response_mask,
             retry_sft_mask=retry_sft_mask,
+            retry_critic_mask=retry_critic_mask,
             attention_mask=attention_mask,
             response_logprobs=response_logprobs,
             routed_experts=routed_experts,
@@ -1024,7 +1047,18 @@ class AgentLoopWorker:
                 selected_reward_loop_worker_handle = random.choice(self.reward_loop_worker_handles)
                 result = await selected_reward_loop_worker_handle.compute_score.remote(data)
                 output.reward_score = result["reward_score"]
-                output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
+                reward_extra_info = dict(result["reward_extra_info"] or {})
+                for key in (
+                    "retry_critic_validation_decisions",
+                    "retry_critic_validation_accepts",
+                    "retry_critic_validation_retries",
+                    "retry_critic_validation_forced_accepts",
+                    "retry_critic_validation_failures",
+                    "retry_critic_validation_mean_retry_probability",
+                ):
+                    if key in output.extra_fields:
+                        reward_extra_info[key] = output.extra_fields[key]
+                output.extra_fields["reward_extra_info"] = reward_extra_info
             output.metrics.compute_score = timing["compute_score"]
 
     async def _compute_teacher_logprobs(self, output: AgentLoopOutput, prompt_ids, response_ids, validate):
@@ -1057,6 +1091,15 @@ class AgentLoopWorker:
             ],
             dim=0,
         )
+        retry_critic_mask = torch.cat(
+            [
+                input.retry_critic_mask
+                if input.retry_critic_mask is not None
+                else torch.zeros_like(input.response_mask)
+                for input in inputs
+            ],
+            dim=0,
+        )
         attention_mask = torch.cat([input.attention_mask for input in inputs], dim=0)
         input_ids = torch.cat([input.input_ids for input in inputs], dim=0)
         position_ids = torch.cat([input.position_ids for input in inputs], dim=0)
@@ -1074,6 +1117,7 @@ class AgentLoopWorker:
                 "responses": response_ids,  # [bsz, response_length]
                 "response_mask": response_mask,  # [bsz, response_length]
                 "retry_sft_mask": retry_sft_mask,  # [bsz, response_length]
+                "retry_critic_mask": retry_critic_mask,  # [bsz, response_length]
                 "input_ids": input_ids,  # [bsz, prompt_length + response_length]
                 "attention_mask": attention_mask,  # [bsz, prompt_length + response_length]
                 # position_ids: [bsz, 3, prompt_length + response_length] or [bsz, prompt_length + response_length]
@@ -1152,6 +1196,16 @@ class AgentLoopWorker:
             "retry_sft_selected_count",
             "retry_sft_rejection_counts",
             "retry_sft_token_count",
+            "retry_critic_label",
+            "retry_critic_token_count",
+            "retry_critic_supervision_skipped_reason",
+            "retry_critic_validation_decision_log",
+            "retry_critic_validation_decisions",
+            "retry_critic_validation_accepts",
+            "retry_critic_validation_retries",
+            "retry_critic_validation_forced_accepts",
+            "retry_critic_validation_failures",
+            "retry_critic_validation_mean_retry_probability",
             "turn_scores",
             "tool_rewards",
             "min_global_steps",

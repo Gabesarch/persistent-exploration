@@ -292,6 +292,17 @@ multi_turn:
   conditional_answer_retry_branch_use_graded_rewards: False
   conditional_answer_retry_branch_baseline_weight_key: "gdpo_baseline_weight"
 
+  # Same-model A/R retry critic. Oracle supervision applies only to training;
+  # critic-controlled validation never consults the ground-truth verifier.
+  conditional_answer_retry_critic_enabled: False
+  conditional_answer_retry_critic_oracle_supervision_enabled: True
+  conditional_answer_retry_critic_enable_validation: False
+  conditional_answer_retry_critic_question: 'Assuming another tool round is available, should the preceding candidate be accepted or retried? In the <answer> block, output only "A" or "R".'
+  conditional_answer_retry_critic_assistant_prefill: "I need to classify whether the preceding candidate should be accepted or retried.\n</think>\n<answer>\n"
+  conditional_answer_retry_critic_accept_token: A
+  conditional_answer_retry_critic_retry_token: R
+  conditional_answer_retry_critic_decision_threshold: 0.5
+
 # support logging rollout prob for debugging purpose
 # "Truncated importance sampling" requires rollout log probs, set to True when turning on Truncated importance sampling
 calculate_log_probs: False

@@ -35,6 +35,6 @@ generation_kwargs:
 lmms_eval_specific_kwargs:
   default:
     pre_prompt: "Provide the point for the command:"
-    post_prompt: ' Output the point in a JSON array format using 0-1000 image coordinates: [{"point_2d": [x, y]}].'
+    post_prompt: "Use coordinates relative to the original full image: x and y must each be normalized to the 0-1000 range. In the <answer> block, output only this JSON array: [{\"point_2d\": [x, y]}].\n\n\n\n"
 metadata:
   image_indexing: training_faithful

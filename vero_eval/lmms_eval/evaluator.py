@@ -26,7 +26,7 @@ import lmms_eval.api
 import lmms_eval.api.metrics
 import lmms_eval.api.registry
 from lmms_eval import models
-from lmms_eval.api.instance import Instance, unwrap_generation_output
+from lmms_eval.api.instance import GenerationResult, Instance, unwrap_generation_output
 from lmms_eval.api.model import lmms
 from lmms_eval.api.reasoning import parse_reasoning_tags_config, strip_reasoning_tags
 from lmms_eval.api.task import Task
@@ -1027,6 +1027,7 @@ def evaluate(
             text, tc = unwrap_generation_output(x)
             req.resps.append(text)
             req.token_counts.append(tc)
+            req.response_metadata.append(x.metadata if isinstance(x, GenerationResult) else None)
 
         if is_budget_exceeded():
             eval_logger.warning("Token budget reached after '{}' requests. Skipping remaining request types.", reqtype)
@@ -1196,6 +1197,11 @@ def evaluate(
                             )
                         ),
                     }
+                    per_sample_metadata = [
+                        req.response_metadata[0] if req.response_metadata else None for req in requests
+                    ]
+                    if any(metadata is not None for metadata in per_sample_metadata):
+                        example["response_metadata"] = per_sample_metadata
                     if input_media:
                         example["input_media"] = input_media
                     example.update(metrics)

@@ -158,6 +158,23 @@ class MultiTurnConfig(BaseConfig):
     conditional_answer_retry_branch_reward_components: dict[str, float] = field(default_factory=dict)
     conditional_answer_retry_branch_use_graded_rewards: bool = False
     conditional_answer_retry_branch_baseline_weight_key: str = "gdpo_baseline_weight"
+    # Same-model A/R critic. Training labels are supplied by the existing
+    # verifier, while validation may use this critic to control retries.
+    conditional_answer_retry_critic_enabled: bool = False
+    conditional_answer_retry_critic_oracle_supervision_enabled: bool = True
+    conditional_answer_retry_critic_enable_validation: bool = False
+    conditional_answer_retry_critic_question: str = (
+        'Assuming another tool round is available, should the preceding candidate be accepted or retried? '
+        'In the <answer> block, output only "A" or "R".'
+    )
+    conditional_answer_retry_critic_assistant_prefill: str = (
+        "I need to classify whether the preceding candidate should be accepted or retried.\n"
+        "</think>\n"
+        "<answer>\n"
+    )
+    conditional_answer_retry_critic_accept_token: str = "A"
+    conditional_answer_retry_critic_retry_token: str = "R"
+    conditional_answer_retry_critic_decision_threshold: float = 0.5
     llm_judge_enabled: bool = False
     llm_judge_prompt_path: Optional[str] = None
     llm_judge_reward_types: list[str] = field(default_factory=lambda: ["search"])
