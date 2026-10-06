@@ -45,6 +45,7 @@ from verl.trainer.distillation.losses import is_distillation_enabled
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
+    compute_branch_advantage_mass_metrics,
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
@@ -358,6 +359,8 @@ class RayPPOTrainer:
 
     def _validate_branch_strata_config(self) -> None:
         strata = self._branch_strata_config()
+        if strata and strata.get("log_advantage_mass", False) and not strata.get("enabled", False):
+            raise ValueError("policy_loss.branch_strata.log_advantage_mass requires branch strata to be enabled.")
         if not strata or not bool(strata.get("enabled", False)):
             return
         if self.use_legacy_worker_impl == "disable":
@@ -490,6 +493,9 @@ class RayPPOTrainer:
                 self.config.actor_rollout_ref.actor.get("policy_loss", {})
                 .get("retry_sft", {})
                 .get("enabled", False)
+            ) or bool(
+                self.config.actor_rollout_ref.get("rollout", {}).get("multi_turn", {})
+                .get("conditional_answer_retry_mask_canonical_prefix", False)
             ),
         )
         batch.batch["branch_policy_loss_weight"] = weights
@@ -2329,6 +2335,8 @@ class RayPPOTrainer:
                                 norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                                 config=self.config.algorithm,
                             )
+                            if self._branch_strata_config().get("log_advantage_mass", False):
+                                metrics.update(compute_branch_advantage_mass_metrics(batch))
 
                     # update critic
                     if self.use_critic:

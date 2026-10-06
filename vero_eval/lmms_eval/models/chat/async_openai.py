@@ -907,6 +907,18 @@ class AsyncOpenAIChat(lmms):
             return self.training_alignment.system_prompt
         if task in self._task_system_prompt_cache:
             return self._task_system_prompt_cache[task]
+        # A run-specific protocol (e.g. Qwen3 XML) must replace task fragments,
+        # since concatenating it with the default JSON rules gives conflicting calls.
+        if os.getenv("RUN_SYSTEM_PROMPT_MODE", "task_metadata").lower() == "run_env":
+            path = os.getenv("TRAINING_SYSTEM_PROMPT") or os.getenv("SYSTEM_PROMPT")
+            if not path:
+                raise ValueError("RUN_SYSTEM_PROMPT_MODE=run_env requires a system prompt file")
+            if not os.path.isfile(path):
+                path = os.path.join(_VERO_EVAL_ROOT, path)
+            with open(path, "r", encoding="utf-8", newline="") as stream:
+                resolved = stream.read()
+            self._task_system_prompt_cache[task] = resolved
+            return resolved
         fragments: List[str] = []
         if self.system_prompt:
             fragments.append(self.system_prompt.strip())

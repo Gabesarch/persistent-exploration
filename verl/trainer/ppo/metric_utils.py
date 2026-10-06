@@ -30,6 +30,44 @@ from verl.utils.import_utils import deprecated
 logger = logging.getLogger(__name__)
 
 
+@torch.no_grad()
+def compute_branch_advantage_mass_metrics(batch: DataProto) -> dict[str, float]:
+    """Measure signed advantage mass entering branch-stratified GSPO.
+
+    For each row, average max(A, 0) or max(-A, 0) over response_mask,
+    multiply by branch_policy_loss_weight, then sum and divide by the full
+    expanded batch size (including zero-weight padding), just like the loss.
+    Include rollout IS weights when present. Compute once on the driver after
+    rollout correction and advantage computation, avoiding microbatch averages.
+
+    These are nonnegative, pre-clipping advantage contributions, not gradient
+    norms. They exclude the common policy/auxiliary-loss mixture coefficient.
+    With policy ratio one, negative - positive equals the GSPO policy loss.
+    """
+    advantages = batch.batch["advantages"].detach().float()
+    mask = batch.batch["response_mask"].to(device=advantages.device, dtype=torch.bool)
+    row_weights = batch.batch["branch_policy_loss_weight"].to(advantages)
+    is_branch = batch.batch["branch_policy_loss_is_branch"].to(device=advantages.device, dtype=torch.bool)
+    masked_advantages = torch.where(mask, advantages, 0.0)
+    if "rollout_is_weights" in batch.batch:
+        masked_advantages = torch.where(mask, masked_advantages * batch.batch["rollout_is_weights"], 0.0)
+    lengths = mask.sum(dim=-1).clamp_min(1)
+    positive = masked_advantages.clamp_min(0).sum(dim=-1) / lengths * row_weights
+    negative = (-masked_advantages).clamp_min(0).sum(dim=-1) / lengths * row_weights
+    denominator = max(int(advantages.shape[0]), 1)
+    prefix = "actor/advantage_mass"
+    metrics = {
+        f"{prefix}/positive": float(positive.sum().item() / denominator),
+        f"{prefix}/negative": float(negative.sum().item() / denominator),
+    }
+    for name, rows in (("canonical", ~is_branch), ("branch", is_branch)):
+        metrics[f"{prefix}/{name}_positive"] = float(positive[rows].sum().item() / denominator)
+        metrics[f"{prefix}/{name}_negative"] = float(negative[rows].sum().item() / denominator)
+    total = metrics[f"{prefix}/positive"] + metrics[f"{prefix}/negative"]
+    metrics[f"{prefix}/positive_fraction"] = metrics[f"{prefix}/positive"] / total if total else 0.0
+    return metrics
+
+
 @deprecated("verl.utils.metric.reduce_metrics")
 def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
     """

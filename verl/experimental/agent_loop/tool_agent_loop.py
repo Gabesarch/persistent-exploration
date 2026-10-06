@@ -19,6 +19,7 @@ import math
 import os
 import random
 import re
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
 from uuid import uuid4
@@ -97,6 +98,25 @@ class AgentState(Enum):
     INTERACTING = "interacting"
 
 
+@dataclass
+class CandidateAnswerSchedule:
+    """Attempt history and deadlines survive removal of failed candidate text."""
+
+    sampling_key: str
+    first_deadline: int
+    followup_deadline: int | None = None
+    history: list[dict[str, Any]] = field(default_factory=list)
+    generated_policy_turns: int = 0
+    generated_policy_tokens: int = 0
+    forcing_reason: str | None = None
+
+    @property
+    def next_deadline(self) -> int | None:
+        if not self.history:
+            return self.first_deadline
+        return self.followup_deadline if len(self.history) == 1 else None
+
+
 class AgentData:
     """Encapsulates all state variables for the agent loop. AgentData is passed to tool calling in case that
     tool may need to access full history state. User can store any tool session data in `extra_fields`."""
@@ -139,6 +159,7 @@ class AgentData:
         self.user_turns = 0
         self.assistant_turns = 0
         self.effective_max_assistant_turns: int | None = None
+        self.candidate_answer_schedule: CandidateAnswerSchedule | None = None
 
         # Temporary state for tool calls
         self.tool_calls: list[FunctionCall] = []
@@ -226,6 +247,18 @@ class ToolAgentLoop(AgentLoopBase):
         self.conditional_answer_retry_force_next_tool_call = getattr(
             multi_turn_config, "conditional_answer_retry_force_next_tool_call", True
         )
+        self.conditional_answer_retry_mask_canonical_prefix = bool(
+            getattr(multi_turn_config, "conditional_answer_retry_mask_canonical_prefix", False)
+        )
+        self.candidate_answer_schedule_enabled = bool(
+            getattr(multi_turn_config, "candidate_answer_schedule_enabled", False)
+        )
+        self.candidate_answer_first_turns = getattr(multi_turn_config, "candidate_answer_first_turns", [4, 5, 6, 7])
+        self.candidate_answer_followup_min_turn_gap = getattr(
+            multi_turn_config, "candidate_answer_followup_min_turn_gap", 2
+        )
+        self.candidate_answer_schedule_seed = getattr(multi_turn_config, "candidate_answer_schedule_seed", 42)
+        self._validate_candidate_answer_schedule_config()
         self.conditional_answer_retry_suffix = getattr(
             multi_turn_config,
             "conditional_answer_retry_suffix",
@@ -472,6 +505,7 @@ class ToolAgentLoop(AgentLoopBase):
             interaction_kwargs=interaction_kwargs,
         )
         agent_data.effective_max_assistant_turns = self._sample_effective_max_assistant_turns(debug_trajectory)
+        self._initialize_candidate_answer_schedule(agent_data, debug_trajectory)
         if self.randomized_max_assistant_turns_enabled:
             agent_data.extra_fields.update(self._randomized_turn_cap_metadata(agent_data))
         debug_enabled = self._debug_enabled_for_trajectory(debug_trajectory)
@@ -529,6 +563,8 @@ class ToolAgentLoop(AgentLoopBase):
                 "turn_scores": agent_data.turn_scores,
                 "tool_rewards": agent_data.tool_rewards,
                 **self._randomized_turn_cap_metadata(agent_data),
+                **self._candidate_answer_schedule_metadata(agent_data),
+                **self._canonical_prefix_mask_metadata(agent_data),
                 CROP_IMAGE_REFS_KEY: agent_data.crop_image_refs,
                 "__agent_loop_retry_sft_candidates": list(agent_data.retry_sft_candidates),
                 "retry_sft_candidate_count": len(agent_data.retry_sft_candidates),
@@ -569,6 +605,113 @@ class ToolAgentLoop(AgentLoopBase):
             block_videos=agent_data.video_data,
         )
         return AgentState.GENERATING
+
+    def _validate_candidate_answer_schedule_config(self) -> None:
+        if not self.candidate_answer_schedule_enabled:
+            return
+        cap = self.max_assistant_turns
+        if type(cap) is not int or cap < 3:
+            raise ValueError("candidate answer scheduling requires max_assistant_turns >= 3")
+        try:
+            turns = list(self.candidate_answer_first_turns)
+        except TypeError as exc:
+            raise ValueError("candidate_answer_first_turns must be a nonempty sequence of integers") from exc
+        if (
+            not turns
+            or any(type(turn) is not int or not 1 <= turn < cap for turn in turns)
+            or len(set(turns)) != len(turns)
+        ):
+            raise ValueError("candidate_answer_first_turns must contain unique integers in [1, max_assistant_turns)")
+        self.candidate_answer_first_turns = turns
+        gap = self.candidate_answer_followup_min_turn_gap
+        if type(gap) is not int or not 2 <= gap < cap:
+            raise ValueError("candidate_answer_followup_min_turn_gap must be an integer in [2, max_assistant_turns)")
+        if type(self.candidate_answer_schedule_seed) is not int:
+            raise ValueError("candidate_answer_schedule_seed must be an integer")
+        if self.randomized_max_assistant_turns_enabled or self.force_tool_calls_until_final_turn:
+            raise ValueError(
+                "candidate answer scheduling conflicts with randomized total caps or forced tool exploration"
+            )
+        if not (
+            self.conditional_answer_retry_enabled
+            and self.conditional_answer_retry_force_next_tool_call
+            and self.force_answer_on_final_turn
+        ):
+            raise ValueError(
+                "candidate answer scheduling requires answer retries, a forced retry tool call, and final forcing"
+            )
+
+    def _initialize_candidate_answer_schedule(self, agent_data: AgentData, trajectory: dict[str, Any]) -> None:
+        if not getattr(self, "candidate_answer_schedule_enabled", False) or trajectory.get("validate"):
+            return
+        sampling_key = json.dumps(
+            [
+                self.candidate_answer_schedule_seed,
+                trajectory.get("step"),
+                trajectory.get("sample_index"),
+                trajectory.get("rollout_n"),
+            ],
+            separators=(",", ":"),
+            default=str,
+        )
+        agent_data.candidate_answer_schedule = CandidateAnswerSchedule(
+            sampling_key=sampling_key,
+            first_deadline=random.Random(sampling_key + ":first").choice(self.candidate_answer_first_turns),
+        )
+
+    @staticmethod
+    def _candidate_answer_due(agent_data: AgentData) -> bool:
+        schedule = getattr(agent_data, "candidate_answer_schedule", None)
+        return (
+            schedule is not None
+            and schedule.next_deadline is not None
+            and agent_data.assistant_turns + 1 >= schedule.next_deadline
+        )
+
+    @staticmethod
+    def _candidate_answer_schedule_metadata(agent_data: AgentData) -> dict[str, Any]:
+        schedule = getattr(agent_data, "candidate_answer_schedule", None)
+        if schedule is None:
+            return {}
+        return {
+            "candidate_answer_schedule": {
+                "first_deadline": schedule.first_deadline,
+                "followup_deadline": schedule.followup_deadline,
+                "next_deadline": schedule.next_deadline,
+                "candidate_count": len(schedule.history),
+                "generated_policy_turns": schedule.generated_policy_turns,
+                "generated_policy_tokens": schedule.generated_policy_tokens,
+                "history": [dict(record) for record in schedule.history],
+            }
+        }
+
+    def _record_candidate_answer(
+        self, agent_data: AgentData, grade: dict[str, Any], *, action: str, reason: str
+    ) -> None:
+        schedule = getattr(agent_data, "candidate_answer_schedule", None)
+        if schedule is None:
+            return
+        ordinal = len(schedule.history) + 1
+        schedule.history.append(
+            {
+                "candidate_ordinal": ordinal,
+                "retained_turn": agent_data.assistant_turns,
+                "generated_policy_turn": schedule.generated_policy_turns,
+                "generated_policy_tokens": schedule.generated_policy_tokens,
+                "sampled_deadline": schedule.next_deadline,
+                "forced": schedule.forcing_reason is not None,
+                "forcing_reason": schedule.forcing_reason,
+                "accuracy": self._grade_accuracy(grade),
+                "grade_error": grade.get("error") if isinstance(grade, dict) else None,
+                "action": action,
+                "reason": reason,
+            }
+        )
+        if ordinal == 1 and action == "retry":
+            earliest = agent_data.assistant_turns + self.candidate_answer_followup_min_turn_gap
+            cap = self._effective_max_assistant_turns(agent_data)
+            if earliest < cap:
+                schedule.followup_deadline = random.Random(schedule.sampling_key + ":followup").randrange(earliest, cap)
 
     def _validate_randomized_max_assistant_turns_config(self) -> None:
         if not self.randomized_max_assistant_turns_enabled:
@@ -754,11 +897,19 @@ class ToolAgentLoop(AgentLoopBase):
         assistant_prefill_ids: list[int] = []
         teacher_only_prefill_ids: list[int] = []
         generation_snapshot = self._snapshot_generation_state(agent_data)
+        candidate_deadline_forced = False
+        schedule = getattr(agent_data, "candidate_answer_schedule", None)
+        if schedule is not None:
+            schedule.forcing_reason = None
 
         if self.force_tool_calls_until_final_turn:
             forced_required_tag = "<answer>" if self._must_answer_now(agent_data) else "<tool_call>"
             sampling_params = self._with_forced_action_extra_args(sampling_params, forced_required_tag)
         elif self._force_answer_on_final_turn_active(rollout_kwargs) and self._must_answer_now(agent_data):
+            forced_required_tag = "<answer>"
+            sampling_params = self._with_forced_action_extra_args(sampling_params, forced_required_tag)
+        elif self._candidate_answer_due(agent_data):
+            candidate_deadline_forced = True
             forced_required_tag = "<answer>"
             sampling_params = self._with_forced_action_extra_args(sampling_params, forced_required_tag)
         elif agent_data.force_next_tool_call:
@@ -775,7 +926,10 @@ class ToolAgentLoop(AgentLoopBase):
                 assistant_prefill_ids = self._append_conditional_retry_assistant_prefill(agent_data)
             agent_data.force_next_tool_call = False
         if forced_required_tag == "<answer>":
-            assistant_prefill_ids = self._append_force_final_answer_think_prefill(agent_data)
+            if schedule is not None:
+                schedule.forcing_reason = "candidate_deadline" if candidate_deadline_forced else "budget"
+            if not candidate_deadline_forced:
+                assistant_prefill_ids = self._append_force_final_answer_think_prefill(agent_data)
         sampling_params = self._with_assistant_turn_token_cap(sampling_params, agent_data)
 
         with simple_timer("generate_sequences", agent_data.metrics):
@@ -814,6 +968,9 @@ class ToolAgentLoop(AgentLoopBase):
                 agent_data.extra_fields["max_global_steps"] = max_global_steps
 
         agent_data.assistant_turns += 1
+        if schedule is not None:
+            schedule.generated_policy_turns += 1
+            schedule.generated_policy_tokens += len(output.token_ids)
         agent_data.response_ids = output.token_ids
         response_start = len(agent_data.response_mask)
         agent_data.prompt_ids += agent_data.response_ids
@@ -1108,6 +1265,7 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.extra_fields["conditional_answer_retry_last_grade"] = grade
         accuracy = self._grade_accuracy(grade)
         if accuracy > float(self.conditional_answer_retry_correct_accuracy_threshold):
+            self._record_candidate_answer(agent_data, grade, action="accept", reason="positive_accuracy")
             appended = await self._append_retry_critic_supervision(agent_data, grade=grade, label="A")
             if appended:
                 agent_data.extra_fields["__agent_loop_precritic_grade"] = grade
@@ -1120,6 +1278,7 @@ class ToolAgentLoop(AgentLoopBase):
             retry_count=retry_count,
         )
         if skipped_reason is not None:
+            self._record_candidate_answer(agent_data, grade, action="terminate", reason=skipped_reason)
             agent_data.extra_fields["conditional_answer_retry_skipped_reason"] = skipped_reason
             appended = await self._append_retry_critic_supervision(agent_data, grade=grade, label="R")
             if appended:
@@ -1127,6 +1286,7 @@ class ToolAgentLoop(AgentLoopBase):
             self._log_incorrect_answer_retry_skipped(agent_data, grade, retry_count, skipped_reason)
             return None
 
+        self._record_candidate_answer(agent_data, grade, action="retry", reason="incorrect_answer")
         await self._append_retry_critic_supervision(agent_data, grade=grade, label="R")
         self._maybe_append_wrong_answer_branch(
             agent_data=agent_data,
@@ -1140,6 +1300,7 @@ class ToolAgentLoop(AgentLoopBase):
         retry_count += 1
         suffix = self.conditional_answer_retry_suffix or ""
         await self._append_conditional_retry_suffix_to_previous_message(agent_data, suffix)
+        self._mask_canonical_retry_prefix(agent_data, rollout_kwargs)
         if self.conditional_answer_retry_force_next_tool_call:
             agent_data.force_next_tool_call = True
         agent_data.extra_fields["conditional_answer_retry_count"] = retry_count
@@ -1157,6 +1318,38 @@ class ToolAgentLoop(AgentLoopBase):
         if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
             return AgentState.TERMINATED
         return AgentState.GENERATING
+
+    def _mask_canonical_retry_prefix(self, agent_data: AgentData, rollout_kwargs: dict[str, Any]) -> None:
+        """Mask after rollback and prompt rewriting, so only the new continuation trains.
+
+        Each actual retry advances the pivot. Branch outputs already have their
+        own divergence-only masks. Attention context and auxiliary loss masks
+        are unchanged. A failed answer that cannot retry does not advance it.
+        """
+        if not getattr(self, "conditional_answer_retry_mask_canonical_prefix", False):
+            return
+        if (rollout_kwargs.get("_debug_trajectory") or {}).get("validate", False):
+            return
+        previous_masked = int(agent_data.extra_fields.get("canonical_prefix_masked_policy_tokens", 0))
+        agent_data.extra_fields["canonical_prefix_masked_policy_tokens"] = previous_masked + sum(
+            agent_data.response_mask
+        )
+        agent_data.extra_fields["canonical_prefix_mask_tokens"] = len(agent_data.response_mask)
+        agent_data.response_mask = [0] * len(agent_data.response_mask)
+
+    def _canonical_prefix_mask_metadata(self, agent_data: AgentData) -> dict[str, Any]:
+        if "canonical_prefix_mask_tokens" not in agent_data.extra_fields:
+            return {}
+        pivot = int(agent_data.extra_fields["canonical_prefix_mask_tokens"])
+        mask = agent_data.response_mask[: self.response_length]
+        return {
+            "canonical_prefix_mask": {
+                "prefix_tokens": pivot,
+                "masked_policy_tokens": int(agent_data.extra_fields["canonical_prefix_masked_policy_tokens"]),
+                "active_prefix_policy_tokens": int(sum(mask[:pivot])),
+                "active_suffix_policy_tokens": int(sum(mask[pivot:])),
+            }
+        }
 
     def _retry_critic_grade_is_supervisable(self, grade: Any) -> bool:
         if not isinstance(grade, dict) or grade.get("error"):
@@ -1436,6 +1629,7 @@ class ToolAgentLoop(AgentLoopBase):
                 "turn_scores": list(agent_data.turn_scores),
                 "tool_rewards": list(agent_data.tool_rewards),
                 **self._randomized_turn_cap_metadata(agent_data),
+                **self._candidate_answer_schedule_metadata(agent_data),
                 CROP_IMAGE_REFS_KEY: list(agent_data.crop_image_refs),
             },
         )
@@ -1804,7 +1998,9 @@ class ToolAgentLoop(AgentLoopBase):
         if message_index is None:
             raise RuntimeError("conditional answer retry could not find a previous user/tool message")
 
-        agent_data.messages[message_index] = self._append_suffix_to_tool_message(agent_data.messages[message_index], suffix)
+        agent_data.messages[message_index] = self._append_suffix_to_tool_message(
+            agent_data.messages[message_index], suffix
+        )
         prompt_start = agent_data.last_user_tool_prompt_start
         prompt_end = agent_data.last_user_tool_prompt_end
         mask_start = agent_data.last_user_tool_response_mask_start
@@ -1865,7 +2061,9 @@ class ToolAgentLoop(AgentLoopBase):
             )
         old_len = prompt_end - prompt_start
         delta = len(replacement_ids) - old_len
-        agent_data.prompt_ids = agent_data.prompt_ids[:prompt_start] + replacement_ids + agent_data.prompt_ids[prompt_end:]
+        agent_data.prompt_ids = (
+            agent_data.prompt_ids[:prompt_start] + replacement_ids + agent_data.prompt_ids[prompt_end:]
+        )
         if mask_end > mask_start:
             agent_data.response_mask = (
                 agent_data.response_mask[:mask_start]
@@ -2380,6 +2578,7 @@ class ToolAgentLoop(AgentLoopBase):
             "tool_prompt": self.tool_schemas,
             "tool_config_path": self.rollout_config.multi_turn.tool_config_path,
             "sampling_params": sampling_params,
+            **self._candidate_answer_schedule_metadata(agent_data),
             "source_image_paths": source_image_paths,
         }
         agent_data.debug_events.append(record)
@@ -2406,6 +2605,8 @@ class ToolAgentLoop(AgentLoopBase):
             "raw_prompt": kwargs["raw_prompt"],
             "messages": agent_data.messages,
             "final_response": final_response,
+            **self._candidate_answer_schedule_metadata(agent_data),
+            **self._canonical_prefix_mask_metadata(agent_data),
             "retry_critic_tokens": int(sum(output.retry_critic_mask or [])),
             "retry_critic_label": output.extra_fields.get("retry_critic_label"),
             "num_turns": output.num_turns,
@@ -2424,6 +2625,10 @@ class ToolAgentLoop(AgentLoopBase):
                         self.conditional_answer_retry_branch_baseline_weight_key
                     ),
                     "reward_extra_info": branch.extra_fields.get("reward_extra_info"),
+                    **(
+                        {"candidate_answer_schedule": branch.extra_fields["candidate_answer_schedule"]}
+                        if "candidate_answer_schedule" in branch.extra_fields else {}
+                    ),
                 }
                 for branch in (output.branch_outputs or [])
             ],

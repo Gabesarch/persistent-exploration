@@ -33,6 +33,7 @@ API_KEY="${API_KEY:-qwen}"; NUM_GPUS="${NUM_GPUS:-1}"
 CUSTOM_CHAT_TEMPLATE="${CUSTOM_CHAT_TEMPLATE:-}"
 FORCE_TOOL_CALLS_UNTIL_FINAL_TURN="${FORCE_TOOL_CALLS_UNTIL_FINAL_TURN:-false}"
 FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS="${FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS:-false}"
+TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-hermes}"
 
 LOG_DIR="${LOG_DIR:-$VERO_EVAL_DIR/logs/vllm}"
 mkdir -p "$LOG_DIR"
@@ -40,6 +41,7 @@ LOGFILE="$LOG_DIR/vllm_$(date '+%Y-%m-%d_%H-%M-%S')_port${PORT}.txt"
 
 echo "CHECKPOINT_PATH: $CHECKPOINT_PATH"
 echo "PORT: $PORT   NUM_GPUS: $NUM_GPUS   served-model-name: $MODEL_NAME"
+echo "Tool-call parser: $TOOL_CALL_PARSER"
 
 # Only kill a server on OUR port: on shared nodes a blanket `pkill -f "vllm serve"`
 # would murder a sibling job's policy server mid-eval (give concurrent jobs unique
@@ -115,7 +117,7 @@ nohup vllm serve "$CHECKPOINT_PATH" \
   --api-key "$API_KEY" \
   --enable-sleep-mode \
   --enable-auto-tool-choice \
-  --tool-call-parser hermes \
+  --tool-call-parser "$TOOL_CALL_PARSER" \
   "${CHAT_TEMPLATE_ARGS[@]}" \
   "${LOGITS_PROCESSOR_ARGS[@]}" \
   --enforce-eager \

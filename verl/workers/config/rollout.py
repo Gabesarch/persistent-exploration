@@ -107,6 +107,11 @@ class MultiTurnConfig(BaseConfig):
     randomized_max_assistant_turns_per_turn_probability: float = 0.0
     randomized_max_assistant_turns_seed: int = 42
     randomized_max_assistant_turns_enable_validation: bool = False
+    # Training-only candidate deadlines; these do not shorten the total turn cap.
+    candidate_answer_schedule_enabled: bool = False
+    candidate_answer_first_turns: list[int] = field(default_factory=lambda: [4, 5, 6, 7])
+    candidate_answer_followup_min_turn_gap: int = 2
+    candidate_answer_schedule_seed: int = 42
     final_answer_token_margin: int = 2048
     # Text appended inside the forced final turn's `<think>` block before generation.
     # Empty string leaves forced final-answer generation unchanged.
@@ -132,6 +137,9 @@ class MultiTurnConfig(BaseConfig):
     # Whether GT-based answer retry is allowed during validation rollouts.
     conditional_answer_retry_enable_validation: bool = True
     conditional_answer_retry_force_next_tool_call: bool = True
+    # Training only: exclude the retained prefix through the latest retry pivot
+    # from canonical policy loss, while preserving it as attention context.
+    conditional_answer_retry_mask_canonical_prefix: bool = False
     conditional_answer_retry_suffix: str = (
         "You have not gathered enough information yet. In your next turn, keep exploring rather than answering "
         "prematurely: use more tool calls to broaden the search, test alternative hypotheses, look for "

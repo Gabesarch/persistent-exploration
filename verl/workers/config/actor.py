@@ -107,6 +107,7 @@ class BranchLossStrataConfig(BaseConfig):
     """Configuration for parent-balanced canonical/branch policy-loss strata."""
 
     enabled: bool = False
+    log_advantage_mass: bool = False
     branch_fraction: float = 0.2
     cap_by_parent_prevalence: bool = True
     parent_balance: bool = True
@@ -115,6 +116,8 @@ class BranchLossStrataConfig(BaseConfig):
     subsampling: BranchSubsamplingConfig = field(default_factory=BranchSubsamplingConfig)
 
     def __post_init__(self):
+        if self.log_advantage_mass and not self.enabled:
+            raise ValueError("policy_loss.branch_strata.log_advantage_mass requires branch strata to be enabled.")
         if not 0.0 <= float(self.branch_fraction) < 1.0:
             raise ValueError(
                 f"policy_loss.branch_strata.branch_fraction must satisfy 0 <= value < 1, got {self.branch_fraction!r}."

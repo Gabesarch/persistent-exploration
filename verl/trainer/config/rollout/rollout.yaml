@@ -235,6 +235,13 @@ multi_turn:
   randomized_max_assistant_turns_seed: 42
   randomized_max_assistant_turns_enable_validation: False
 
+  # Training-only deadlines for a first candidate and one follow-up. The total
+  # retained-trajectory turn cap and validation behavior remain unchanged.
+  candidate_answer_schedule_enabled: False
+  candidate_answer_first_turns: [4, 5, 6, 7]
+  candidate_answer_followup_min_turn_gap: 2
+  candidate_answer_schedule_seed: 42
+
   # Token headroom reserved for the final <answer> turn; if remaining response budget
   # drops below this, switch to forcing an answer to avoid an answerless overflow.
   final_answer_token_margin: 2048
@@ -261,6 +268,8 @@ multi_turn:
   conditional_answer_retry_enable_validation: True
 
   conditional_answer_retry_force_next_tool_call: True
+  # Training only: mask canonical policy loss through the latest actual retry pivot.
+  conditional_answer_retry_mask_canonical_prefix: False
   conditional_answer_retry_suffix: "You have not gathered enough information yet. In your next turn, keep exploring rather than answering prematurely: use more tool calls to broaden the search, test alternative hypotheses, look for disconfirming evidence, and dig deeper into the most likely explanations. Finalize only when the evidence clearly supports a conclusion."
   conditional_answer_retry_assistant_prefill: ""
 

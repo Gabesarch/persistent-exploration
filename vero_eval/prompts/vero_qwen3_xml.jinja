@@ -1,0 +1,125 @@
+{# Qwen3 XML variant of the forced-think Vero training template at minio3-yp
+   8013b08821be150825978eb89fb7c05d0434bc09. Keeps the vision/tool-response
+   framing; changes the tool instructions and assistant tool history to XML. #}
+{%- if tools %}
+    {{- '<|im_start|>system\n' }}
+    {%- if messages[0].role == 'system' %}
+        {%- if messages[0].content is string %}
+            {{- messages[0].content }}
+        {%- else %}
+            {%- for content in messages[0].content %}
+                {%- if 'text' in content %}
+                    {{- content.text }}
+                {%- endif %}
+            {%- endfor %}
+        {%- endif %}
+        {{- '\n\n' }}
+    {%- endif %}
+    {{- "# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>" }}
+    {%- for tool in tools %}
+        {{- "\n" }}
+        {{- tool | tojson }}
+    {%- endfor %}
+    {{- "\n</tools>\n\nEvery assistant response must contain exactly one non-empty <think> block followed by exactly one action block. Use <tool_call> for tool calls and <answer> for final answers. Only whitespace may appear outside these blocks. For each function call, use Qwen3 XML with a <function=FUNCTION_NAME> block and <parameter=PARAMETER_NAME> children inside <tool_call></tool_call>. Never use a JSON tool-call object:\n<think>\nReasoning for this step.\n</think>\n<tool_call>\n<function=FUNCTION_NAME>\n<parameter=PARAMETER_NAME>VALUE</parameter>\n</function>\n</tool_call>\n\nFinal answers must use this structure:\n<think>\nFinal reasoning.\n</think>\n<answer>\nFinal answer.\n</answer><|im_end|>\n" }}
+{%- else %}
+    {%- if messages[0].role == 'system' %}
+        {{- '<|im_start|>system\n' }}
+        {%- if messages[0].content is string %}
+            {{- messages[0].content }}
+        {%- else %}
+            {%- for content in messages[0].content %}
+                {%- if 'text' in content %}
+                    {{- content.text }}
+                {%- endif %}
+            {%- endfor %}
+        {%- endif %}
+        {{- '<|im_end|>\n' }}
+    {%- endif %}
+{%- endif %}
+{%- set image_count = namespace(value=0) %}
+{%- set video_count = namespace(value=0) %}
+{%- for message in messages %}
+    {%- if message.role == "user" %}
+        {{- '<|im_start|>' + message.role + '\n' }}
+        {%- if message.content is string %}
+            {{- message.content }}
+        {%- else %}
+            {%- for content in message.content %}
+                {%- if content.type == 'image' or 'image' in content or 'image_url' in content %}
+                    {%- set image_count.value = image_count.value + 1 %}
+                    {%- if add_vision_id %}Picture {{ image_count.value }}: {% endif -%}
+                    <|vision_start|><|image_pad|><|vision_end|>
+                {%- elif content.type == 'video' or 'video' in content %}
+                    {%- set video_count.value = video_count.value + 1 %}
+                    {%- if add_vision_id %}Video {{ video_count.value }}: {% endif -%}
+                    <|vision_start|><|video_pad|><|vision_end|>
+                {%- elif 'text' in content %}
+                    {{- content.text }}
+                {%- endif %}
+            {%- endfor %}
+        {%- endif %}
+        {{- '<|im_end|>\n' }}
+    {%- elif message.role == "assistant" %}
+        {{- '<|im_start|>' + message.role + '\n' }}
+        {%- if message.content is string %}
+            {{- message.content }}
+        {%- else %}
+            {%- for content_item in message.content %}
+                {%- if 'text' in content_item %}
+                    {{- content_item.text }}
+                {%- endif %}
+            {%- endfor %}
+        {%- endif %}
+        {%- if message.tool_calls %}
+            {%- for tool_call in message.tool_calls %}
+                {%- if (loop.first and message.content) or (not loop.first) %}
+                    {{- '\n' }}
+                {%- endif %}
+                {%- if tool_call.function %}
+                    {%- set tool_call = tool_call.function %}
+                {%- endif %}
+                {{- '<tool_call>\n<function=' + tool_call.name + '>\n' }}
+                {%- for name, value in tool_call.arguments.items() %}
+                    {{- '<parameter=' + name + '>\n' }}
+                    {%- if value is string %}
+                        {{- value }}
+                    {%- else %}
+                        {{- value | tojson }}
+                    {%- endif %}
+                    {{- '\n</parameter>\n' }}
+                {%- endfor %}
+                {{- '</function>\n</tool_call>' }}
+            {%- endfor %}
+        {%- endif %}
+        {{- '<|im_end|>\n' }}
+    {%- elif message.role == "tool" %}
+        {%- if loop.first or (messages[loop.index0 - 1].role != "tool") %}
+            {{- '<|im_start|>user' }}
+        {%- endif %}
+        {{- '\n<tool_response>\n' }}
+        {%- if message.content is string %}
+            {{- message.content }}
+        {%- else %}
+            {%- for content in message.content %}
+                {%- if content.type == 'image' or 'image' in content or 'image_url' in content %}
+                    {%- set image_count.value = image_count.value + 1 %}
+                    {%- if add_vision_id %}Picture {{ image_count.value }}: {% endif -%}
+                    <|vision_start|><|image_pad|><|vision_end|>
+                {%- elif content.type == 'video' or 'video' in content %}
+                    {%- set video_count.value = video_count.value + 1 %}
+                    {%- if add_vision_id %}Video {{ video_count.value }}: {% endif -%}
+                    <|vision_start|><|video_pad|><|vision_end|>
+                {%- elif 'text' in content %}
+                    {{- content.text }}
+                {%- endif %}
+            {%- endfor %}
+        {%- endif %}
+        {{- '\n</tool_response>' }}
+        {%- if loop.last or (messages[loop.index0 + 1].role != "tool") %}
+            {{- '<|im_end|>\n' }}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n<think>\n' }}
+{%- endif %}
