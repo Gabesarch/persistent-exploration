@@ -308,6 +308,9 @@ class ToolAgentLoop(AgentLoopBase):
         self.conditional_answer_retry_correct_accuracy_threshold = getattr(
             multi_turn_config, "conditional_answer_retry_correct_accuracy_threshold", 0.0
         )
+        self.conditional_answer_retry_accept_partial_credit = bool(
+            getattr(multi_turn_config, "conditional_answer_retry_accept_partial_credit", True)
+        )
         self.conditional_answer_retry_max_retries = getattr(
             multi_turn_config, "conditional_answer_retry_max_retries", None
         )
@@ -668,8 +671,7 @@ class ToolAgentLoop(AgentLoopBase):
             and agent_data.assistant_turns + 1 >= schedule.next_deadline
         )
 
-    @staticmethod
-    def _candidate_answer_schedule_metadata(agent_data: AgentData) -> dict[str, Any]:
+    def _candidate_answer_schedule_metadata(self, agent_data: AgentData) -> dict[str, Any]:
         schedule = getattr(agent_data, "candidate_answer_schedule", None)
         if schedule is None:
             return {}
@@ -681,6 +683,8 @@ class ToolAgentLoop(AgentLoopBase):
                 "candidate_count": len(schedule.history),
                 "generated_policy_turns": schedule.generated_policy_turns,
                 "generated_policy_tokens": schedule.generated_policy_tokens,
+                "accept_partial_credit": getattr(self, "conditional_answer_retry_accept_partial_credit", True),
+                "correct_accuracy_threshold": self.conditional_answer_retry_correct_accuracy_threshold,
                 "history": [dict(record) for record in schedule.history],
             }
         }
@@ -1264,8 +1268,12 @@ class ToolAgentLoop(AgentLoopBase):
         grade = await self._grade_current_response(agent_data, rollout_kwargs)
         agent_data.extra_fields["conditional_answer_retry_last_grade"] = grade
         accuracy = self._grade_accuracy(grade)
-        if accuracy > float(self.conditional_answer_retry_correct_accuracy_threshold):
-            self._record_candidate_answer(agent_data, grade, action="accept", reason="positive_accuracy")
+        accepts_partial = getattr(self, "conditional_answer_retry_accept_partial_credit", True)
+        if accuracy > float(self.conditional_answer_retry_correct_accuracy_threshold) and (
+            accepts_partial or accuracy >= 1.0
+        ):
+            reason = "positive_accuracy" if accepts_partial else "full_accuracy"
+            self._record_candidate_answer(agent_data, grade, action="accept", reason=reason)
             appended = await self._append_retry_critic_supervision(agent_data, grade=grade, label="A")
             if appended:
                 agent_data.extra_fields["__agent_loop_precritic_grade"] = grade

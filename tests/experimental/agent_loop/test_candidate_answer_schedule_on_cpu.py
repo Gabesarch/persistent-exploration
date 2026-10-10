@@ -144,6 +144,52 @@ def test_first_deadline_forces_and_accepts_positive_credit(first, credit):
     assert not data.branch_outputs
 
 
+@pytest.mark.parametrize("credit", [0.25, 0.5, 0.75, 0.999999])
+def test_full_credit_mode_retries_partial_candidate_with_real_reject_supervision(credit):
+    loop, data, _ = make_case(grades=(credit, 1.0), mask_prefix=True)
+    loop.conditional_answer_retry_accept_partial_credit = False
+    complete(loop, data)
+    history = data.candidate_answer_schedule.history
+    assert [record["action"] for record in history] == ["retry", "accept"]
+    assert [record["accuracy"] for record in history] == [credit, 1.0]
+    assert history[-1]["reason"] == "full_accuracy"
+    branch, = data.branch_outputs
+    assert branch.extra_fields["retry_critic_label"] == "R"
+    assert branch.extra_fields["conditional_answer_retry_branch_grade"]["accuracy"] == credit
+    assert sum(branch.retry_critic_mask) == 1
+    assert [token for token, mask in zip(branch.response_ids, branch.retry_critic_mask, strict=True) if mask] == [49]
+    assert branch.extra_fields["candidate_answer_schedule"]["accept_partial_credit"] is False
+    assert data.extra_fields["retry_critic_label"] == "A"
+    assert sum(data.retry_critic_mask) == 1
+    assert loop._canonical_prefix_mask_metadata(data)["canonical_prefix_mask"]["active_prefix_policy_tokens"] == 0
+
+
+def test_full_credit_mode_keeps_reject_label_for_partial_answer_at_final_cap():
+    loop, data, _ = make_case(grades=(0.5, 0.75, 0.999999), mask_prefix=True)
+    loop.conditional_answer_retry_accept_partial_credit = False
+    complete(loop, data)
+    history = data.candidate_answer_schedule.history
+    assert [record["action"] for record in history] == ["retry", "retry", "terminate"]
+    assert history[-1]["retained_turn"] == 11
+    assert data.extra_fields["retry_critic_label"] == "R"
+    assert data.extra_fields["__agent_loop_precritic_grade"]["accuracy"] == 0.999999
+    assert sum(data.retry_critic_mask) == 1
+    assert len(data.branch_outputs) == 2
+    assert all(branch.extra_fields["retry_critic_label"] == "R" for branch in data.branch_outputs)
+    response = data.prompt_ids[-len(data.retry_critic_mask):]
+    assert [token for token, mask in zip(response, data.retry_critic_mask, strict=True) if mask] == [49]
+
+
+@pytest.mark.parametrize("first", [4, 5, 6, 7])
+def test_full_credit_mode_accepts_full_answer_without_retry(first):
+    loop, data, _ = make_case(first=first, grades=(1.0,))
+    loop.conditional_answer_retry_accept_partial_credit = False
+    complete(loop, data)
+    assert [record["action"] for record in data.candidate_answer_schedule.history] == ["accept"]
+    assert data.extra_fields["retry_critic_label"] == "A"
+    assert not data.branch_outputs
+
+
 def test_turn_seven_rollback_preserves_schedule_branch_and_cost():
     loop, data, server = make_case(grades=(0.0, 0.0, 1.0))
     complete(loop, data)
@@ -394,6 +440,11 @@ def test_new_recipe_composes_with_schedule_mask_diagnostics_and_half_critic_weig
     with initialize_config_dir(config_dir=str(root / "vero2_scripts/config"), version_base=None):
         base = OmegaConf.to_container(compose(config_name=base_name), resolve=False)
         new = OmegaConf.to_container(compose(config_name=name), resolve=False)
+        legacy = compose(
+            config_name=name,
+            overrides=["actor_rollout_ref.rollout.multi_turn.conditional_answer_retry_accept_partial_credit=true"],
+        )
+    assert legacy.actor_rollout_ref.rollout.multi_turn.conditional_answer_retry_accept_partial_credit is True
     multi_turn = new["actor_rollout_ref"]["rollout"]["multi_turn"]
     assert multi_turn["max_assistant_turns"] == 11
     assert multi_turn["candidate_answer_schedule_enabled"] is True
@@ -402,6 +453,8 @@ def test_new_recipe_composes_with_schedule_mask_diagnostics_and_half_critic_weig
     assert multi_turn["candidate_answer_schedule_seed"] == 42
     assert multi_turn["randomized_max_assistant_turns_enabled"] is False
     assert multi_turn["conditional_answer_retry_mask_canonical_prefix"] is True
+    assert multi_turn["conditional_answer_retry_accept_partial_credit"] is False
+    assert base["actor_rollout_ref"]["rollout"]["multi_turn"]["conditional_answer_retry_accept_partial_credit"] is True
     strata = new["actor_rollout_ref"]["actor"]["policy_loss"]["branch_strata"]
     assert strata["log_advantage_mass"] is True
     assert new["trainer"]["experiment_name"] == name + "_20260930"
@@ -413,6 +466,7 @@ def test_new_recipe_composes_with_schedule_mask_diagnostics_and_half_critic_weig
     critic["loss_fraction"] = 0.01
     multi_turn["candidate_answer_schedule_enabled"] = False
     multi_turn["conditional_answer_retry_mask_canonical_prefix"] = False
+    multi_turn["conditional_answer_retry_accept_partial_credit"] = True
     strata["log_advantage_mass"] = False
     new["trainer"]["experiment_name"] = base["trainer"]["experiment_name"]
     assert new == base
@@ -420,3 +474,4 @@ def test_new_recipe_composes_with_schedule_mask_diagnostics_and_half_critic_weig
     assert defaults.candidate_answer_schedule_enabled is False
     assert defaults.candidate_answer_first_turns == [4, 5, 6, 7]
     assert defaults.conditional_answer_retry_mask_canonical_prefix is False
+    assert defaults.conditional_answer_retry_accept_partial_credit is True

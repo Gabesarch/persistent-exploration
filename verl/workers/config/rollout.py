@@ -159,6 +159,9 @@ class MultiTurnConfig(BaseConfig):
     conditional_answer_retry_sft_enabled: bool = False
     conditional_answer_retry_sft_target_selection: str = "all"
     conditional_answer_retry_correct_accuracy_threshold: float = 0.0
+    # False requires full accuracy (>= 1.0) as well as the threshold above.
+    # This controls both oracle retry decisions and A/R supervision labels.
+    conditional_answer_retry_accept_partial_credit: bool = True
     conditional_answer_retry_max_retries: Optional[int] = None
     conditional_answer_retry_branch_enabled: bool = False
     conditional_answer_retry_branch_enable_validation: bool = False

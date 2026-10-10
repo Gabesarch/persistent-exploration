@@ -278,6 +278,8 @@ actor_rollout_ref:
       conditional_answer_retry_suffix: ""
       conditional_answer_retry_assistant_prefill: "Let’s see. I still don’t have decisive evidence, so I should inspect a substantially different region. If one area looks especially promising, I can examine it more closely, but I should look elsewhere once further zooming stops revealing new evidence."
       conditional_answer_retry_correct_accuracy_threshold: 0.0
+      # Require full credit: partial answers retry and receive R critic supervision.
+      conditional_answer_retry_accept_partial_credit: false
       conditional_answer_retry_max_retries: null
       conditional_answer_retry_branch_enabled: true
       conditional_answer_retry_branch_enable_validation: false

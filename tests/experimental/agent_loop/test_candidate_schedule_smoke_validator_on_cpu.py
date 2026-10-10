@@ -60,3 +60,27 @@ def test_smoke_checker_requires_mask_and_finite_mass(tmp_path, failure):
         counts = validate(traces, log)
         assert counts["prefix_masked_rollouts"] == counts["forced_followup"] == 1
         assert counts["prefix_masked_policy_tokens"] == 40
+
+
+@pytest.mark.parametrize("action,credit,valid", [("terminate", 0.5, True), ("accept", 0.5, False),
+                                               ("accept", 1.0, True), ("terminate", 1.0, False)])
+def test_smoke_checker_honors_full_credit_requirement(tmp_path, action, credit, valid):
+    records = fixture_records()
+    schedule = records[0]["candidate_answer_schedule"]
+    schedule["accept_partial_credit"] = False
+    schedule["correct_accuracy_threshold"] = 0.0
+    schedule["history"][0]["accuracy"] = 0.75
+    schedule["history"][-1].update(action=action, accuracy=credit)
+    traces = tmp_path / "sample_traces.jsonl"
+    traces.write_text("\n".join(json.dumps(record) for record in records))
+    metrics = {"actor/pg_loss": 0.1, "actor/retry_critic_loss": 0.2, "actor/retry_critic_weighted_loss": 0.002}
+    for name in ("positive", "negative", "canonical_positive", "canonical_negative", "branch_positive",
+                 "branch_negative", "positive_fraction"):
+        metrics[f"actor/advantage_mass/{name}"] = 0.5
+    log = tmp_path / "train.log"
+    log.write_text(", ".join(f"{key}:{value}" for key, value in metrics.items()))
+    if valid:
+        assert validate(traces, log)["retried_candidates"] == 1
+    else:
+        with pytest.raises(AssertionError):
+            validate(traces, log)

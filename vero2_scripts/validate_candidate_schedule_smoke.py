@@ -36,6 +36,8 @@ def validate(traces: Path, train_log: Path) -> Counter:
             "rollout contains a forced-action structure error"
         )
         followup = schedule["followup_deadline"]
+        accepts_partial = schedule.get("accept_partial_credit", True)
+        correct_threshold = float(schedule.get("correct_accuracy_threshold", 0.0))
         if history:
             assert history[0]["retained_turn"] <= schedule["first_deadline"], "first candidate missed its deadline"
             if history[0]["action"] == "retry":
@@ -62,11 +64,14 @@ def validate(traces: Path, train_log: Path) -> Counter:
                 assert candidate["generated_policy_turn"] > history[index - 1]["generated_policy_turn"]
             counts["candidates"] += 1
             counts["retried_candidates"] += int(candidate["action"] == "retry")
+            acceptable = candidate["accuracy"] > correct_threshold and (
+                accepts_partial or candidate["accuracy"] >= 1.0
+            )
             if candidate["action"] == "accept":
-                assert candidate["accuracy"] > 0
+                assert acceptable, "accepted a candidate below the configured accuracy requirement"
                 counts["recovered_rollouts"] += int(index > 0)
             else:
-                assert candidate["accuracy"] <= 0
+                assert not acceptable, "rejected a candidate meeting the configured accuracy requirement"
         if len(history) >= 2:
             assert schedule["next_deadline"] is None, "schedule was rearmed after the one follow-up"
         prefix_mask = record.get("canonical_prefix_mask")

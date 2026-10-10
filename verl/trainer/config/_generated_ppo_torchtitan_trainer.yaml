@@ -363,6 +363,7 @@ actor_rollout_ref:
       conditional_answer_retry_sft_enabled: false
       conditional_answer_retry_sft_target_selection: all
       conditional_answer_retry_correct_accuracy_threshold: 0.0
+      conditional_answer_retry_accept_partial_credit: true
       conditional_answer_retry_max_retries: null
       conditional_answer_retry_branch_enabled: false
       conditional_answer_retry_branch_enable_validation: false
