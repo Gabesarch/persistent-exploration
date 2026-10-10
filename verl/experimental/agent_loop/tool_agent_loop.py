@@ -21,6 +21,7 @@ import random
 import re
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import partial
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -61,6 +62,14 @@ from verl.utils.reward_score.math_verify_reward_type_multiturn_tool_calling_opti
     tool_repeat_overlap_call_diagnostics,
 )
 from verl.utils.rollout_trace import rollout_trace_op
+from verl.utils.trajectory_replay import (
+    build_judge_messages,
+    extract_candidate_answer,
+    extract_question_text,
+    parse_judge_response,
+    persist_candidate,
+    select_candidate_evidence,
+)
 from verl.workers.rollout.replica import TokenOutput
 
 logger = logging.getLogger(__file__)
@@ -117,6 +126,21 @@ class CandidateAnswerSchedule:
         return self.followup_deadline if len(self.history) == 1 else None
 
 
+@dataclass
+class PromptGroupSchedule:
+    """Fixed prompt-group deadlines with independent, rollback-stable sample state."""
+
+    group_id: str
+    force_first_tool_call: bool
+    answer_turns: tuple[int, ...]
+    consumed_answer_turns: set[int] = field(default_factory=set)
+    history: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def next_deadline(self) -> int | None:
+        return next((turn for turn in self.answer_turns if turn not in self.consumed_answer_turns), None)
+
+
 class AgentData:
     """Encapsulates all state variables for the agent loop. AgentData is passed to tool calling in case that
     tool may need to access full history state. User can store any tool session data in `extra_fields`."""
@@ -137,6 +161,9 @@ class AgentData:
     ):
         self.messages = messages
         self.image_data = image_data
+        # Keep the already-processed initial images separate from later crop outputs.
+        self.initial_processed_images = tuple(image_data or [])
+        self.tool_output_images: list[Any] = []
         self.video_data = video_data
         self.original_prompt_image_sources = original_prompt_image_sources or []
         self.crop_cache_root = crop_cache_root
@@ -144,6 +171,7 @@ class AgentData:
         self.metrics = metrics
         self.request_id = request_id
         self.tools_kwargs = tools_kwargs
+        self.replay_question = extract_question_text(messages)
         self.interaction = interaction
         self.interaction_kwargs = interaction_kwargs or {}
 
@@ -160,6 +188,8 @@ class AgentData:
         self.assistant_turns = 0
         self.effective_max_assistant_turns: int | None = None
         self.candidate_answer_schedule: CandidateAnswerSchedule | None = None
+        self.prompt_group_schedule: PromptGroupSchedule | None = None
+        self.replay_candidate_entries: list[dict[str, Any]] = []
 
         # Temporary state for tool calls
         self.tool_calls: list[FunctionCall] = []
@@ -259,6 +289,12 @@ class ToolAgentLoop(AgentLoopBase):
         )
         self.candidate_answer_schedule_seed = getattr(multi_turn_config, "candidate_answer_schedule_seed", 42)
         self._validate_candidate_answer_schedule_config()
+        self.prompt_group_schedule_enabled = bool(getattr(multi_turn_config, "prompt_group_schedule_enabled", False))
+        if self.prompt_group_schedule_enabled:
+            if self.candidate_answer_schedule_enabled or self.randomized_max_assistant_turns_enabled:
+                raise ValueError("prompt-group scheduling conflicts with per-sample candidate schedules or turn caps")
+            if self.force_tool_calls_until_final_turn:
+                raise ValueError("prompt-group scheduling forces only the first tool turn")
         self.conditional_answer_retry_suffix = getattr(
             multi_turn_config,
             "conditional_answer_retry_suffix",
@@ -341,6 +377,11 @@ class ToolAgentLoop(AgentLoopBase):
         self.conditional_answer_retry_critic_enable_validation = bool(
             getattr(multi_turn_config, "conditional_answer_retry_critic_enable_validation", False)
         )
+        self.conditional_answer_retry_critic_mode = str(
+            getattr(multi_turn_config, "conditional_answer_retry_critic_mode", "legacy")
+        )
+        if self.conditional_answer_retry_critic_mode not in {"legacy", "reasoning"}:
+            raise ValueError("conditional_answer_retry_critic_mode must be 'legacy' or 'reasoning'")
         self.conditional_answer_retry_critic_question = str(
             getattr(multi_turn_config, "conditional_answer_retry_critic_question", "")
         )
@@ -509,6 +550,7 @@ class ToolAgentLoop(AgentLoopBase):
         )
         agent_data.effective_max_assistant_turns = self._sample_effective_max_assistant_turns(debug_trajectory)
         self._initialize_candidate_answer_schedule(agent_data, debug_trajectory)
+        self._initialize_prompt_group_schedule(agent_data, kwargs.get("prompt_group_schedule"), debug_trajectory)
         if self.randomized_max_assistant_turns_enabled:
             agent_data.extra_fields.update(self._randomized_turn_cap_metadata(agent_data))
         debug_enabled = self._debug_enabled_for_trajectory(debug_trajectory)
@@ -556,6 +598,8 @@ class ToolAgentLoop(AgentLoopBase):
             routed_experts=agent_data.routed_experts,
             extra_fields={**TERMINAL_TOOL_EXTRA_FIELD_DEFAULTS, **agent_data.extra_fields},
         )
+        if self._trajectory_replay_config().get("enabled", False):
+            output.extra_fields["is_replay_judge"] = False
         if self.conditional_answer_retry_branch_enabled:
             output.extra_fields[self.conditional_answer_retry_branch_baseline_weight_key] = 1.0
             output.extra_fields["is_conditional_answer_retry_branch"] = False
@@ -567,10 +611,12 @@ class ToolAgentLoop(AgentLoopBase):
                 "tool_rewards": agent_data.tool_rewards,
                 **self._randomized_turn_cap_metadata(agent_data),
                 **self._candidate_answer_schedule_metadata(agent_data),
+                **self._prompt_group_schedule_metadata(agent_data),
                 **self._canonical_prefix_mask_metadata(agent_data),
                 CROP_IMAGE_REFS_KEY: agent_data.crop_image_refs,
                 "__agent_loop_retry_sft_candidates": list(agent_data.retry_sft_candidates),
                 "retry_sft_candidate_count": len(agent_data.retry_sft_candidates),
+                "replay_candidate_entries": list(agent_data.replay_candidate_entries),
             }
         )
         final_grade = output.extra_fields.pop("__agent_loop_precritic_grade", None)
@@ -661,6 +707,48 @@ class ToolAgentLoop(AgentLoopBase):
             sampling_key=sampling_key,
             first_deadline=random.Random(sampling_key + ":first").choice(self.candidate_answer_first_turns),
         )
+
+    def _initialize_prompt_group_schedule(
+        self, agent_data: AgentData, assignment: Any, trajectory: dict[str, Any]
+    ) -> None:
+        if not getattr(self, "prompt_group_schedule_enabled", False) or trajectory.get("validate"):
+            return
+        if assignment is None:
+            return
+        if not isinstance(assignment, dict):
+            raise ValueError("prompt_group_schedule must be a mapping")
+        force_first = assignment.get("force_first_tool_call", False)
+        turns = assignment.get("answer_turns", [])
+        if type(force_first) is not bool or not isinstance(turns, list | tuple):
+            raise ValueError("prompt_group_schedule requires a boolean first-tool flag and a list of turns")
+        if (
+            any(type(turn) is not int or not 2 <= turn <= 9 for turn in turns)
+            or list(turns) != sorted(set(turns))
+            or len(turns) not in ({1, 2} if force_first else {0})
+            or (len(turns) == 2 and turns[1] - turns[0] < 2)
+            or any(turn >= self.max_assistant_turns for turn in turns)
+        ):
+            raise ValueError("prompt_group_schedule requires one/two sorted turns in [2, 9], separated by >=2")
+        agent_data.prompt_group_schedule = PromptGroupSchedule(
+            group_id=str(assignment.get("group_id", "")),
+            force_first_tool_call=force_first,
+            answer_turns=tuple(turns),
+        )
+
+    @staticmethod
+    def _prompt_group_schedule_metadata(agent_data: AgentData) -> dict[str, Any]:
+        schedule = getattr(agent_data, "prompt_group_schedule", None)
+        if schedule is None:
+            return {}
+        return {
+            "prompt_group_schedule": {
+                "group_id": schedule.group_id,
+                "force_first_tool_call": schedule.force_first_tool_call,
+                "answer_turns": list(schedule.answer_turns),
+                "consumed_answer_turns": sorted(schedule.consumed_answer_turns),
+                "history": [dict(event) for event in schedule.history],
+            }
+        }
 
     @staticmethod
     def _candidate_answer_due(agent_data: AgentData) -> bool:
@@ -902,7 +990,9 @@ class ToolAgentLoop(AgentLoopBase):
         teacher_only_prefill_ids: list[int] = []
         generation_snapshot = self._snapshot_generation_state(agent_data)
         candidate_deadline_forced = False
+        group_deadline_forced = False
         schedule = getattr(agent_data, "candidate_answer_schedule", None)
+        group_schedule = getattr(agent_data, "prompt_group_schedule", None)
         if schedule is not None:
             schedule.forcing_reason = None
 
@@ -915,6 +1005,21 @@ class ToolAgentLoop(AgentLoopBase):
         elif self._candidate_answer_due(agent_data):
             candidate_deadline_forced = True
             forced_required_tag = "<answer>"
+            sampling_params = self._with_forced_action_extra_args(sampling_params, forced_required_tag)
+        elif (
+            group_schedule is not None
+            and group_schedule.next_deadline is not None
+            and agent_data.assistant_turns + 1 >= group_schedule.next_deadline
+        ):
+            group_deadline_forced = True
+            forced_required_tag = "<answer>"
+            sampling_params = self._with_forced_action_extra_args(sampling_params, forced_required_tag)
+        elif (
+            group_schedule is not None
+            and group_schedule.force_first_tool_call
+            and agent_data.assistant_turns == 0
+        ):
+            forced_required_tag = "<tool_call>"
             sampling_params = self._with_forced_action_extra_args(sampling_params, forced_required_tag)
         elif agent_data.force_next_tool_call:
             forced_required_tag = "<tool_call>"
@@ -932,7 +1037,7 @@ class ToolAgentLoop(AgentLoopBase):
         if forced_required_tag == "<answer>":
             if schedule is not None:
                 schedule.forcing_reason = "candidate_deadline" if candidate_deadline_forced else "budget"
-            if not candidate_deadline_forced:
+            if not candidate_deadline_forced and not group_deadline_forced:
                 assistant_prefill_ids = self._append_force_final_answer_think_prefill(agent_data)
         sampling_params = self._with_assistant_turn_token_cap(sampling_params, agent_data)
 
@@ -972,6 +1077,11 @@ class ToolAgentLoop(AgentLoopBase):
                 agent_data.extra_fields["max_global_steps"] = max_global_steps
 
         agent_data.assistant_turns += 1
+        if group_deadline_forced:
+            # This state is intentionally outside generation snapshots: a rejected
+            # answer rolls back its retained turn, but must not repeat this deadline.
+            group_schedule.consumed_answer_turns.add(group_schedule.next_deadline)
+            group_schedule.history.append({"answer_turn": agent_data.assistant_turns, "forced": True})
         if schedule is not None:
             schedule.generated_policy_turns += 1
             schedule.generated_policy_tokens += len(output.token_ids)
@@ -1266,6 +1376,7 @@ class ToolAgentLoop(AgentLoopBase):
         ignore_termination: bool,
     ) -> AgentState | None:
         grade = await self._grade_current_response(agent_data, rollout_kwargs)
+        await self._capture_replay_candidate(agent_data, assistant_message, grade, rollout_kwargs)
         agent_data.extra_fields["conditional_answer_retry_last_grade"] = grade
         accuracy = self._grade_accuracy(grade)
         accepts_partial = getattr(self, "conditional_answer_retry_accept_partial_credit", True)
@@ -1275,7 +1386,10 @@ class ToolAgentLoop(AgentLoopBase):
             reason = "positive_accuracy" if accepts_partial else "full_accuracy"
             self._record_candidate_answer(agent_data, grade, action="accept", reason=reason)
             appended = await self._append_retry_critic_supervision(agent_data, grade=grade, label="A")
-            if appended:
+            if appended or (
+                self._trajectory_replay_config().get("enabled", False)
+                and self._retry_critic_grade_is_supervisable(grade)
+            ):
                 agent_data.extra_fields["__agent_loop_precritic_grade"] = grade
             return None
 
@@ -1289,7 +1403,10 @@ class ToolAgentLoop(AgentLoopBase):
             self._record_candidate_answer(agent_data, grade, action="terminate", reason=skipped_reason)
             agent_data.extra_fields["conditional_answer_retry_skipped_reason"] = skipped_reason
             appended = await self._append_retry_critic_supervision(agent_data, grade=grade, label="R")
-            if appended:
+            if appended or (
+                self._trajectory_replay_config().get("enabled", False)
+                and self._retry_critic_grade_is_supervisable(grade)
+            ):
                 agent_data.extra_fields["__agent_loop_precritic_grade"] = grade
             self._log_incorrect_answer_retry_skipped(agent_data, grade, retry_count, skipped_reason)
             return None
@@ -1326,6 +1443,48 @@ class ToolAgentLoop(AgentLoopBase):
         if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
             return AgentState.TERMINATED
         return AgentState.GENERATING
+
+    def _trajectory_replay_config(self) -> Any:
+        config = getattr(self, "config", {})
+        return config.get("trainer", {}).get("trajectory_replay", {})
+
+    async def _capture_replay_candidate(
+        self,
+        agent_data: AgentData,
+        assistant_message: str,
+        grade: dict[str, Any],
+        rollout_kwargs: dict[str, Any],
+    ) -> None:
+        replay_config = self._trajectory_replay_config()
+        trajectory = rollout_kwargs.get("_debug_trajectory") or {}
+        if not replay_config.get("enabled", False) or trajectory.get("validate"):
+            return
+        if not self._retry_critic_grade_is_supervisable(grade):
+            return
+        root = os.path.join(str(self.config.trainer.default_local_dir), "trajectory_replay")
+        entry = await self.loop.run_in_executor(
+            None,
+            partial(
+                persist_candidate,
+                root,
+                question=agent_data.replay_question,
+                answer=extract_candidate_answer(assistant_message),
+                initial_images=agent_data.initial_processed_images,
+                tool_images=agent_data.tool_output_images,
+                candidate_turn=agent_data.assistant_turns,
+                tool_call_count=len(agent_data.executed_tool_calls),
+                accuracy=float(grade["accuracy"]),
+                source_step=trajectory.get("step") or agent_data.crop_cache_step or 0,
+                source_ids={
+                    "request_id": agent_data.request_id,
+                    "uid": rollout_kwargs.get("uid"),
+                    "sample_index": trajectory.get("sample_index"),
+                    "rollout_n": trajectory.get("rollout_n"),
+                },
+            ),
+        )
+        if entry is not None:
+            agent_data.replay_candidate_entries.append(entry)
 
     def _mask_canonical_retry_prefix(self, agent_data: AgentData, rollout_kwargs: dict[str, Any]) -> None:
         """Mask after rollback and prompt rewriting, so only the new continuation trains.
@@ -1425,40 +1584,51 @@ class ToolAgentLoop(AgentLoopBase):
     ) -> AgentState | None:
         retry_count = int(agent_data.extra_fields.get("conditional_answer_retry_count") or 0)
         candidate_turn = int(generation_snapshot["assistant_turns"]) + 1
+        reasoning_mode = getattr(self, "conditional_answer_retry_critic_mode", "legacy") == "reasoning"
+        critic_details = {"critic_mode": "reasoning"} if reasoning_mode else {}
         try:
-            prefix_ids = await self._retry_critic_prompt_prefix_ids()
-            critic_output: TokenOutput = await self.server_manager.generate(
-                request_id=f"{agent_data.request_id}-retry-critic-{uuid4().hex}",
-                prompt_ids=agent_data.prompt_ids + prefix_ids,
-                sampling_params={
-                    "max_tokens": 1,
-                    "temperature": 0.0,
-                    "top_p": 1.0,
-                    "top_k": -1,
-                    "logprobs": True,
-                    "allowed_token_ids": [
-                        int(self._retry_critic_accept_token_id),
-                        int(self._retry_critic_retry_token_id),
-                    ],
-                },
-                image_data=agent_data.image_data,
-                video_data=agent_data.video_data,
-            )
-            if len(critic_output.token_ids) != 1 or not critic_output.log_probs:
-                raise ValueError("critic generation did not return exactly one token and its log probability")
-            selected_id = int(critic_output.token_ids[0])
-            selected_logprob = float(critic_output.log_probs[0])
-            if selected_id not in {self._retry_critic_accept_token_id, self._retry_critic_retry_token_id}:
-                raise ValueError(f"critic returned disallowed token id {selected_id}")
-            selected_probability = min(max(math.exp(selected_logprob), 0.0), 1.0)
-            if selected_id == self._retry_critic_retry_token_id:
-                p_retry = selected_probability
-                model_token = "R"
+            if reasoning_mode:
+                decision, details = await self._generate_reasoning_retry_critic_decision(
+                    agent_data, assistant_message, candidate_turn
+                )
+                critic_details.update(details)
+                model_token = decision
+                selected_logprob = None
+                p_accept = p_retry = None
             else:
-                p_retry = 1.0 - selected_probability
-                model_token = "A"
-            p_accept = 1.0 - p_retry
-            decision = "R" if p_retry > self.conditional_answer_retry_critic_decision_threshold else "A"
+                prefix_ids = await self._retry_critic_prompt_prefix_ids()
+                critic_output: TokenOutput = await self.server_manager.generate(
+                    request_id=f"{agent_data.request_id}-retry-critic-{uuid4().hex}",
+                    prompt_ids=agent_data.prompt_ids + prefix_ids,
+                    sampling_params={
+                        "max_tokens": 1,
+                        "temperature": 0.0,
+                        "top_p": 1.0,
+                        "top_k": -1,
+                        "logprobs": True,
+                        "allowed_token_ids": [
+                            int(self._retry_critic_accept_token_id),
+                            int(self._retry_critic_retry_token_id),
+                        ],
+                    },
+                    image_data=agent_data.image_data,
+                    video_data=agent_data.video_data,
+                )
+                if len(critic_output.token_ids) != 1 or not critic_output.log_probs:
+                    raise ValueError("critic generation did not return exactly one token and its log probability")
+                selected_id = int(critic_output.token_ids[0])
+                selected_logprob = float(critic_output.log_probs[0])
+                if selected_id not in {self._retry_critic_accept_token_id, self._retry_critic_retry_token_id}:
+                    raise ValueError(f"critic returned disallowed token id {selected_id}")
+                selected_probability = min(max(math.exp(selected_logprob), 0.0), 1.0)
+                if selected_id == self._retry_critic_retry_token_id:
+                    p_retry = selected_probability
+                    model_token = "R"
+                else:
+                    p_retry = 1.0 - selected_probability
+                    model_token = "A"
+                p_accept = 1.0 - p_retry
+                decision = "R" if p_retry > self.conditional_answer_retry_critic_decision_threshold else "A"
         except Exception as exc:  # noqa: BLE001 - validation critic failures must retain the candidate.
             self._record_retry_critic_validation_decision(
                 agent_data,
@@ -1473,6 +1643,7 @@ class ToolAgentLoop(AgentLoopBase):
                     "controller_action": "accept_fallback",
                     "retry_depth": retry_count,
                     "skip_or_error_reason": f"{type(exc).__name__}: {exc}",
+                    **critic_details,
                 },
                 failure=True,
             )
@@ -1498,6 +1669,7 @@ class ToolAgentLoop(AgentLoopBase):
             "controller_action": action,
             "retry_depth": retry_count + int(retry_feasible),
             "skip_or_error_reason": skipped_reason,
+            **critic_details,
         }
         if not retry_feasible:
             self._record_retry_critic_validation_decision(
@@ -1519,6 +1691,66 @@ class ToolAgentLoop(AgentLoopBase):
         if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
             return AgentState.TERMINATED
         return AgentState.GENERATING
+
+    async def _generate_reasoning_retry_critic_decision(
+        self, agent_data: AgentData, assistant_message: str, candidate_turn: int
+    ) -> tuple[str, dict[str, Any]]:
+        replay_config = self._trajectory_replay_config()
+        evidence_mode, images = select_candidate_evidence(
+            initial_images=agent_data.initial_processed_images,
+            tool_images=agent_data.tool_output_images,
+            candidate_turn=candidate_turn,
+            tool_call_count=len(agent_data.executed_tool_calls),
+        )
+        answer = extract_candidate_answer(assistant_message)
+        if not images or not agent_data.replay_question or not answer:
+            raise ValueError("reasoning critic requires a question, candidate answer, and admissible visual evidence")
+        messages = build_judge_messages(
+            agent_data.replay_question,
+            answer,
+            images,
+            system_prompt=replay_config.get("system_prompt_path") or replay_config.get("system_prompt"),
+        )
+        prompt_ids = await self.apply_chat_template(messages, images=list(images), tools=None)
+        # The configured Qwen template already emits the opening think block.
+        # Also support templates that emit only the assistant role header.
+        if not self.tokenizer.decode(prompt_ids, skip_special_tokens=False).rstrip().endswith("<think>"):
+            prompt_ids += self.tokenizer.encode("<think>\n", add_special_tokens=False)
+        rollout_config = getattr(self, "rollout_config", None)
+        if rollout_config is not None and len(prompt_ids) > int(rollout_config.prompt_length):
+            raise ValueError("reasoning critic prompt exceeds configured prompt_length")
+        max_tokens = int(replay_config.get("normal_budget", 4096)) + int(replay_config.get("overlong_buffer", 1024))
+        critic_output = await self.server_manager.generate(
+            request_id=f"{agent_data.request_id}-reasoning-retry-critic-{uuid4().hex}",
+            prompt_ids=prompt_ids,
+            sampling_params={
+                "n": 1,
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "top_k": -1,
+                "logprobs": False,
+            },
+            image_data=list(images),
+            video_data=None,
+        )
+        if len(critic_output.token_ids) > max_tokens:
+            raise ValueError("reasoning critic server exceeded its hard response budget")
+        decoded = self.tokenizer.decode(critic_output.token_ids, skip_special_tokens=True)
+        eos = getattr(self.tokenizer, "eos_token", None)
+        if eos and decoded.endswith(eos):
+            decoded = decoded[:-len(eos)]
+        response_text = "<think>\n" + decoded
+        decision = parse_judge_response(response_text)
+        if decision is None:
+            raise ValueError("reasoning critic must generate a nonempty think block followed by one A/R answer")
+        return decision, {
+            "critic_generated_tokens": len(critic_output.token_ids),
+            "critic_response": response_text,
+            "critic_evidence_mode": evidence_mode,
+            "critic_evidence_images": len(images),
+            "critic_reasoning_format_valid": True,
+        }
 
     def _record_retry_critic_validation_decision(
         self,
@@ -1638,6 +1870,9 @@ class ToolAgentLoop(AgentLoopBase):
                 "tool_rewards": list(agent_data.tool_rewards),
                 **self._randomized_turn_cap_metadata(agent_data),
                 **self._candidate_answer_schedule_metadata(agent_data),
+                **self._prompt_group_schedule_metadata(agent_data),
+                "replay_candidate_entries": [],
+                **({"is_replay_judge": False} if self._trajectory_replay_config().get("enabled", False) else {}),
                 CROP_IMAGE_REFS_KEY: list(agent_data.crop_image_refs),
             },
         )
@@ -2357,6 +2592,7 @@ class ToolAgentLoop(AgentLoopBase):
 
         agent_data.messages.extend(add_messages)
         agent_data.crop_image_refs.extend(pending_crop_refs)
+        agent_data.tool_output_images.extend(new_images_this_turn)
         agent_data.tool_rewards.extend(pending_tool_rewards)
 
         if new_images_this_turn:
@@ -2587,6 +2823,7 @@ class ToolAgentLoop(AgentLoopBase):
             "tool_config_path": self.rollout_config.multi_turn.tool_config_path,
             "sampling_params": sampling_params,
             **self._candidate_answer_schedule_metadata(agent_data),
+            **self._prompt_group_schedule_metadata(agent_data),
             "source_image_paths": source_image_paths,
         }
         agent_data.debug_events.append(record)
@@ -2614,7 +2851,9 @@ class ToolAgentLoop(AgentLoopBase):
             "messages": agent_data.messages,
             "final_response": final_response,
             **self._candidate_answer_schedule_metadata(agent_data),
+            **self._prompt_group_schedule_metadata(agent_data),
             **self._canonical_prefix_mask_metadata(agent_data),
+            "replay_candidate_entries": list(agent_data.replay_candidate_entries),
             "retry_critic_tokens": int(sum(output.retry_critic_mask or [])),
             "retry_critic_label": output.extra_fields.get("retry_critic_label"),
             "num_turns": output.num_turns,
@@ -2636,6 +2875,10 @@ class ToolAgentLoop(AgentLoopBase):
                     **(
                         {"candidate_answer_schedule": branch.extra_fields["candidate_answer_schedule"]}
                         if "candidate_answer_schedule" in branch.extra_fields else {}
+                    ),
+                    **(
+                        {"prompt_group_schedule": branch.extra_fields["prompt_group_schedule"]}
+                        if "prompt_group_schedule" in branch.extra_fields else {}
                     ),
                 }
                 for branch in (output.branch_outputs or [])

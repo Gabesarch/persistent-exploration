@@ -3,6 +3,9 @@
 The vero2 RL experiments: Slurm launchers (`run_*.sh`), Hydra configs, tool schemas, system
 prompts. Everything drives `python -m verl.trainer.main_ppo` on Della.
 
+For the isolated reasoning-critic replay run and its checkpoint/resume GPU smoke, see
+[README_critic_replay.md](README_critic_replay.md).
+
 > **Always launch from the repo root** (`sbatch vero2_scripts/<family>/<variant>/run_*.sh`).
 > Launchers `source ./set_paths.sh` via a relative path. Cluster/Slurm details: top-level
 > `CLAUDE.md` and `useful_command.sh` (§3 headers, §7 exact commands).

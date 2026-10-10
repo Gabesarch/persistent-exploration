@@ -241,6 +241,8 @@ multi_turn:
   candidate_answer_first_turns: [4, 5, 6, 7]
   candidate_answer_followup_min_turn_gap: 2
   candidate_answer_schedule_seed: 42
+  # Opt-in immutable per-prompt scheduling supplied by the trainer before n-fold repeat.
+  prompt_group_schedule_enabled: False
 
   # Token headroom reserved for the final <answer> turn; if remaining response budget
   # drops below this, switch to forcing an answer to avoid an answerless overflow.
@@ -309,6 +311,8 @@ multi_turn:
   conditional_answer_retry_critic_enabled: False
   conditional_answer_retry_critic_oracle_supervision_enabled: True
   conditional_answer_retry_critic_enable_validation: False
+  # "reasoning" uses the sanitized replay-judge task instead of the legacy one-token critic.
+  conditional_answer_retry_critic_mode: legacy
   conditional_answer_retry_critic_question: 'Assuming another tool round is available, should the preceding candidate be accepted or retried? In the <answer> block, output only "A" or "R".'
   conditional_answer_retry_critic_assistant_prefill: "I need to classify whether the preceding candidate should be accepted or retried.\n</think>\n<answer>\n"
   conditional_answer_retry_critic_accept_token: A

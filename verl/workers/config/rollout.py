@@ -112,6 +112,8 @@ class MultiTurnConfig(BaseConfig):
     candidate_answer_first_turns: list[int] = field(default_factory=lambda: [4, 5, 6, 7])
     candidate_answer_followup_min_turn_gap: int = 2
     candidate_answer_schedule_seed: int = 42
+    # Trainer-assigned schedules are shared across all samples of a task prompt.
+    prompt_group_schedule_enabled: bool = False
     final_answer_token_margin: int = 2048
     # Text appended inside the forced final turn's `<think>` block before generation.
     # Empty string leaves forced final-answer generation unchanged.
@@ -174,6 +176,7 @@ class MultiTurnConfig(BaseConfig):
     conditional_answer_retry_critic_enabled: bool = False
     conditional_answer_retry_critic_oracle_supervision_enabled: bool = True
     conditional_answer_retry_critic_enable_validation: bool = False
+    conditional_answer_retry_critic_mode: str = "legacy"
     conditional_answer_retry_critic_question: str = (
         'Assuming another tool round is available, should the preceding candidate be accepted or retried? '
         'In the <answer> block, output only "A" or "R".'

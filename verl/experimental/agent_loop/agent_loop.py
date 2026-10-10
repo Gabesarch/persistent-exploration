@@ -61,6 +61,17 @@ from verl.workers.rollout.replica import DiffusionOutput, TokenOutput, get_rollo
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+
+def _align_replay_output_columns(outputs):
+    """Preserve row alignment for chunks containing different agent types."""
+    keys = set().union(*(output.non_tensor_batch for output in outputs))
+    for output in outputs:
+        for key in keys - output.non_tensor_batch.keys():
+            missing = np.empty(len(output), dtype=object)
+            missing[:] = None
+            output.non_tensor_batch[key] = missing
+
+
 DEFAULT_ROUTING_CACHE_SIZE = 10000
 
 
@@ -1138,13 +1149,24 @@ class AgentLoopWorker:
         non_tensor_batch = {
             "__num_turns__": np.array([input.num_turns for input in inputs], dtype=np.int32),
         }
+        preserve_object_rows = bool(
+            getattr(self, "config", {}).get("trainer", {}).get("trajectory_replay", {}).get("enabled", False)
+        )
         if self.reward_loop_worker_handles is None and input_non_tensor_batch:
-            non_tensor_batch.update(self._expand_input_non_tensor_batch(inputs, input_non_tensor_batch))
+            non_tensor_batch.update(
+                self._expand_input_non_tensor_batch(
+                    inputs,
+                    input_non_tensor_batch,
+                    preserve_object_rows=preserve_object_rows,
+                )
+            )
         elif input_non_tensor_batch and "__rollout_row_id" in input_non_tensor_batch:
             # Trainer-side batch expansion needs this internal row map even when
             # async reward workers own the user-facing non-tensor fields.
             non_tensor_batch["__rollout_row_id"] = self._expand_input_non_tensor_batch(
-                inputs, {"__rollout_row_id": input_non_tensor_batch["__rollout_row_id"]}
+                inputs,
+                {"__rollout_row_id": input_non_tensor_batch["__rollout_row_id"]},
+                preserve_object_rows=preserve_object_rows,
             )["__rollout_row_id"]
 
         # Add reward_extra_info to non_tensor_batch. Reward functions can emit sparse
@@ -1212,6 +1234,14 @@ class AgentLoopWorker:
             "max_global_steps",
             "extras",
         }
+        if getattr(self, "config", {}).get("trainer", {}).get("trajectory_replay", {}).get("enabled", False):
+            # A worker chunk can contain only tasks or only judges. Keep their
+            # optional columns aligned before DataProto.concat combines chunks.
+            default_extra_keys.update({
+                "is_replay_judge", "replay_candidate_entries", "prompt_group_schedule",
+                "replay_judge_rewards", "replay_candidate_entry_id", "replay_judge_trace",
+                "judge_reasoning_tokens", "judge_prefill_active_tokens", "assistant_turns",
+            })
         all_keys = {
             key
             for input_item in inputs
@@ -1242,6 +1272,7 @@ class AgentLoopWorker:
     def _expand_input_non_tensor_batch(
         inputs: list[_InternalAgentLoopOutput],
         input_non_tensor_batch: dict,
+        preserve_object_rows: bool = False,
     ) -> dict[str, np.ndarray]:
         expanded = {}
         for key, values in input_non_tensor_batch.items():
@@ -1256,7 +1287,15 @@ class AgentLoopWorker:
                         f"Cannot expand non-tensor key {key!r}: missing source row for agent-loop output."
                     )
                 row_values.append(values[int(source_row)])
-            expanded[key] = np.array(row_values, dtype=getattr(values, "dtype", object))
+            dtype = getattr(values, "dtype", object)
+            if preserve_object_rows and np.dtype(dtype) == np.dtype(object):
+                # Each item may itself be a message list. np.array would turn
+                # equal-length lists into extra dimensions only in some chunks.
+                rows = np.empty(len(row_values), dtype=object)
+                rows[:] = row_values
+                expanded[key] = rows
+            else:
+                expanded[key] = np.array(row_values, dtype=dtype)
         return expanded
 
 
@@ -1480,13 +1519,20 @@ class AgentLoopManager:
                 )
             if self.stream_teacher_with_rollout:
                 await self.teacher_model_manager.sleep()
+            if getattr(self, "config", {}).get("trainer", {}).get("trajectory_replay", {}).get("enabled", False):
+                _align_replay_output_columns(outputs)
             output = DataProto.concat(outputs)
 
             # calculate performance metrics
             metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]
+            output.meta_info.pop("metrics", None)
             timing = self._performance_metrics(metrics, output)
 
-            output.meta_info = {"timing": timing, **outputs[0].meta_info}
+            if getattr(self, "config", {}).get("trainer", {}).get("trajectory_replay", {}).get("enabled", False):
+                # Preserve the reward-key union produced by DataProto.concat.
+                output.meta_info = {"timing": timing, **output.meta_info}
+            else:
+                output.meta_info = {"timing": timing, **outputs[0].meta_info}
             return output
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
