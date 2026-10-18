@@ -1,0 +1,29 @@
+dataset_path: godx7/Pinpoint-Bench
+dataset_kwargs:
+  builder_fn: !function utils.pinpoint_bench_builder
+test_split: validation
+output_type: generate_until
+doc_to_visual: !function utils.pinpoint_bench_doc_to_visual
+doc_to_text: !function utils.pinpoint_bench_doc_to_text
+doc_to_target: !function utils.pinpoint_bench_doc_to_target
+process_results: !function utils.pinpoint_bench_process_results
+
+generation_kwargs:
+  max_new_tokens: 64
+  temperature: 0
+  top_p: 1.0
+  num_beams: 1
+  do_sample: false
+
+metric_list:
+  - metric: judge_accuracy
+    aggregation: !function utils.pinpoint_bench_aggregate_judge_results
+    higher_is_better: true
+
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: "You are given an image. Search the picture to answer the question. Respond with a short, specific phrase only. "
+    post_prompt: ""
+
+metadata:
+  version: 0.0
