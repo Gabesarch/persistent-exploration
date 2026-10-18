@@ -318,11 +318,18 @@ def test_new_multi_turn_features_are_disabled_by_default():
 
 
 @pytest.mark.parametrize("async_rewards", [False, True])
-def test_mixed_worker_postprocess_manager_concat_and_trainer_union(async_rewards):
+@pytest.mark.parametrize("batch_mode", ["replace", "append"])
+def test_mixed_worker_postprocess_manager_concat_and_trainer_union(async_rewards, batch_mode):
     """Exercise real row expansion, sparse schemas, reward-key union, and strict flag dtypes."""
     config = OmegaConf.create(
         {
-            "trainer": {"trajectory_replay": {"enabled": True, "prompt_fraction": 0.5}},
+            "trainer": {
+                "trajectory_replay": {
+                    "enabled": True,
+                    "prompt_fraction": 1 / 3 if batch_mode == "append" else 0.5,
+                    "batch_mode": batch_mode,
+                }
+            },
             "actor_rollout_ref": {
                 "actor": {"policy_loss": {"retry_critic": {"enabled": False}}},
                 "rollout": {
@@ -370,17 +377,19 @@ def test_mixed_worker_postprocess_manager_concat_and_trainer_union(async_rewards
         },
     )
     batch = trainer._prepare_trajectory_replay_batch(batch, {})
-    batch.non_tensor_batch["uid"] = object_array([f"group-{i}" for i in range(4)])
+    batch.non_tensor_batch["uid"] = object_array([f"group-{i}" for i in range(len(batch))])
     gen_batch = trainer._get_gen_batch(batch).repeat(2, interleave=True)
-    gen_batch.non_tensor_batch["__rollout_row_id"] = np.arange(8)
+    gen_batch.non_tensor_batch["__rollout_row_id"] = np.arange(len(gen_batch))
     worker = object.__new__(AgentLoopWorker)
     worker.config = config
     worker.reward_loop_worker_handles = [object()] if async_rewards else None
     worker.distillation_enabled = False
     worker.stream_teacher_with_rollout = False
-    chunks = gen_batch.chunk(2)
+    task_rollouts = (4 if batch_mode == "append" else 2) * 2
+    chunks = gen_batch.chunk(len(gen_batch) // 4)
     outputs = []
-    for is_judge, chunk in zip((False, True), chunks, strict=True):
+    for chunk in chunks:
+        is_judge = bool(chunk.non_tensor_batch["is_replay_judge"][0])
         internal = []
         for row in range(len(chunk)):
             common = {
@@ -439,16 +448,19 @@ def test_mixed_worker_postprocess_manager_concat_and_trainer_union(async_rewards
             outputs[1].non_tensor_batch[key].shape,
         )
     direct = DataProto.concat(outputs)
-    assert len(direct) == 12
-    assert direct.non_tensor_batch["__rollout_row_id"].tolist() == [0, 0, 1, 1, 2, 2, 3, 3, 4, 5, 6, 7]
-    assert direct.non_tensor_batch["terminal_reason"].shape == (12,)
+    total_rows = task_rollouts * 2 + 4
+    assert len(direct) == total_rows
+    assert direct.non_tensor_batch["__rollout_row_id"].tolist() == (
+        np.repeat(np.arange(task_rollouts), 2).tolist() + list(range(task_rollouts, len(gen_batch)))
+    )
+    assert direct.non_tensor_batch["terminal_reason"].shape == (total_rows,)
     assert direct.non_tensor_batch["comprehensive_debug"].tolist()[-4:] == [None] * 4
-    assert direct.non_tensor_batch["raw_format"].tolist() == [None] * 8 + [1.0] * 4
+    assert direct.non_tensor_batch["raw_format"].tolist() == [None] * (task_rollouts * 2) + [1.0] * 4
     if not async_rewards:
         raw_prompts = direct.non_tensor_batch["raw_prompt"]
         assert raw_prompts.ndim == 1
         assert raw_prompts[0] == [{"role": "user", "content": "question 0"}]
-        assert raw_prompts[-1] == chunks[1].non_tensor_batch["raw_prompt"][-1]
+        assert raw_prompts[-1] == chunks[-1].non_tensor_batch["raw_prompt"][-1]
         assert raw_prompts[-1][1]["content"][0]["text"].startswith("Original question:\nquestion\n")
         assert raw_prompts[-1][1]["content"][-1]["text"] == "\nCandidate answer:\n\\boxed{42}"
 
@@ -471,10 +483,10 @@ def test_mixed_worker_postprocess_manager_concat_and_trainer_union(async_rewards
 
     generated = asyncio.run(generate())
     assert set(generated.meta_info["reward_extra_keys"]) == {"accuracy", "format", "tool_efficiency", "raw_format"}
-    assert generated.meta_info["timing"]["test_rows"] == 12
+    assert generated.meta_info["timing"]["test_rows"] == total_rows
     row_ids = generated.non_tensor_batch.pop("__rollout_row_id")
     trained = batch.repeat(2, interleave=True).select_idxs(row_ids).union(generated)
-    assert len(trained) == 12
-    assert trained.non_tensor_batch["is_replay_judge"].tolist() == [False] * 8 + [True] * 4
+    assert len(trained) == total_rows
+    assert trained.non_tensor_batch["is_replay_judge"].tolist() == [False] * (task_rollouts * 2) + [True] * 4
     assert trained.non_tensor_batch["is_replay_judge"].dtype == object
     assert all(len(value) == len(trained) for value in trained.non_tensor_batch.values())

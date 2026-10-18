@@ -1,13 +1,14 @@
 """GPU smoke acceptance requires measured replay updates and snapshot restore."""
 
 import json
+import re
 
 import pytest
 
 from vero2_scripts.validate_replay_critic_smoke import validate
 
 
-def _fixture(run_dir):
+def _fixture(run_dir, batch_mode="replace"):
     debug = run_dir / "debug"
     debug.mkdir()
     cache = run_dir / "checkpoint/trajectory_replay"
@@ -38,13 +39,27 @@ def _fixture(run_dir):
             )
         )
     rows = []
-    for step, prompts in enumerate((0, 4, 4, 4), 1):
+    target = 6 if batch_mode == "append" else 4
+    for step, prompts in enumerate((0, target, target, target), 1):
+        tasks = 20 if batch_mode == "append" else 20 - prompts
+        total = tasks + prompts
         row = {
             "actor/pg_loss": 0.01,
+            "replay/append_mode": int(batch_mode == "append"),
+            "replay/base_prompt_count": 20,
+            "replay/configured_prompt_fraction": 0.2,
+            "replay/prompt_target": target,
+            "replay/task_prompt_count": tasks,
+            "replay/total_prompt_count": total,
+            "replay/rollout_n": 8,
+            "replay/task_rollout_count": tasks * 8,
+            "replay/critic_rollout_count": prompts * 8,
+            "replay/total_rollout_count": total * 8,
+            "replay/prompt_fraction": prompts / total,
             "replay/prompt_count": prompts,
             "replay/accept_prompts": prompts / 2,
             "replay/reject_prompts": prompts / 2,
-            "replay/loss_share": prompts / 20,
+            "replay/loss_share": 0.2 * prompts / target,
             "replay/active_policy_tokens": prompts * 50,
             "replay/reasoning_tokens": prompts * 40,
             "replay/nonzero_advantage_tokens": prompts * 20,
@@ -115,6 +130,23 @@ def test_observed_gpu_smoke_fixture_passes(tmp_path):
     assert counts["optimizer_updates"] == counts["checkpoint_snapshots"] == 4
     assert counts["replay_updates"] == 3
     assert counts["well_formed_judge_rollouts"] == counts["well_formed_validation_judge_decisions"] == 1
+
+
+def test_append_smoke_counts_preserve_twenty_fresh_prompts_with_six_balanced_judges(tmp_path):
+    _fixture(tmp_path, batch_mode="append")
+    assert validate(tmp_path)["replay_updates"] == 3
+
+
+@pytest.mark.parametrize("batch_mode", ["replace", "append"])
+@pytest.mark.parametrize(
+    "field", ["task_prompt_count", "total_prompt_count", "task_rollout_count", "critic_rollout_count"]
+)
+def test_smoke_rejects_wrong_batch_counts(tmp_path, batch_mode, field):
+    _fixture(tmp_path, batch_mode=batch_mode)
+    path = tmp_path / "resume.log"
+    path.write_text(re.sub(rf"replay/{field}:[0-9.]+", f"replay/{field}:1", path.read_text()))
+    with pytest.raises(AssertionError):
+        validate(tmp_path)
 
 
 @pytest.mark.parametrize(

@@ -1,12 +1,14 @@
 """Exercise mixed replay preparation, branch weighting, advantages and gradients."""
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
 import torch
 from omegaconf import OmegaConf
 from PIL import Image
+from torchdata.stateful_dataloader import StatefulDataLoader
 
 from verl import DataProto
 from verl.trainer.ppo.core_algos import compute_policy_loss_gspo
@@ -19,6 +21,7 @@ from verl.trainer.ppo.trajectory_replay import (
     object_array,
     replay_prompt_target,
 )
+from verl.utils.dataset.rl_dataset import PerBatchDomainSampler
 from verl.utils.trajectory_replay import ReplayCache, persist_candidate
 from verl.workers.config.actor import ActorConfig, BranchLossStrataConfig, PolicyLossConfig
 
@@ -30,6 +33,7 @@ def trainer_config(enabled=True):
             "actor_rollout_ref": {
                 "actor": {"policy_loss": {"branch_strata": {"enabled": True}, "retry_critic": {"enabled": False}}},
                 "rollout": {
+                    "n": 8,
                     "agent": {"default_agent_loop": "tool_agent"},
                     "multi_turn": {"prompt_group_schedule_enabled": enabled},
                 },
@@ -119,6 +123,98 @@ def test_short_cache_uses_balanced_pairs_and_scales_judge_mass(tmp_path):
     assert metrics["replay/prompt_count"] == 4 and len(batch) == 128
     assert metrics["replay/accept_prompts"] == metrics["replay/reject_prompts"] == 2
     assert batch.meta_info["replay_loss_share"] == pytest.approx(0.2 * 4 / 26)
+
+
+@pytest.mark.parametrize("cache_count", [0, 2, 16])
+def test_append_preserves_every_fresh_prompt_and_only_adds_available_pairs(tmp_path, cache_count):
+    trainer = make_trainer(tmp_path, cache_count=cache_count)
+    trainer.config.trainer.trajectory_replay.batch_mode = "append"
+    original = prompt_batch()
+    metrics = {}
+    batch = trainer._prepare_trajectory_replay_batch(original, metrics)
+    critics = min(cache_count * 2, 32)
+    assert len(batch) == 128 + critics
+    for key, values in original.non_tensor_batch.items():
+        if key in {"is_replay_judge", "replay_candidate", "agent_name", "prompt_group_schedule"}:
+            continue
+        assert batch.non_tensor_batch[key][:128].tolist() == values.tolist()
+    assert batch.non_tensor_batch["index"][:128].tolist() == list(range(128))
+    assert batch.non_tensor_batch["ability"][:128].tolist() == ["chart"] * 43 + ["counting"] * 43 + ["search"] * 42
+    assert batch.non_tensor_batch["is_replay_judge"].tolist() == [False] * 128 + [True] * critics
+    assert metrics["replay/prompt_target"] == 32
+    assert metrics["replay/task_prompt_count"] == 128
+    assert metrics["replay/total_prompt_count"] == 128 + critics
+    assert metrics["replay/task_rollout_count"] == 1024
+    assert metrics["replay/critic_rollout_count"] == 8 * critics
+    assert metrics["replay/prompt_fraction"] == pytest.approx(critics / (128 + critics))
+    assert metrics["replay/loss_share"] == pytest.approx(0.2 * critics / 32)
+    assert metrics["replay/accept_prompts"] == metrics["replay/reject_prompts"] == critics // 2
+    schedules = batch.non_tensor_batch["prompt_group_schedule"]
+    assert all(schedule is not None for schedule in schedules[:128])
+    assert all(schedule is None for schedule in schedules[128:])
+    repeated = batch.repeat(8, interleave=True)
+    assert sum(~np.asarray(repeated.non_tensor_batch["is_replay_judge"], dtype=bool)) == 1024
+    assert sum(repeated.non_tensor_batch["is_replay_judge"]) == critics * 8
+    for row in range(128):
+        assert all(
+            value == schedules[row]
+            for value in repeated.non_tensor_batch["prompt_group_schedule"][row * 8 : (row + 1) * 8]
+        )
+    if critics:
+        assert len({entry["entry_id"] for entry in batch.non_tensor_batch["replay_candidate"][128:]}) == critics
+
+
+def test_append_target_uses_expanded_share_and_keeps_replacement_default():
+    assert replay_prompt_target(128, 0.2, "append") == 32
+    assert replay_prompt_target(20, 0.2, "append") == 6
+    assert replay_prompt_target(128, 0.2) == replay_prompt_target(128, 0.2, "replace") == 26
+    with pytest.raises(ValueError, match="batch_mode"):
+        replay_prompt_target(128, 0.2, "unknown")
+
+
+def test_append_resume_restores_loader_position_and_checkpoint_cache_not_newer_live_state(tmp_path):
+    domains = {name: np.arange(i * 256, (i + 1) * 256) for i, name in enumerate(("chart", "counting", "search"))}
+
+    def loader():
+        sampler = PerBatchDomainSampler(domains, {name: 1 / 3 for name in domains}, 128, 768)
+        return StatefulDataLoader(list(range(768)), batch_size=128, sampler=sampler, num_workers=0)
+
+    old_loader = loader()
+    iterator = iter(old_loader)
+    next(iterator)
+    checkpoint = tmp_path / "global_step_1"
+    checkpoint.mkdir()
+    torch.save(old_loader.state_dict(), checkpoint / "data.pt")
+    expected_next = next(iterator)
+    cache = ReplayCache(tmp_path / "trajectory_replay")
+    fill_cache(cache, count=16)
+    cache.snapshot(checkpoint)
+    cache.commit([], 2)  # A newer live manifest must not control resume.
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text("1")
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    trainer.config = trainer_config()
+    trainer.config.trainer.update(
+        {
+            "default_local_dir": str(tmp_path),
+            "default_hdfs_dir": None,
+            "resume_mode": "auto",
+            "del_local_ckpt_after_load": False,
+        }
+    )
+    trainer.config.trainer.trajectory_replay.batch_mode = "append"
+    trainer.train_dataloader = loader()
+    trainer.actor_rollout_wg = Mock()
+    trainer.trajectory_replay_cache = cache
+    trainer.use_critic = False
+    trainer._load_checkpoint()
+    assert trainer.global_steps == trainer._replay_restore_step == cache.step == 1
+    assert trainer._replay_restored_entries == 32
+    assert trainer.train_dataloader.batch_size == trainer.train_dataloader.sampler.batch_size == 128
+    assert torch.equal(next(iter(trainer.train_dataloader)), expected_next)
+    trainer.actor_rollout_wg.load_checkpoint.assert_called_once_with(
+        str(checkpoint / "actor"),
+        del_local_after_load=False,
+    )
 
 
 def test_disabled_features_leave_batch_untouched():

@@ -42,10 +42,12 @@ FORCE_TOOL_CALLS_UNTIL_FINAL_TURN="${FORCE_TOOL_CALLS_UNTIL_FINAL_TURN:-false}"
 FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS="${FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS:-false}"
 FORCE_FINAL_ANSWER_PREFIX="${FORCE_FINAL_ANSWER_PREFIX:-}"
 CRITIC_GUIDED_ANSWER_RETRY="${CRITIC_GUIDED_ANSWER_RETRY:-false}"
+CRITIC_GUIDED_ANSWER_RETRY_SOURCE="${CRITIC_GUIDED_ANSWER_RETRY_SOURCE:-policy}"
+CRITIC_GUIDED_ANSWER_RETRY_MODE="${CRITIC_GUIDED_ANSWER_RETRY_MODE:-token}"
 CRITIC_GUIDED_ANSWER_RETRY_THRESHOLD="${CRITIC_GUIDED_ANSWER_RETRY_THRESHOLD:-0.5}"
 CRITIC_GUIDED_ANSWER_RETRY_PREFILL_PROFILE="${CRITIC_GUIDED_ANSWER_RETRY_PREFILL_PROFILE:-persist}"
 DEFAULT_FORCE_FINAL_ANSWER_THINK_PREFILL="This is the final turn, so I need to answer from the evidence gathered so far."
-export FORCE_FINAL_ANSWER_THINK_PREFILL="${FORCE_FINAL_ANSWER_THINK_PREFILL:-$DEFAULT_FORCE_FINAL_ANSWER_THINK_PREFILL}"
+export FORCE_FINAL_ANSWER_THINK_PREFILL="${FORCE_FINAL_ANSWER_THINK_PREFILL-$DEFAULT_FORCE_FINAL_ANSWER_THINK_PREFILL}"
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-}"
 LIMIT="${LIMIT:-}"
 
@@ -72,7 +74,7 @@ fi
 #    Hosted API_TYPE=openai|azure judges do not manage the local policy lifecycle. The old
 #    dedicated judge server remains available explicitly with JUDGE_BACKEND=server
 #    and needs two GPUs unless policy self-judging is deliberately requested. ─────
-_JUDGE_STEMS="visual_probe simplevqa mathvista mathvision charxiv mmvetv2 mia_bench mm_mt_bench mmifeval fvqa chartmuseum"
+_JUDGE_STEMS="visual_probe pinpoint_bench simplevqa mathvista mathvision charxiv mmvetv2 mia_bench mm_mt_bench mmifeval fvqa chartmuseum"
 RUN_HAS_JUDGE=0
 MANAGE_VLLM_SERVER_LIFECYCLE=false
 for _t in ${TASKS//,/ }; do
@@ -153,9 +155,29 @@ fi
 case "${CRITIC_GUIDED_ANSWER_RETRY,,}" in
   1|true|yes|on)
     MODEL_ARGS="${MODEL_ARGS},critic_guided_answer_retry=true"
+    MODEL_ARGS="${MODEL_ARGS},critic_guided_answer_retry_source=${CRITIC_GUIDED_ANSWER_RETRY_SOURCE}"
+    MODEL_ARGS="${MODEL_ARGS},critic_guided_answer_retry_mode=${CRITIC_GUIDED_ANSWER_RETRY_MODE}"
     MODEL_ARGS="${MODEL_ARGS},critic_guided_answer_retry_threshold=${CRITIC_GUIDED_ANSWER_RETRY_THRESHOLD}"
     MODEL_ARGS="${MODEL_ARGS},critic_guided_answer_retry_prefill_profile=${CRITIC_GUIDED_ANSWER_RETRY_PREFILL_PROFILE}"
+    if [[ "$CRITIC_GUIDED_ANSWER_RETRY_MODE" == reasoning ]]; then
+      MODEL_ARGS="${MODEL_ARGS},critic_guided_answer_retry_temperature=${REPLAY_CRITIC_TEMPERATURE:-0}"
+      MODEL_ARGS="${MODEL_ARGS},critic_guided_answer_retry_top_k=${REPLAY_CRITIC_TOP_K:--1}"
+      MODEL_ARGS="${MODEL_ARGS},critic_guided_answer_retry_top_p=${REPLAY_CRITIC_TOP_P:-1}"
+    fi
     ;;
+esac
+
+if [[ "${FIRST_CANDIDATE_ANSWER_TURN:-0}" != 0 ]]; then
+  MODEL_ARGS="${MODEL_ARGS},first_candidate_answer_turn=${FIRST_CANDIDATE_ANSWER_TURN}"
+fi
+case "${ALWAYS_RETRY_ANSWERS:-false}" in
+  1|true|yes|on) MODEL_ARGS="${MODEL_ARGS},always_retry_answers=true" ;;
+esac
+if [[ "${FOLLOWUP_CANDIDATE_ANSWER_TURN:-0}" != 0 ]]; then
+  MODEL_ARGS="${MODEL_ARGS},followup_candidate_answer_turn=${FOLLOWUP_CANDIDATE_ANSWER_TURN}"
+fi
+case "${RECORD_ANSWER_CANDIDATES:-false}" in
+  1|true|yes|on) MODEL_ARGS="${MODEL_ARGS},record_answer_candidates=true" ;;
 esac
 
 echo "Tasks:      $TASKS"
@@ -164,7 +186,14 @@ echo "Model args: $MODEL_ARGS"
 echo "Final think prefill: ${FORCE_FINAL_ANSWER_THINK_PREFILL:-<empty>}"
 echo "Critic retry: enabled=$CRITIC_GUIDED_ANSWER_RETRY threshold=$CRITIC_GUIDED_ANSWER_RETRY_THRESHOLD prefill_profile=$CRITIC_GUIDED_ANSWER_RETRY_PREFILL_PROFILE"
 echo "Critic domain thresholds: ${VERO_EVAL_CRITIC_DOMAIN_THRESHOLDS:-<none; using fallback>}"
+echo "First candidate deadline: ${FIRST_CANDIDATE_ANSWER_TURN:-0} (0=disabled); record candidates: ${RECORD_ANSWER_CANDIDATES:-false}"
 echo ""
+
+# Retain these maxcalls reruns before judging so a judge crash does not
+# require another policy-generation pass. Other evaluations remain opt-in.
+if [[ "${CHECKPOINT_PATH:-}" == *branchstrata20_fresh_lr1e5_critic_maxcalls* ]]; then
+  export LMMS_EVAL_SAVE_PREJUDGE_SAMPLES="${LMMS_EVAL_SAVE_PREJUDGE_SAMPLES:-true}"
+fi
 
 python -m lmms_eval \
     --model async_openai \

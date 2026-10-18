@@ -34,6 +34,19 @@ def _metric_rows(path):
     return rows
 
 
+def _expected_layout(row):
+    # Older replacement-mode smoke logs predate explicit batch-layout metrics.
+    base = row.get("replay/base_prompt_count", 20)
+    fraction = row.get("replay/configured_prompt_fraction", 0.2)
+    append = row.get("replay/append_mode", 0)
+    assert base > 0 and base == int(base) and 0 <= fraction < 1 and append in (0, 1)
+    expected = base * fraction / (1 - fraction) if append else base * fraction
+    target = 2 * math.floor(expected / 2 + 0.5)
+    if not append:
+        target = min(target, 2 * ((int(base) - 1) // 2))
+    return base, fraction, append, target
+
+
 def _validate_update(row):
     for key in (
         "replay/prompt_count",
@@ -52,9 +65,24 @@ def _validate_update(row):
     count = row["replay/prompt_count"]
     assert count == row["replay/accept_prompts"] + row["replay/reject_prompts"]
     assert row["replay/accept_prompts"] == row["replay/reject_prompts"], "replay classes are unbalanced"
-    assert math.isclose(row["replay/loss_share"], count / 20, abs_tol=1e-6), (
-        "judge objective share differs from realized prompt fraction"
+    base, fraction, append, target = _expected_layout(row)
+    assert 0 <= count <= target and count == int(count)
+    expected_share = fraction * count / target if target else 0
+    assert math.isclose(row["replay/loss_share"], expected_share, abs_tol=1e-6), (
+        "judge objective share differs from configured share scaled by available balanced pairs"
     )
+    if "replay/base_prompt_count" in row:
+        tasks = base if append else base - count
+        total = tasks + count
+        n = row["replay/rollout_n"]
+        assert n == 8, "smoke must sample eight rollouts per prompt"
+        assert row["replay/prompt_target"] == target
+        assert row["replay/task_prompt_count"] == tasks, "fresh task prompt count changed"
+        assert row["replay/total_prompt_count"] == total
+        assert math.isclose(row["replay/prompt_fraction"], count / total, abs_tol=1e-6)
+        assert row["replay/task_rollout_count"] == tasks * n
+        assert row["replay/critic_rollout_count"] == count * n
+        assert row["replay/total_rollout_count"] == total * n
     if count:
         assert row["replay/active_policy_tokens"] > 0, "judge response has no active policy tokens"
         assert row["replay/reasoning_tokens"] > 0, "judge thinking has no active policy tokens"
@@ -74,7 +102,9 @@ def validate(run_dir):
         counts["replay_updates_with_nonzero_advantages"] += int(row["replay/nonzero_advantage_tokens"] > 0)
     assert counts["optimizer_updates"] == 4, "smoke must run three fresh steps and one resumed step"
     assert counts["replay_updates_with_nonzero_advantages"], "no judge update has advantage-bearing policy tokens"
-    assert any(row["replay/prompt_count"] == 4 for row in initial), "no full balanced replay-bearing initial update"
+    assert any(
+        row["replay/prompt_count"] == _expected_layout(row)[3] > 0 for row in initial
+    ), "no full balanced replay-bearing initial update"
     assert resumed[0].get("replay/cache_restore_step") == 3, "resume did not restore the selected step-3 cache"
     assert resumed[0].get("replay/restored_entries", 0) > 0, "resume restored an empty cache"
     assert resumed[0]["replay/prompt_count"] > 0, "resumed update did not sample restored replay"

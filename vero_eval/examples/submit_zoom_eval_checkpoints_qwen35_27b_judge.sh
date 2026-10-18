@@ -22,6 +22,11 @@
 #   FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS=true bash ...  # force one final <answer> call at tool cap
 #   EVAL_NAME=branchstrata20_fresh_lr1e5_critic \
 #     CRITIC_GUIDED_ANSWER_RETRY_THRESHOLD=0.5 ONLY_EVAL_GLOBAL_STEPS=10,20 bash ...
+#   Candidate schedule v1 defaults to first candidate by turn 5, global critic
+#   threshold 0.5, and recorded candidate answers. FIRST_CANDIDATE_ANSWER_TURN=0
+#   restores natural timing; an explicit critic threshold overrides 0.5.
+#   Completed candidate checkpoints in the previous timing's output directory
+#   are also skipped. Use SKIP_IF_EXISTS=false for an intentional reevaluation.
 #   SKIP_IF_EXISTS=false SKIP_IF_QUEUED=false DRY_RUN=1 bash ...
 set -euo pipefail
 
@@ -56,7 +61,6 @@ RUN_SYSTEM_PROMPT_MODE_EXPLICIT="${RUN_SYSTEM_PROMPT_MODE+x}"
 RUN_SYSTEM_PROMPT_MODE="${RUN_SYSTEM_PROMPT_MODE:-task_metadata}"  # task_metadata|run_env|none
 
 MAX_IMAGE_PIXELS="${MAX_IMAGE_PIXELS:-10000000}"
-MAX_TOOL_IMAGES="${MAX_TOOL_IMAGES:-10}"
 export WORKERS="${WORKERS:-10}"
 ACCELERATE_PORT_BASE="${ACCELERATE_PORT_BASE:-12346}"
 POLICY_PORT_BASE="${POLICY_PORT_BASE:-10001}"
@@ -80,12 +84,15 @@ DEFAULT_FORCE_FINAL_ANSWER_THINK_PREFILL="This is the final turn, so I need to a
 FORCE_FINAL_ANSWER_THINK_PREFILL="${FORCE_FINAL_ANSWER_THINK_PREFILL:-$DEFAULT_FORCE_FINAL_ANSWER_THINK_PREFILL}"
 CRITIC_GUIDED_ANSWER_RETRY_EXPLICIT="${CRITIC_GUIDED_ANSWER_RETRY+x}"
 CRITIC_GUIDED_ANSWER_RETRY="${CRITIC_GUIDED_ANSWER_RETRY:-false}"
+CRITIC_GUIDED_ANSWER_RETRY_SOURCE="${CRITIC_GUIDED_ANSWER_RETRY_SOURCE:-policy}"
+JUDGE_BACKEND="${JUDGE_BACKEND:-engine}"
 CRITIC_GUIDED_ANSWER_RETRY_THRESHOLD="${CRITIC_GUIDED_ANSWER_RETRY_THRESHOLD:-0.5}"
 VLLM_JUDGE_MODEL_PATH="${VLLM_JUDGE_MODEL_PATH:-/scratch/gpfs/ZHUANGL/gs1693/hf_cache/Qwen/Qwen3.5-27B}"
 VLLM_JUDGE_CHAT_TEMPLATE="${VLLM_JUDGE_CHAT_TEMPLATE:-$VLLM_JUDGE_MODEL_PATH/chat_template_no_think.jinja}"
-# Export this through sbatch so the parent evaluator and its in-process judge
-# both avoid FlashInfer's node-local CUDA JIT dependency.
+# Sampling and GDN attention have separate FlashInfer controls.
 VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
+VLLM_JUDGE_ENFORCE_EAGER="${VLLM_JUDGE_ENFORCE_EAGER:-true}"
+VLLM_JUDGE_GDN_PREFILL_BACKEND="${VLLM_JUDGE_GDN_PREFILL_BACKEND:-triton}"
 
 TRAINING_SYSTEM_PROMPT_CHATTING_TOOL_CALLING="/home/gs1693/repo/vero2/vero2_scripts/prompts/system_prompt_chatting_tool_calling.txt"
 TRAINING_SYSTEM_PROMPT_QWEN3_XML="$VERO_EVAL_DIR/prompts/tools/system_vero_reasoning_qwen3_xml.txt"
@@ -95,9 +102,11 @@ TRAINING_SYSTEM_PROMPT_QWEN3_XML="$VERO_EVAL_DIR/prompts/tools/system_vero_reaso
 declare -A TRAIN_DIR_BY_EVAL_NAME=(
   # Standalone downloaded checkpoints; paths are model directories, not run roots.
   [qwen35_vero2_step200]="/scratch/gpfs/ZHUANGL/yz5121/vero-home/vero2-ablations/qwen3.5-vero2at200step"
-  [minio3_vero2_step100]="/scratch/gpfs/ZHUANGL/yz5121/vero-home/vero2-ablations/minio3-vero2at100step"
-  # R3L continuation array 14728996 (tasks share this output root; save_freq=40).
-  [opmd_r3l_visual_probe_14728996]="/scratch/gpfs/ZHUANGL/gs1693/vero2_r3l/checkpoints/vero2_verl/opmd_r3l_qwen3vl_visual_probe_cropzoom_14728996"
+  # Repaired local metadata: Qwen3-VL-8B config/tokenizer and JSON/Hermes template.
+  [minio3_vero2_step100]="/scratch/gpfs/ZHUANGL/gs1693/vero2/checkpoints/standalone_eval_20261007/minio3-vero2at100step"
+  [fixjson_vero2_step200]="/scratch/gpfs/ZHUANGL/yz5121/vero-home/vero2-ablations/22_5_fixjson-step_200"
+  # Step-200 shard links plus verified Qwen3-VL metadata; merge in our own directory.
+  [minio3_vero2_step200]="/scratch/gpfs/ZHUANGL/gs1693/vero2/checkpoints/standalone_eval_20261017/minio3-vero2-ckpt-step200"
   # Continuation arrays 14444045 and 14446126; tasks 1-10 share each root.
   [gdpo_fresh_lr1e5_noexplore]="/scratch/gpfs/ZHUANGL/gs1693/vero2/checkpoints/vero2_verl/gdpo_fresh_lr1e5_noexplore_20260925"
   [gdpo_fresh_lr1e5_noexplore_accformat]="/scratch/gpfs/ZHUANGL/gs1693/vero2/checkpoints/vero2_verl/gdpo_fresh_lr1e5_noexplore_accformat_20260925"
@@ -122,8 +131,13 @@ declare -A TRAIN_DIR_BY_EVAL_NAME=(
   # Training continuation array 14651867; fresh updates after original step 80.
   [branchstrata20_fresh_lr1e5_restart_step80]="/scratch/gpfs/ZHUANGL/gs1693/vero2/checkpoints/vero2_verl/branchstrata20_fresh_lr1e5_restart_step80_20260928"
   [branchstrata20_fresh_lr1e5_critic]="/scratch/gpfs/ZHUANGL/gs1693/vero2/checkpoints/vero2_verl/branchstrata20_fresh_lr1e5_critic_20260810"
+  # Continuation arrays 14777121 (5 tool rounds) and 14777129 (20 tool rounds).
+  [branchstrata20_fresh_lr1e5_critic_maxcalls5]="/scratch/gpfs/ZHUANGL/gs1693/vero2/checkpoints/vero2_verl/branchstrata20_fresh_lr1e5_critic_maxcalls5_20260930"
+  [branchstrata20_fresh_lr1e5_critic_maxcalls20]="/scratch/gpfs/ZHUANGL/gs1693/vero2/checkpoints/vero2_verl/branchstrata20_fresh_lr1e5_critic_maxcalls20_20260930"
   # Training continuation array 14785215; tasks share this checkpoint root.
   [branchstrata20_fresh_lr1e5_critic_candidate_schedule_v1]="/scratch/gpfs/ZHUANGL/gs1693/vero2/checkpoints/vero2_verl/branchstrata20_fresh_lr1e5_critic_candidate_schedule_v1_20260930"
+  # Array 15328860, including its append-batch continuation; one shared run.
+  [branchstrata20_fresh_lr1e5_critic_replay_schedule_v1]="/scratch/gpfs/ZHUANGL/gs1693/vero2/checkpoints/vero2_verl/branchstrata20_fresh_lr1e5_critic_replay_schedule_v1_20261010"
   # Training SLURM continuation array 12794189 (tasks 1-10 share this directory).
   [branchstrata20_fresh_prefixremoved_gspo_lr1e5_critic]="/scratch/gpfs/ZHUANGL/gs1693/vero2/checkpoints/vero2_verl/branchstrata20_fresh_prefixremoved_gspo_lr1e5_critic_20260810"
   # Training SLURM array 12095042.
@@ -141,20 +155,20 @@ declare -A TRAIN_DIR_BY_EVAL_NAME=(
 # It equals prompts/tools/system_vero_reasoning.txt (task_metadata mode):
 # 2980 UTF-8 bytes; SHA-256 c86c158cbbbc751309b1f20671c457dd59a3d887a69d9eb552d2394a544431c6.
 # Both GDPO runs disable critic retries; retain the comparison evaluation protocol.
-# R3L audit 2026-09-30: all 2042 train and 284 validation records omit
-# system messages. vero2_r3l's prompt equals the file below and task_metadata
-# verbatim (2980 bytes; same SHA-256 above). R3L retries are training-only;
-# use the standard comparison protocol (10 tools, forced final, no critic retry).
 # Restart-step80 audit: all 2042 train and 515 validation records omit system
 # messages; the same 2980-byte prompt/hash above is inserted verbatim. Answer
 # retries are training-only; retain the standard comparison evaluation policy.
 # Candidate-schedule audit: all 2042 train and 515 validation records omit
 # system messages; the same prompt bytes/hash above apply. Candidate deadlines
 # are training-only. Validation uses learned critic retries with persist prefill.
+# Replay audit: the same 2042/515 records and 2980-byte solver prompt apply.
+# The dedicated judge prompt has 1174 UTF-8 bytes; SHA-256
+# a0d2a2024d5bbc61189f0570bc7f53c790c88c57384984bdfa713aa08efe699e.
 declare -A SYSTEM_PROMPT_BY_EVAL_NAME=(
   [qwen35_vero2_step200]="$TRAINING_SYSTEM_PROMPT_QWEN3_XML"
   [minio3_vero2_step100]="$TRAINING_SYSTEM_PROMPT_CHATTING_TOOL_CALLING"
-  [opmd_r3l_visual_probe_14728996]="$TRAINING_SYSTEM_PROMPT_CHATTING_TOOL_CALLING"
+  [fixjson_vero2_step200]="$TRAINING_SYSTEM_PROMPT_CHATTING_TOOL_CALLING"
+  [minio3_vero2_step200]="$TRAINING_SYSTEM_PROMPT_CHATTING_TOOL_CALLING"
   [gdpo_fresh_lr1e5_noexplore]="$TRAINING_SYSTEM_PROMPT_CHATTING_TOOL_CALLING"
   [gdpo_fresh_lr1e5_noexplore_accformat]="$TRAINING_SYSTEM_PROMPT_CHATTING_TOOL_CALLING"
   [answer_retry_branch_donly_llmjudge_forcedprefill]="$TRAINING_SYSTEM_PROMPT_CHATTING_TOOL_CALLING"
@@ -172,7 +186,10 @@ declare -A SYSTEM_PROMPT_BY_EVAL_NAME=(
   [branchstrata20_fresh_lr1e5]="$TRAINING_SYSTEM_PROMPT_CHATTING_TOOL_CALLING"
   [branchstrata20_fresh_lr1e5_restart_step80]="$TRAINING_SYSTEM_PROMPT_CHATTING_TOOL_CALLING"
   [branchstrata20_fresh_lr1e5_critic]="$TRAINING_SYSTEM_PROMPT_CHATTING_TOOL_CALLING"
+  [branchstrata20_fresh_lr1e5_critic_maxcalls5]="$TRAINING_SYSTEM_PROMPT_CHATTING_TOOL_CALLING"
+  [branchstrata20_fresh_lr1e5_critic_maxcalls20]="$TRAINING_SYSTEM_PROMPT_CHATTING_TOOL_CALLING"
   [branchstrata20_fresh_lr1e5_critic_candidate_schedule_v1]="$TRAINING_SYSTEM_PROMPT_CHATTING_TOOL_CALLING"
+  [branchstrata20_fresh_lr1e5_critic_replay_schedule_v1]="$TRAINING_SYSTEM_PROMPT_CHATTING_TOOL_CALLING"
   [branchstrata20_fresh_prefixremoved_gspo_lr1e5_critic]="$TRAINING_SYSTEM_PROMPT_CHATTING_TOOL_CALLING"
   [branchstrata30_fresh]="$TRAINING_SYSTEM_PROMPT_CHATTING_TOOL_CALLING"
   [branchstrata10_fresh]="$TRAINING_SYSTEM_PROMPT_CHATTING_TOOL_CALLING"
@@ -182,23 +199,40 @@ declare -A SYSTEM_PROMPT_BY_EVAL_NAME=(
 )
 
 declare -A EVAL_NAMES_BY_GROUP=(
-  [branch_comparison]="qwen35_vero2_step200 minio3_vero2_step100 opmd_r3l_visual_probe_14728996 gdpo_fresh_lr1e5_noexplore gdpo_fresh_lr1e5_noexplore_accformat hardonly_llmjudge hardonly_llmjudge_lr5e6 branchstrata20 branchstrata20_unmaskedprefill answer_retry_branch_donly_llmjudge_forcedprefill branchstrata20_restart20 branchstrata20_unmasked_restart20 branchstrata20_base_noforceanswer branchstrata20_base_noforceanswer_unmaskedprefill teacheronly_retry_sft05_forceanswer teacheronly_retry_sft05 branchstrata20_fresh branchstrata20_fresh_prefixremoved_gspo branchstrata20_fresh_randomturncap_p05_x5_q075 branchstrata20_fresh_lr1e5 branchstrata20_fresh_lr1e5_restart_step80 branchstrata20_fresh_lr1e5_critic branchstrata20_fresh_lr1e5_critic_candidate_schedule_v1 branchstrata20_fresh_prefixremoved_gspo_lr1e5_critic branchstrata30_fresh branchstrata10_fresh branchstrata20_fresh_clip0005_0007"
+  [branch_comparison]="qwen35_vero2_step200 minio3_vero2_step100 gdpo_fresh_lr1e5_noexplore gdpo_fresh_lr1e5_noexplore_accformat hardonly_llmjudge hardonly_llmjudge_lr5e6 branchstrata20 branchstrata20_unmaskedprefill answer_retry_branch_donly_llmjudge_forcedprefill branchstrata20_restart20 branchstrata20_unmasked_restart20 branchstrata20_base_noforceanswer branchstrata20_base_noforceanswer_unmaskedprefill teacheronly_retry_sft05_forceanswer teacheronly_retry_sft05 branchstrata20_fresh branchstrata20_fresh_prefixremoved_gspo branchstrata20_fresh_randomturncap_p05_x5_q075 branchstrata20_fresh_lr1e5 branchstrata20_fresh_lr1e5_restart_step80 branchstrata20_fresh_lr1e5_critic branchstrata20_fresh_lr1e5_critic_candidate_schedule_v1 branchstrata20_fresh_prefixremoved_gspo_lr1e5_critic branchstrata30_fresh branchstrata10_fresh branchstrata20_fresh_clip0005_0007"
 )
+EVAL_NAMES_BY_GROUP[branch_comparison]+=" branchstrata20_fresh_lr1e5_critic_maxcalls5 branchstrata20_fresh_lr1e5_critic_maxcalls20"
+EVAL_NAMES_BY_GROUP[branch_comparison]+=" branchstrata20_fresh_lr1e5_critic_replay_schedule_v1"
+EVAL_NAMES_BY_GROUP[branch_comparison]+=" fixjson_vero2_step200 minio3_vero2_step200"
 
 # Single model directories get numbered output identities for filters, dedup and plots.
 declare -A SINGLE_CHECKPOINT_STEP_BY_EVAL_NAME=(
   [qwen35_vero2_step200]=200
   [minio3_vero2_step100]=100
+  [fixjson_vero2_step200]=200
+  [minio3_vero2_step200]=200
 )
 declare -A RUN_SYSTEM_PROMPT_MODE_BY_EVAL_NAME=(
   # Replace the task's JSON prompt, rather than appending an incompatible fragment.
   [qwen35_vero2_step200]=run_env
+  # Exact JSON training prompt, including its trailing newline; no task fragments.
+  [fixjson_vero2_step200]=run_env
+  [minio3_vero2_step200]=run_env
+  # Use the training file verbatim, independent of a benchmark's prompt fragments.
+  [branchstrata20_fresh_lr1e5_critic_maxcalls5]=run_env
+  [branchstrata20_fresh_lr1e5_critic_maxcalls20]=run_env
+  [branchstrata20_fresh_lr1e5_critic_replay_schedule_v1]=run_env
 )
 declare -A TOOL_CALL_PARSER_BY_EVAL_NAME=(
   [qwen35_vero2_step200]=qwen3_coder
+  [fixjson_vero2_step200]=hermes
+  [minio3_vero2_step200]=hermes
 )
 declare -A CHAT_TEMPLATE_BY_EVAL_NAME=(
   [qwen35_vero2_step200]="$VERO_EVAL_DIR/prompts/vero_qwen3_xml.jinja"
+  # Identical to the exported fixjson and mini-o3 step-164 templates (990af54b...).
+  [fixjson_vero2_step200]="$VERO_EVAL_DIR/prompts/vero_json_step200.jinja"
+  [minio3_vero2_step200]="$VERO_EVAL_DIR/prompts/vero_json_step200.jinja"
 )
 if [[ -z "$RUN_SYSTEM_PROMPT_MODE_EXPLICIT" ]]; then
   RUN_SYSTEM_PROMPT_MODE="${RUN_SYSTEM_PROMPT_MODE_BY_EVAL_NAME[$EVAL_NAME]:-$RUN_SYSTEM_PROMPT_MODE}"
@@ -243,7 +277,10 @@ PY
 
 declare -A CRITIC_RETRY_PROFILE_BY_EVAL_NAME=(
   [branchstrata20_fresh_lr1e5_critic]="persist"
+  [branchstrata20_fresh_lr1e5_critic_maxcalls5]="persist"
+  [branchstrata20_fresh_lr1e5_critic_maxcalls20]="persist"
   [branchstrata20_fresh_lr1e5_critic_candidate_schedule_v1]="persist"
+  [branchstrata20_fresh_lr1e5_critic_replay_schedule_v1]="persist"
   [branchstrata20_fresh_prefixremoved_gspo_lr1e5_critic]="teacher_only"
 )
 
@@ -255,6 +292,10 @@ if [[ -z "$CRITIC_GUIDED_ANSWER_RETRY_EXPLICIT" && -n "$CRITIC_GUIDED_ANSWER_RET
 fi
 
 CRITIC_RETRY_ENABLED=false
+case "$CRITIC_GUIDED_ANSWER_RETRY_SOURCE" in
+  policy|ground_truth) ;;
+  *) echo "ERROR: critic source must be policy or ground_truth." >&2; exit 1 ;;
+esac
 case "${CRITIC_GUIDED_ANSWER_RETRY,,}" in
   1|true|yes|on) CRITIC_RETRY_ENABLED=true ;;
   0|false|no|off) ;;
@@ -372,6 +413,41 @@ if [[ "$EVAL_NAME" == "all" ]]; then
   exit 0
 fi
 
+# Resolve per-run defaults only in leaf invocations, so a group does not pass
+# one member's timing policy to the other members. Explicit values still win.
+declare -A MAX_TOOL_ITERATIONS_BY_EVAL_NAME=(
+  # Training allows N tool rounds and N+1 assistant turns (including the answer).
+  [branchstrata20_fresh_lr1e5_critic_maxcalls5]=5
+  [branchstrata20_fresh_lr1e5_critic_maxcalls20]=20
+)
+MAX_TOOL_ITERATIONS="${MAX_TOOL_ITERATIONS:-${MAX_TOOL_ITERATIONS_BY_EVAL_NAME[$EVAL_NAME]:-10}}"
+# Every zoom returns an image; a lower image cap would truncate the 20-round run.
+MAX_TOOL_IMAGES="${MAX_TOOL_IMAGES:-${MAX_TOOL_ITERATIONS_BY_EVAL_NAME[$EVAL_NAME]:-10}}"
+if [[ "$EVAL_NAME" == branchstrata20_fresh_lr1e5_critic_candidate_schedule_v1 ]]; then
+  FIRST_CANDIDATE_ANSWER_TURN="${FIRST_CANDIDATE_ANSWER_TURN:-5}"
+  RECORD_ANSWER_CANDIDATES="${RECORD_ANSWER_CANDIDATES:-true}"
+else
+  FIRST_CANDIDATE_ANSWER_TURN="${FIRST_CANDIDATE_ANSWER_TURN:-0}"
+  RECORD_ANSWER_CANDIDATES="${RECORD_ANSWER_CANDIDATES:-false}"
+fi
+
+# Replay deadlines are training-only. Validation generates a full reasoning
+# critic response over sanitized evidence, using the exact training recipe.
+if [[ "$EVAL_NAME" == branchstrata20_fresh_lr1e5_critic_replay_schedule_v1 ]]; then
+  CRITIC_GUIDED_ANSWER_RETRY_MODE="${CRITIC_GUIDED_ANSWER_RETRY_MODE:-reasoning}"
+  REPLAY_CRITIC_SYSTEM_PROMPT="${REPLAY_CRITIC_SYSTEM_PROMPT:-$VERO_EVAL_DIR/../vero2_scripts/prompts/reasoning_replay_critic.txt}"
+  VERO_TRAINING_CONFIG="${VERO_TRAINING_CONFIG:-$VERO_EVAL_DIR/../vero2_scripts/config/branchstrata20_fresh_lr1e5_critic_replay_schedule_v1.yaml}"
+  REPLAY_CRITIC_TEMPERATURE="${REPLAY_CRITIC_TEMPERATURE:-0.6}"
+  REPLAY_CRITIC_TOP_K="${REPLAY_CRITIC_TOP_K:-20}"
+  REPLAY_CRITIC_TOP_P="${REPLAY_CRITIC_TOP_P:-0.95}"
+else
+  CRITIC_GUIDED_ANSWER_RETRY_MODE="${CRITIC_GUIDED_ANSWER_RETRY_MODE:-token}"
+fi
+case "$CRITIC_GUIDED_ANSWER_RETRY_MODE" in
+  token|reasoning) ;;
+  *) echo "ERROR: critic mode must be token or reasoning." >&2; exit 1 ;;
+esac
+
 declare -A TASKS_BY_TASK_GROUP=(
   [visual_probe]="visual_probe_easy_reasoning_zoom,visual_probe_medium_reasoning_zoom,visual_probe_hard_reasoning_zoom"
   [visual_probe_hstar_pinpoint]="visual_probe_easy_reasoning_zoom,visual_probe_medium_reasoning_zoom,visual_probe_hard_reasoning_zoom,hstarbench_mixed_reasoning_zoom,pinpoint_bench_reasoning_zoom,screenspotpro_point_in_box_reasoning_zoom"
@@ -418,7 +494,35 @@ if [[ "$CRITIC_RETRY_ENABLED" == true ]]; then
   CRITIC_THRESHOLD_TAG="${CRITIC_GUIDED_ANSWER_RETRY_THRESHOLD//./p}"
   CRITIC_THRESHOLD_TAG="${CRITIC_THRESHOLD_TAG//[^A-Za-z0-9]/_}"
   CRITIC_RETRY_JOB_TAG="critic_retry_thr${CRITIC_THRESHOLD_TAG}"
+  if [[ "$CRITIC_GUIDED_ANSWER_RETRY_MODE" == reasoning ]]; then
+    CRITIC_RETRY_JOB_TAG="reasoning_critic"
+  fi
+  if [[ "$CRITIC_GUIDED_ANSWER_RETRY_SOURCE" == ground_truth ]]; then
+    CRITIC_RETRY_JOB_TAG="gt_critic"
+  fi
   OUTPUT_ROOT="${OUTPUT_ROOT}_${CRITIC_RETRY_JOB_TAG}"
+fi
+LEGACY_CANDIDATE_OUTPUT_ROOT=""
+LEGACY_CANDIDATE_JOB_TAG=""
+FOLLOWUP_CANDIDATE_ANSWER_TURN="${FOLLOWUP_CANDIDATE_ANSWER_TURN:-0}"
+if [[ "$FIRST_CANDIDATE_ANSWER_TURN" != 0 ]]; then
+  if [[ "$EVAL_NAME" == branchstrata20_fresh_lr1e5_critic_candidate_schedule_v1 ]]; then
+    LEGACY_CANDIDATE_OUTPUT_ROOT="$OUTPUT_ROOT"
+    LEGACY_CANDIDATE_JOB_TAG="$CRITIC_RETRY_JOB_TAG"
+  fi
+  FIRST_CANDIDATE_JOB_TAG="first_candidate_turn${FIRST_CANDIDATE_ANSWER_TURN}"
+  OUTPUT_ROOT="${OUTPUT_ROOT}_${FIRST_CANDIDATE_JOB_TAG}"
+  CRITIC_RETRY_JOB_TAG="${CRITIC_RETRY_JOB_TAG:+${CRITIC_RETRY_JOB_TAG}_}turn${FIRST_CANDIDATE_ANSWER_TURN}"
+fi
+if [[ "$FOLLOWUP_CANDIDATE_ANSWER_TURN" != 0 ]]; then
+  if [[ "$FIRST_CANDIDATE_ANSWER_TURN" -lt 2 || "$FOLLOWUP_CANDIDATE_ANSWER_TURN" -le "$FIRST_CANDIDATE_ANSWER_TURN" || "$FOLLOWUP_CANDIDATE_ANSWER_TURN" -gt "$MAX_TOOL_ITERATIONS" ]]; then
+    echo "ERROR: followup candidate turn requires 2 <= first < followup <= max_tool_iterations." >&2
+    exit 1
+  fi
+  OUTPUT_ROOT="${OUTPUT_ROOT}_followup_turn${FOLLOWUP_CANDIDATE_ANSWER_TURN}"
+  CRITIC_RETRY_JOB_TAG="${CRITIC_RETRY_JOB_TAG}_followup${FOLLOWUP_CANDIDATE_ANSWER_TURN}"
+  LEGACY_CANDIDATE_OUTPUT_ROOT=""
+  LEGACY_CANDIDATE_JOB_TAG=""
 fi
 
 case "${EVAL_PROFILE,,}" in
@@ -470,6 +574,21 @@ case "${EVAL_PROFILE,,}" in
     exit 1
     ;;
 esac
+# Preserve recent-model sampling and controller settings; only pin the tool
+# schema after the profile has selected its tasks (including the debug task).
+# Mini-o3's saved validation prompt has no bbox items/length constraints.
+if [[ -z "$TASKS_EXPLICIT" && "$TASK_GROUP" == visual_probe ]]; then
+  case "$EVAL_NAME" in
+    fixjson_vero2_step200) TASKS="${TASKS//reasoning_zoom/reasoning_zoom_fixjson_step200}" ;;
+    minio3_vero2_step200) TASKS="${TASKS//reasoning_zoom/reasoning_zoom_minio3_step200}" ;;
+  esac
+fi
+if [[ "$CRITIC_GUIDED_ANSWER_RETRY_SOURCE" == ground_truth ]]; then
+  if [[ "$CRITIC_RETRY_ENABLED" != true || "$JUDGE_BACKEND" != server || "$NUM_GPUS" -lt 2 ]]; then
+    echo "ERROR: ground_truth critic requires retry=true, JUDGE_BACKEND=server and NUM_GPUS>=2." >&2
+    exit 1
+  fi
+fi
 SBATCH_OPTS_RAW="${SBATCH_OPTS:-}"
 SBATCH_OPTS=()
 if [[ -n "$SBATCH_OPTS_RAW" ]]; then
@@ -573,6 +692,21 @@ validate_port() {
 validate_positive_int_or_empty MAX_CHECKPOINTS "$MAX_CHECKPOINTS"
 validate_positive_int_or_empty MAX_STEPS_EVAL "$MAX_STEPS_EVAL"
 validate_positive_int_or_empty ONLY_EVAL_EVERY_X "$ONLY_EVAL_EVERY_X"
+validate_positive_int_or_empty MAX_TOOL_ITERATIONS "$MAX_TOOL_ITERATIONS"
+if [[ ! "$FIRST_CANDIDATE_ANSWER_TURN" =~ ^(0|[1-9][0-9]*)$ ]] || \
+   [[ "$FIRST_CANDIDATE_ANSWER_TURN" != 0 && \
+      ( "$FIRST_CANDIDATE_ANSWER_TURN" -lt 2 || "$FIRST_CANDIDATE_ANSWER_TURN" -gt "$MAX_TOOL_ITERATIONS" ) ]]; then
+  echo "ERROR: FIRST_CANDIDATE_ANSWER_TURN must be 0 (disabled) or an integer between 2 and MAX_TOOL_ITERATIONS." >&2
+  exit 1
+fi
+if [[ "$FIRST_CANDIDATE_ANSWER_TURN" != 0 ]]; then
+  case "${FORCE_TOOL_CALLS_UNTIL_FINAL_TURN:-false}" in
+    1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn])
+      echo "ERROR: FIRST_CANDIDATE_ANSWER_TURN requires FORCE_TOOL_CALLS_UNTIL_FINAL_TURN=false; set FIRST_CANDIDATE_ANSWER_TURN=0 for a tool-only schedule." >&2
+      exit 1
+      ;;
+  esac
+fi
 validate_port POLICY_PORT_BASE "$POLICY_PORT_BASE"
 validate_port ACCELERATE_PORT_BASE "$ACCELERATE_PORT_BASE"
 case "${RUN_SYSTEM_PROMPT_MODE,,}" in
@@ -677,6 +811,12 @@ if [[ "${SKIP_IF_EXISTS,,}" == "true" ]]; then
       SKIPPED_EXISTING+=1
       continue
     fi
+    if [[ -n "$LEGACY_CANDIDATE_OUTPUT_ROOT" ]] && \
+       checkpoint_eval_complete "$LEGACY_CANDIDATE_OUTPUT_ROOT/$ckpt_name"; then
+      echo "[INFO] Skipping $ckpt_name (previous evaluation complete under $LEGACY_CANDIDATE_OUTPUT_ROOT/$ckpt_name)."
+      SKIPPED_EXISTING+=1
+      continue
+    fi
     FILTERED_CHECKPOINTS+=("$ckpt")
   done
   CHECKPOINTS=("${FILTERED_CHECKPOINTS[@]}")
@@ -709,6 +849,16 @@ if [[ "${SKIP_IF_QUEUED,,}" == "true" && ${#QUEUED_JOB_SET[@]} -gt 0 ]]; then
       queued_match="$job_name"
     elif [[ -z "$CRITIC_RETRY_JOB_TAG" && -n "${QUEUED_JOB_SET[$legacy_job_name]:-}" ]]; then
       queued_match="$legacy_job_name"
+    fi
+    if [[ -z "$queued_match" && -n "$LEGACY_CANDIDATE_OUTPUT_ROOT" ]]; then
+      if [[ -n "$LEGACY_CANDIDATE_JOB_TAG" ]]; then
+        previous_timing_job_name="zoom-eval-$(sanitize_job_token "${LEGACY_CANDIDATE_JOB_TAG}-${ckpt_name}-${EVAL_NAME}-${TASK_GROUP}")"
+      else
+        previous_timing_job_name="zoom-eval-$(sanitize_job_token "${EVAL_NAME}-${TASK_GROUP}-${ckpt_name}")"
+      fi
+      if [[ -n "${QUEUED_JOB_SET[$previous_timing_job_name]:-}" ]]; then
+        queued_match="$previous_timing_job_name"
+      fi
     fi
     if [[ -n "$queued_match" ]]; then
       echo "[INFO] Skipping $ckpt_name (job $queued_match already queued/running)."
@@ -812,11 +962,14 @@ Submitting Vero zoom checkpoint evals
   Checkpoints:     $CHECKPOINT_INFO
   Image pixels:    max=$MAX_IMAGE_PIXELS
   Max tool images: $MAX_TOOL_IMAGES
+  Candidate timing: first_answer_turn=$FIRST_CANDIDATE_ANSWER_TURN (0=natural) max_tool_iterations=$MAX_TOOL_ITERATIONS record_candidates=$RECORD_ANSWER_CANDIDATES
   Judge model:     $VLLM_JUDGE_MODEL_PATH
   Judge template:  $VLLM_JUDGE_CHAT_TEMPLATE
   FlashInfer sampler: $VLLM_USE_FLASHINFER_SAMPLER
+  Judge runtime:   enforce_eager=$VLLM_JUDGE_ENFORCE_EAGER gdn_prefill_backend=$VLLM_JUDGE_GDN_PREFILL_BACKEND
   Forced final:    after_max_tool_iterations=$FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS prefix=${FORCE_FINAL_ANSWER_PREFIX:-<empty>} think_prefill=${FORCE_FINAL_ANSWER_THINK_PREFILL:-<empty>}
-  Critic retry:    enabled=$CRITIC_RETRY_ENABLED threshold=$CRITIC_GUIDED_ANSWER_RETRY_THRESHOLD prefill_profile=${CRITIC_GUIDED_ANSWER_RETRY_PREFILL_PROFILE:-<none>} tag=${CRITIC_RETRY_JOB_TAG:-<none>}
+  Critic retry:    enabled=$CRITIC_RETRY_ENABLED mode=$CRITIC_GUIDED_ANSWER_RETRY_MODE source=$CRITIC_GUIDED_ANSWER_RETRY_SOURCE threshold=$CRITIC_GUIDED_ANSWER_RETRY_THRESHOLD prefill_profile=${CRITIC_GUIDED_ANSWER_RETRY_PREFILL_PROFILE:-<none>} tag=${CRITIC_RETRY_JOB_TAG:-<none>}
+  Replay critic sampling: temperature=${REPLAY_CRITIC_TEMPERATURE:-0} top_k=${REPLAY_CRITIC_TOP_K:--1} top_p=${REPLAY_CRITIC_TOP_P:-1}
   Workers:         $WORKERS
   Port bases:      policy=$POLICY_PORT_BASE accelerate=$ACCELERATE_PORT_BASE offset=$PORT_OFFSET
   Sbatch options:  ${BASE_SBATCH_OPTS[*]}
@@ -847,16 +1000,19 @@ for i in "${!CHECKPOINTS[@]}"; do
     TOOLS=on
     MM_MAX_PIXELS="$MAX_IMAGE_PIXELS"
     MM_MIN_PIXELS=
+    MAX_TOOL_ITERATIONS="$MAX_TOOL_ITERATIONS"
     MAX_TOOL_IMAGES="$MAX_TOOL_IMAGES"
     CHECKPOINT_PATH="$HF_PATH"
     TASKS="$TASKS"
     PORT="$PORT"
-    JUDGE_BACKEND=engine
+    JUDGE_BACKEND="$JUDGE_BACKEND"
     API_TYPE=vllm
     JUDGE_MODEL_PATH="$VLLM_JUDGE_MODEL_PATH"
     VLLM_JUDGE_MODEL_PATH="$VLLM_JUDGE_MODEL_PATH"
     VLLM_JUDGE_CHAT_TEMPLATE="$VLLM_JUDGE_CHAT_TEMPLATE"
     VLLM_USE_FLASHINFER_SAMPLER="$VLLM_USE_FLASHINFER_SAMPLER"
+    VLLM_JUDGE_ENFORCE_EAGER="$VLLM_JUDGE_ENFORCE_EAGER"
+    VLLM_JUDGE_GDN_PREFILL_BACKEND="$VLLM_JUDGE_GDN_PREFILL_BACKEND"
     CHARXIV_JUDGE_TENSOR_PARALLEL_SIZE=1
     OUTPUT_ROOT="$OUT"
     NUM_GPUS=1
@@ -870,9 +1026,22 @@ for i in "${!CHECKPOINTS[@]}"; do
     FORCE_FINAL_ANSWER_PREFIX="$FORCE_FINAL_ANSWER_PREFIX"
     FORCE_FINAL_ANSWER_THINK_PREFILL="$FORCE_FINAL_ANSWER_THINK_PREFILL"
     CRITIC_GUIDED_ANSWER_RETRY="$CRITIC_RETRY_ENABLED"
+    CRITIC_GUIDED_ANSWER_RETRY_SOURCE="$CRITIC_GUIDED_ANSWER_RETRY_SOURCE"
+    CRITIC_GUIDED_ANSWER_RETRY_MODE="$CRITIC_GUIDED_ANSWER_RETRY_MODE"
     CRITIC_GUIDED_ANSWER_RETRY_THRESHOLD="$CRITIC_GUIDED_ANSWER_RETRY_THRESHOLD"
     CRITIC_GUIDED_ANSWER_RETRY_PREFILL_PROFILE="${CRITIC_GUIDED_ANSWER_RETRY_PREFILL_PROFILE:-persist}"
+    FIRST_CANDIDATE_ANSWER_TURN="$FIRST_CANDIDATE_ANSWER_TURN"
+    FOLLOWUP_CANDIDATE_ANSWER_TURN="$FOLLOWUP_CANDIDATE_ANSWER_TURN"
+    RECORD_ANSWER_CANDIDATES="$RECORD_ANSWER_CANDIDATES"
   )
+  if [[ "$EVAL_NAME" == branchstrata20_fresh_lr1e5_critic_replay_schedule_v1 ]]; then
+    env_list+=(REPLAY_CRITIC_SYSTEM_PROMPT="$REPLAY_CRITIC_SYSTEM_PROMPT" VERO_TRAINING_CONFIG="$VERO_TRAINING_CONFIG")
+    env_list+=(REPLAY_CRITIC_TEMPERATURE="$REPLAY_CRITIC_TEMPERATURE" REPLAY_CRITIC_TOP_K="$REPLAY_CRITIC_TOP_K" REPLAY_CRITIC_TOP_P="$REPLAY_CRITIC_TOP_P")
+    # Training alignment also configures the model; honor an explicit disable.
+    if [[ "$CRITIC_RETRY_ENABLED" == false ]]; then
+      env_list+=(VERO_EVAL_DISABLE_CRITIC=true)
+    fi
+  fi
   [[ -n "$CHAT_TEMPLATE" ]] && env_list+=(CHAT_TEMPLATE="$CHAT_TEMPLATE")
   if [[ -n "${SINGLE_CHECKPOINT_STEP_BY_EVAL_NAME[$EVAL_NAME]:-}" ]]; then
     env_list+=(LMMS_EVAL_HF_TOKENIZER="$HF_PATH")
@@ -890,7 +1059,7 @@ for i in "${!CHECKPOINTS[@]}"; do
 
   echo "[$CKPT_NAME] checkpoint=$HF_PATH"
   echo "  tasks=$TASKS"
-  echo "  port=$PORT judge=engine-sequential master_port=$MASTER_PORT -> $OUT"
+  echo "  port=$PORT judge=$JUDGE_BACKEND master_port=$MASTER_PORT -> $OUT"
   if [[ "$DRY_RUN" == 1 ]]; then
     printf '  '; printf '%q ' env "${env_list[@]}" "${cmd[@]}"; printf '\n'
   else

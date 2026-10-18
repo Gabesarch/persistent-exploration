@@ -206,8 +206,17 @@ class AsyncOpenAIChat(lmms):
         force_final_answer_prefix: str = "",
         force_final_answer_think_prefill: Optional[str] = None,
         critic_guided_answer_retry: bool = False,
+        critic_guided_answer_retry_source: str = "policy",
+        critic_guided_answer_retry_mode: str = "token",
+        critic_guided_answer_retry_temperature: float = 0.0,
+        critic_guided_answer_retry_top_k: int = -1,
+        critic_guided_answer_retry_top_p: float = 1.0,
         critic_guided_answer_retry_threshold: float = 0.5,
         critic_guided_answer_retry_prefill_profile: str = "persist",
+        first_candidate_answer_turn: int = 0,
+        followup_candidate_answer_turn: int = 0,
+        record_answer_candidates: bool = False,
+        always_retry_answers: bool = False,
         manage_vllm_server_lifecycle: bool = False,
         **kwargs,
     ) -> None:
@@ -264,6 +273,17 @@ class AsyncOpenAIChat(lmms):
         self.tool_image_as_user_turn = parse_bool(tool_image_as_user_turn)
         self.force_tool_calls_until_final_turn = parse_bool(force_tool_calls_until_final_turn)
         self.force_answer_after_max_tool_iterations = parse_bool(force_answer_after_max_tool_iterations)
+        self.first_candidate_answer_turn = int(first_candidate_answer_turn)
+        self.followup_candidate_answer_turn = int(followup_candidate_answer_turn)
+        if self.followup_candidate_answer_turn and not (
+            2 <= self.first_candidate_answer_turn < self.followup_candidate_answer_turn <= self.max_tool_iterations
+        ):
+            raise ValueError("followup_candidate_answer_turn requires first turn < followup turn <= max_tool_iterations")
+        self.record_answer_candidates = parse_bool(record_answer_candidates)
+        if self.first_candidate_answer_turn and not 2 <= self.first_candidate_answer_turn <= self.max_tool_iterations:
+            raise ValueError("first_candidate_answer_turn must be 0 (disabled) or between 2 and max_tool_iterations")
+        if self.first_candidate_answer_turn and self.force_tool_calls_until_final_turn:
+            raise ValueError("first_candidate_answer_turn is incompatible with force_tool_calls_until_final_turn")
         if self.force_tool_calls_until_final_turn and self.max_tool_iterations < 1:
             raise ValueError("max_tool_iterations must be positive when force_tool_calls_until_final_turn is enabled")
         self.force_final_answer_prefix = force_final_answer_prefix or ""
@@ -273,6 +293,26 @@ class AsyncOpenAIChat(lmms):
         self.force_final_answer_think_prefill = force_final_answer_think_prefill or ""
         self._forced_action_tokenizer = None
         self.critic_guided_answer_retry = parse_bool(critic_guided_answer_retry)
+        self.always_retry_answers = parse_bool(always_retry_answers)
+        if self.always_retry_answers and (self.critic_guided_answer_retry or self.force_tool_calls_until_final_turn):
+            raise ValueError("always_retry_answers requires critic and forced-tool modes to be disabled")
+        if self.always_retry_answers and (self.mcp_client is None or self.max_tool_iterations < 1):
+            raise ValueError("always_retry_answers requires tools and a positive tool budget")
+        self.critic_guided_answer_retry_source = str(critic_guided_answer_retry_source)
+        self.critic_guided_answer_retry_mode = str(critic_guided_answer_retry_mode)
+        self.critic_guided_answer_retry_temperature = float(critic_guided_answer_retry_temperature)
+        self.critic_guided_answer_retry_top_k = int(critic_guided_answer_retry_top_k)
+        self.critic_guided_answer_retry_top_p = float(critic_guided_answer_retry_top_p)
+        if self.critic_guided_answer_retry_mode not in {"token", "reasoning"}:
+            raise ValueError("critic_guided_answer_retry_mode must be token or reasoning")
+        if self.critic_guided_answer_retry_source not in {"policy", "ground_truth"}:
+            raise ValueError("critic_guided_answer_retry_source must be policy or ground_truth")
+        if self.critic_guided_answer_retry_source == "ground_truth":
+            if not self.critic_guided_answer_retry:
+                raise ValueError("ground_truth critic requires critic_guided_answer_retry=true")
+            if os.getenv("VLLM_SERVER_JUDGE", "").lower() not in {"1", "true", "yes"}:
+                raise ValueError("ground_truth critic requires a dedicated server judge")
+        self._ground_truth_critic_lock = asyncio.Lock()
         self.critic_guided_answer_retry_threshold = float(critic_guided_answer_retry_threshold)
         from lmms_eval.models.model_utils.critic_thresholds import parse_domain_thresholds
 
@@ -293,7 +333,7 @@ class AsyncOpenAIChat(lmms):
             )
         self._retry_critic_accept_token_id = None
         self._retry_critic_retry_token_id = None
-        if self.critic_guided_answer_retry:
+        if self.critic_guided_answer_retry and self.critic_guided_answer_retry_mode == "token":
             tokenizer_name = os.getenv("LMMS_EVAL_HF_TOKENIZER", "Qwen/Qwen3-8B")
             self._forced_action_tokenizer = _get_forced_action_tokenizer(tokenizer_name)
             accept_ids = self._forced_action_tokenizer.encode(
@@ -624,6 +664,37 @@ class AsyncOpenAIChat(lmms):
         )
 
     async def _obtain_retry_critic_decision(self, payload: dict, candidate_content: str, *, task=""):
+        if getattr(self, "critic_guided_answer_retry_mode", "token") == "reasoning":
+            from lmms_eval.models.model_utils.reasoning_replay_critic import (
+                reasoning_critic_request,
+                reasoning_critic_response,
+            )
+
+            profile = getattr(self, "training_alignment", None)
+            settings = profile.reasoning_critic_settings if profile else {
+                "system_prompt": os.environ["REPLAY_CRITIC_SYSTEM_PROMPT"],
+                "prompt_limit": 16384,
+                "max_tokens": 5120,
+            }
+            request, evidence = reasoning_critic_request(
+                payload, candidate_content, settings["system_prompt"],
+                temperature=getattr(self, "critic_guided_answer_retry_temperature", 0.0),
+                top_k=getattr(self, "critic_guided_answer_retry_top_k", -1),
+                top_p=getattr(self, "critic_guided_answer_retry_top_p", 1.0),
+                max_tokens=settings["max_tokens"],
+            )
+            evidence["critic_prompt_limit"] = settings["prompt_limit"]
+            response = None
+            try:
+                if await self._training_prompt_tokens(request) > settings["prompt_limit"]:
+                    raise ValueError("reasoning critic prompt exceeds configured prompt_length")
+                response = await self._create_training_completion(request, critic=True)
+                return response, reasoning_critic_response(response, evidence)
+            except Exception as exc:
+                if response is not None:
+                    exc.retry_critic_response = response
+                exc.retry_critic_details = evidence
+                raise
         threshold = self._critic_threshold_for_task(task)
         request_payload = self._retry_critic_request(payload, candidate_content)
         response = await self._create_training_completion(request_payload, critic=True)
@@ -1172,6 +1243,10 @@ class AsyncOpenAIChat(lmms):
                         "force_tool_calls_until_final_turn requires a final <answer> block and is incompatible "
                         f"with terminal tools for task {task!r}: {sorted(terminal_tools)}"
                     )
+            if getattr(self, "first_candidate_answer_turn", 0) and (not functions or terminal_tools):
+                raise ValueError("first_candidate_answer_turn requires MCP tools and an <answer> final-answer protocol")
+            if getattr(self, "always_retry_answers", False) and (not functions or terminal_tools):
+                raise ValueError("always_retry_answers requires MCP tools and an <answer> final-answer protocol")
             # Per-task image-indexing mode controls the model-visible tool_response wording
             # (training_faithful | multi_index | None=default). See _tool_image_registered_text.
             image_indexing_mode = task_metadata.get("image_indexing")
@@ -1184,12 +1259,24 @@ class AsyncOpenAIChat(lmms):
             forced_final_answer_valid = False
             retry_depth = 0
             retry_critic_records = []
+            answer_retry_records = []
+            first_candidate_seen_turn = None
+            first_candidate_forced_turn = None
+            candidate_answer_turns = []
+            candidate_forced_turns = []
             training_remaining = None
             if profile:
                 payload["_training_initial_tokens"] = await self._training_prompt_tokens(payload)
                 training_remaining = profile.data["max_response_length"]
 
             def _retry_critic_metadata():
+                if getattr(self, "always_retry_answers", False):
+                    return {"answer_retry": {
+                        "enabled": True,
+                        "critic_used": False,
+                        "prefill_profile": self.critic_guided_answer_retry_prefill_profile,
+                        "decisions": answer_retry_records,
+                    }}
                 if not self.critic_guided_answer_retry:
                     return None
                 probabilities = [
@@ -1197,9 +1284,10 @@ class AsyncOpenAIChat(lmms):
                     for record in retry_critic_records
                     if isinstance(record.get("p_retry"), int | float)
                 ]
-                return {
+                metadata = {
                     "retry_critic": {
                         "enabled": True,
+                        "source": getattr(self, "critic_guided_answer_retry_source", "policy"),
                         "threshold": critic_threshold,
                         "prefill_profile": self.critic_guided_answer_retry_prefill_profile,
                         "decisions": retry_critic_records,
@@ -1229,6 +1317,27 @@ class AsyncOpenAIChat(lmms):
                         },
                     }
                 }
+                if getattr(self, "critic_guided_answer_retry_mode", "token") == "reasoning":
+                    metadata["retry_critic"]["mode"] = "reasoning"
+                    metadata["retry_critic"]["sampling_params"] = {
+                        "temperature": getattr(self, "critic_guided_answer_retry_temperature", 0.0),
+                        "top_k": getattr(self, "critic_guided_answer_retry_top_k", -1),
+                        "top_p": getattr(self, "critic_guided_answer_retry_top_p", 1.0),
+                        "n": 1,
+                    }
+                if getattr(self, "first_candidate_answer_turn", 0) or getattr(self, "record_answer_candidates", False):
+                    metadata["first_candidate_schedule"] = {
+                        "deadline_turn": getattr(self, "first_candidate_answer_turn", 0),
+                        "forced_turn": first_candidate_forced_turn,
+                        "first_candidate_turn": first_candidate_seen_turn,
+                    }
+                if getattr(self, "followup_candidate_answer_turn", 0):
+                    metadata["candidate_answer_schedule"] = {
+                        "deadline_turns": [self.first_candidate_answer_turn, self.followup_candidate_answer_turn],
+                        "candidate_turns": list(candidate_answer_turns),
+                        "forced_turns": list(candidate_forced_turns),
+                    }
+                return metadata
 
             def _add_usage(usage_response, *, source: str):
                 nonlocal total_input_tokens, total_output_tokens, total_reasoning_tokens
@@ -1268,14 +1377,40 @@ class AsyncOpenAIChat(lmms):
                 return None
 
             async def _maybe_replace_answer_with_retry_tool(current_response, current_prefill):
-                nonlocal retry_depth
-                if not self.critic_guided_answer_retry:
-                    return current_response, current_prefill, False
+                nonlocal retry_depth, first_candidate_seen_turn
                 message = current_response.choices[0].message
                 if getattr(message, "tool_calls", None):
                     return current_response, current_prefill, False
                 candidate_content = f"{current_prefill}{message.content or ''}"
                 if "<answer>" not in candidate_content:
+                    return current_response, current_prefill, False
+                if first_candidate_seen_turn is None:
+                    first_candidate_seen_turn = tool_iteration + 1
+                candidate_answer_turns.append(tool_iteration + 1)
+                if getattr(self, "always_retry_answers", False):
+                    # Same controller as the saved step-200 ablation: discard each
+                    # candidate, force a zoom with persist prefill, never query a critic.
+                    skipped_reason = _retry_skip_reason()
+                    if skipped_reason is None:
+                        retry_depth += 1
+                    record = {
+                        "candidate_turn": tool_iteration + 1,
+                        "candidate_content": candidate_content,
+                        "controller": "always_retry_answer",
+                        "critic_used": False,
+                        "retry_feasible": skipped_reason is None,
+                        "controller_action": "retry" if skipped_reason is None else "forced_accept",
+                        "retry_depth": retry_depth,
+                        "skip_or_error_reason": skipped_reason,
+                    }
+                    answer_retry_records.append(record)
+                    eval_logger.info(f"Unconditional answer retry: request={idx} task={task} record={json.dumps(record, sort_keys=True)}")
+                    if skipped_reason is not None:
+                        return current_response, current_prefill, False
+                    retry_response, persisted_prefill = await self._obtain_retry_tool_call(payload)
+                    _add_usage(retry_response, source="model")
+                    return retry_response, persisted_prefill, True
+                if not self.critic_guided_answer_retry:
                     return current_response, current_prefill, False
                 critic_candidate = candidate_content
                 if restore_assistant_forced_prefill:
@@ -1287,11 +1422,24 @@ class AsyncOpenAIChat(lmms):
                     if functions:
                         critic_payload["tools"] = functions
                         critic_payload["tool_choice"] = "auto"
-                    critic_response, record = await self._obtain_retry_critic_decision(
-                        critic_payload,
-                        critic_candidate,
-                        task=task,
-                    )
+                    if getattr(self, "critic_guided_answer_retry_source", "policy") == "ground_truth":
+                        from lmms_eval.models.model_utils.ground_truth_critic import grade_visual_probe_candidate
+
+                        # Serialize wake/grade/sleep cycles across concurrent
+                        # trajectories; leave policy generation asynchronous.
+                        async with self._ground_truth_critic_lock:
+                            record = await asyncio.to_thread(
+                                grade_visual_probe_candidate,
+                                self.task_dict[task][split][doc_id],
+                                critic_candidate,
+                                task,
+                            )
+                    else:
+                        critic_response, record = await self._obtain_retry_critic_decision(
+                            critic_payload,
+                            critic_candidate,
+                            task=task,
+                        )
                     _add_usage(critic_response, source="retry_critic")
                     skipped_reason = _retry_skip_reason()
                     retry_feasible = skipped_reason is None
@@ -1312,6 +1460,10 @@ class AsyncOpenAIChat(lmms):
                         }
                     )
                 except Exception as exc:  # Critic failures retain the candidate.
+                    if getattr(self, "critic_guided_answer_retry_source", "policy") == "ground_truth":
+                        # An unavailable GT grader must not silently become an
+                        # accept-all critic and produce a mislabeled evaluation.
+                        raise RuntimeError("ground_truth critic grading failed") from exc
                     if critic_response is None:
                         critic_response = getattr(exc, "retry_critic_response", None)
                     if critic_response is not None:
@@ -1329,7 +1481,10 @@ class AsyncOpenAIChat(lmms):
                         "retry_depth": retry_depth,
                         "skip_or_error_reason": f"{type(exc).__name__}: {exc}",
                     }
+                    record.update(getattr(exc, "retry_critic_details", {}))
 
+                if getattr(self, "record_answer_candidates", False):
+                    record["candidate_content"] = critic_candidate
                 retry_critic_records.append(record)
                 self._record_retry_critic_stats(record, usage_response=critic_response)
                 eval_logger.info(
@@ -1511,6 +1666,18 @@ class AsyncOpenAIChat(lmms):
                 )
                 force_final_answer_now = final_turn_due and not terminal_tools
                 force_terminal_answer_now = final_turn_due and bool(terminal_tools)
+                first_deadline = getattr(self, "first_candidate_answer_turn", 0)
+                followup_deadline = getattr(self, "followup_candidate_answer_turn", 0)
+                force_first_candidate_now = bool(
+                    first_deadline and tool_iteration + 1 >= first_deadline
+                    and first_candidate_forced_turn is None
+                    and (followup_deadline or first_candidate_seen_turn is None)
+                    and not final_turn_due
+                )
+                force_followup_candidate_now = bool(
+                    followup_deadline and followup_deadline not in candidate_forced_turns
+                    and tool_iteration + 1 >= followup_deadline and not final_turn_due
+                )
 
                 # Once the image budget is spent, stop offering image-producing tools
                 # so the model answers. Terminal (answer-protocol) tools stay offered:
@@ -1548,6 +1715,19 @@ class AsyncOpenAIChat(lmms):
                         idx,
                     )
                     forced_final_answer_valid = self._forced_final_answer_failure(response) is None
+                elif force_first_candidate_now or force_followup_candidate_now:
+                    # Match training's candidate deadline: constrain the action to
+                    # <answer>, without the final-turn prefill or changing the cap.
+                    if force_first_candidate_now:
+                        first_candidate_forced_turn = tool_iteration + 1
+                    candidate_forced_turns.append(tool_iteration + 1)
+                    request_payload = self._with_forced_action_extra_body(payload, "<answer>")
+                    request_payload["tool_choice"] = "none"
+                    response = await self._create_training_completion(request_payload)
+                    responses_for_usage.append(("primary", response))
+                    failure = self._forced_final_answer_failure(response)
+                    if failure is not None:
+                        response.choices[0].message.content = f"[LMMS_EVAL_FORCED_FINAL_ANSWER_FAILED: early_candidate_{failure}]"
                 else:
                     if self.force_tool_calls_until_final_turn:
                         request_payload = self._with_forced_action_extra_body(payload, "<tool_call>")
@@ -1618,6 +1798,10 @@ class AsyncOpenAIChat(lmms):
         results = []
 
         async def run():
+            if getattr(self, "critic_guided_answer_retry_source", "policy") == "ground_truth":
+                # Each task calls asyncio.run anew. Locks with concurrent
+                # waiters bind to a loop and cannot be reused by the next task.
+                self._ground_truth_critic_lock = asyncio.Lock()
             res: List[Tuple[GenerationResult, int]] = []
             pbar = tqdm(total=len(requests), disable=(self.rank != 0), desc="Model Responding")
             current_concurrency = (

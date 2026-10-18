@@ -35,6 +35,11 @@ FORCE_TOOL_CALLS_UNTIL_FINAL_TURN="${FORCE_TOOL_CALLS_UNTIL_FINAL_TURN:-false}"
 FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS="${FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS:-false}"
 TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-hermes}"
 
+# These reruns write their policy-server logs beside the scratch results;
+# home is at its hard quota. Already-queued batches invoke this shared script.
+if [[ "${CHECKPOINT_PATH:-}" == *branchstrata20_fresh_lr1e5_critic_maxcalls* && -n "${OUTPUT_ROOT:-}" ]]; then
+  LOG_DIR="${LOG_DIR:-${OUTPUT_ROOT%/}/runtime_logs}"
+fi
 LOG_DIR="${LOG_DIR:-$VERO_EVAL_DIR/logs/vllm}"
 mkdir -p "$LOG_DIR"
 LOGFILE="$LOG_DIR/vllm_$(date '+%Y-%m-%d_%H-%M-%S')_port${PORT}.txt"

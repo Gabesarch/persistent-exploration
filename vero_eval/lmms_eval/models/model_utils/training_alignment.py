@@ -142,6 +142,24 @@ class TrainingAlignment:
         model.critic_guided_answer_retry_threshold = self.eval_critic_threshold
         model.critic_guided_answer_retry_prefill_profile = "persist"
 
+    @property
+    def reasoning_critic_settings(self):
+        from lmms_eval.models.model_utils.reasoning_replay_critic import replay_contract
+
+        replay = self.config.get("trainer", {}).get("trajectory_replay", {})
+        prompt_path = replay.get("system_prompt_path")
+        prompt = self.resolve(prompt_path) if prompt_path else replay.get("system_prompt")
+        normal = int(replay.get("normal_budget", 4096))
+        buffer = int(replay.get("overlong_buffer", 1024))
+        limit = int(self.data["max_prompt_length"])
+        if min(normal, buffer, limit) <= 0:
+            raise ValueError("Training reasoning critic budgets must be positive")
+        return {
+            "system_prompt": replay_contract().load_judge_system_prompt(prompt),
+            "prompt_limit": limit,
+            "max_tokens": normal + buffer,
+        }
+
     def generation_kwargs(self):
         # Keep the evaluation's sampling distribution; only align the turn budget.
         return {"max_new_tokens": self.multi["max_assistant_tokens_per_turn"]}

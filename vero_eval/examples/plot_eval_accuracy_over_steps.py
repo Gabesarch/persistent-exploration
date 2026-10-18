@@ -267,6 +267,15 @@ def discover_baseline_result_file(
     return choose_latest(paths, latest_by)
 
 
+def comparison_benchmark(benchmark: str) -> str:
+    """Compare checkpoint-specific prompt variants in the usual difficulty panels."""
+    return re.sub(
+        r"^(visual_probe_(?:easy|medium|hard)_reasoning_zoom)_(?:fixjson|minio3)_step200$",
+        r"\1",
+        benchmark,
+    )
+
+
 def load_records(
     condition: Condition,
     metric: str,
@@ -291,7 +300,7 @@ def load_records(
                 Record(
                     condition=condition.label,
                     step=step,
-                    benchmark=str(benchmark),
+                    benchmark=comparison_benchmark(str(benchmark)),
                     metric=metric_key,
                     accuracy=accuracy,
                     result_file=result_file,

@@ -402,7 +402,10 @@ class RayPPOTrainer:
             raise ValueError("Replay judge normal budget and overlong buffer must be positive")
         if hard_cap > self.config.data.max_response_length:
             raise ValueError("Replay judge hard cap exceeds the padded response length")
-        replay_prompt_target(self.config.data.train_batch_size, float(config.get("prompt_fraction", 0.2)))
+        replay_prompt_target(
+            self.config.data.train_batch_size, float(config.get("prompt_fraction", 0.2)),
+            config.get("batch_mode", "replace"),
+        )
         self.trajectory_replay_cache = ReplayCache(
             os.path.join(self.config.trainer.default_local_dir, "trajectory_replay"),
             capacity=int(config.get("capacity", 8192)), seed=int(config.get("seed", 42)),
@@ -462,26 +465,34 @@ class RayPPOTrainer:
             return batch
         target = 0
         candidates = []
+        base_count = len(batch)
+        batch_mode = config.get("batch_mode", "replace")
         if replay_enabled:
             self.trajectory_replay_cache.reload()
             retained_ids = {entry["entry_id"] for entry in self.trajectory_replay_cache.entries}
             self._replay_prompt_lengths = {
                 key: value for key, value in getattr(self, "_replay_prompt_lengths", {}).items() if key in retained_ids
             }
-            target = replay_prompt_target(len(batch), float(config.get("prompt_fraction", 0.2)))
+            target = replay_prompt_target(base_count, float(config.get("prompt_fraction", 0.2)), batch_mode)
             candidates, skipped = fitting_replay_samples(
                 self.trajectory_replay_cache, target, self.global_steps, self._replay_prompt_fits,
             )
             metrics["replay/skipped_prompts"] = skipped
             metrics["replay/cache_entries"] = len(self.trajectory_replay_cache.entries)
         count = len(candidates)
-        task_count = len(batch) - count
+        task_count = base_count if batch_mode == "append" else base_count - count
         rng = np.random.default_rng(np.random.SeedSequence([int(config.get("seed", 42)), self.global_steps]))
         if count:
-            domain_weights = getattr(self.train_dataset, "per_batch_domain_weights", None)
-            fresh = choose_task_rows(batch, task_count, domain_weights, rng)
-            replaced = np.setdiff1d(np.arange(len(batch)), fresh)
-            batch = batch.select_idxs(np.concatenate([fresh, replaced]))
+            if batch_mode == "append":
+                # Clone row slots only. Replace their prompts/provenance below;
+                # never consume or reorder additional rows from the dataloader.
+                judge_rows = batch.select_idxs(np.arange(count) % base_count)
+                batch = DataProto.concat([batch, judge_rows])
+            else:
+                domain_weights = getattr(self.train_dataset, "per_batch_domain_weights", None)
+                fresh = choose_task_rows(batch, task_count, domain_weights, rng)
+                replaced = np.setdiff1d(np.arange(len(batch)), fresh)
+                batch = batch.select_idxs(np.concatenate([fresh, replaced]))
         flags = np.zeros(len(batch), dtype=bool)
         flags[task_count:] = True
         if replay_enabled:
@@ -507,7 +518,17 @@ class RayPPOTrainer:
                     batch.non_tensor_batch["ability"][offset] = "replay_judge"
             share = float(config.get("prompt_fraction", 0.2)) * count / target if target else 0.0
             batch.meta_info["replay_loss_share"] = share
+            rollout_n = int(self.config.actor_rollout_ref.rollout.get("n", 1))
             metrics.update({
+                "replay/append_mode": int(batch_mode == "append"),
+                "replay/base_prompt_count": base_count,
+                "replay/task_prompt_count": task_count,
+                "replay/total_prompt_count": len(batch),
+                "replay/task_rollout_count": task_count * rollout_n,
+                "replay/critic_rollout_count": count * rollout_n,
+                "replay/total_rollout_count": len(batch) * rollout_n,
+                "replay/rollout_n": rollout_n,
+                "replay/configured_prompt_fraction": float(config.get("prompt_fraction", 0.2)),
                 "replay/prompt_target": target, "replay/prompt_count": count,
                 "replay/prompt_fraction": count / len(batch), "replay/accept_prompts": count // 2,
                 "replay/reject_prompts": count // 2, "replay/loss_share": share,

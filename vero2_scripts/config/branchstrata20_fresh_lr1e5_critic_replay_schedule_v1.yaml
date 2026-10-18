@@ -387,6 +387,8 @@ critic:
 trainer:
   trajectory_replay:
     enabled: true
+    # Preserve all 128 fresh task prompts; append 32 balanced critic prompts.
+    batch_mode: append
     prompt_fraction: 0.20
     capacity: 8192
     seed: 42

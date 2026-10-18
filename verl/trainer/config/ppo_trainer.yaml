@@ -133,6 +133,7 @@ trainer:
   # Opt-in on-policy reasoning judge replay. Disabled for all existing runs.
   trajectory_replay:
     enabled: false
+    batch_mode: replace
     prompt_fraction: 0.20
     capacity: 8192
     seed: 42

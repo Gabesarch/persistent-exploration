@@ -110,6 +110,8 @@ class JudgeConfig:
     gpu_memory_utilization: float
     system_prompt: Optional[str]
     chat_template: Optional[str] = None
+    enforce_eager: bool = False
+    gdn_prefill_backend: str = "auto"
 
 
 def _load_chat_template(raw_template: Optional[str]) -> Optional[str]:
@@ -142,6 +144,20 @@ def _load_config(model_hint: Optional[str]) -> JudgeConfig:
     )
     system_prompt = os.getenv("CHARXIV_JUDGE_SYSTEM_PROMPT", os.getenv("VLLM_JUDGE_SYSTEM_PROMPT", _DEFAULT_SYSTEM_PROMPT))
     chat_template = _load_chat_template(os.getenv("VLLM_JUDGE_CHAT_TEMPLATE"))
+    # Qwen3.5 auto-selects FlashInfer GDN on H100. Its shared JIT cache can
+    # contain CUDA/Python paths from another environment; sampler settings
+    # do not disable that attention kernel. Apply safe defaults to this judge
+    # even for already-queued jobs that have no new environment overrides.
+    qwen35 = any(tag in model_path.lower() for tag in ("qwen3.5", "qwen3_5"))
+    eager_raw = os.getenv("VLLM_JUDGE_ENFORCE_EAGER", "true" if qwen35 else "false").strip().lower()
+    if eager_raw not in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
+        raise ValueError("VLLM_JUDGE_ENFORCE_EAGER must be a boolean")
+    enforce_eager = eager_raw in {"1", "true", "yes", "on"}
+    gdn_prefill_backend = os.getenv(
+        "VLLM_JUDGE_GDN_PREFILL_BACKEND", "triton" if qwen35 else "auto"
+    ).strip().lower()
+    if gdn_prefill_backend not in {"auto", "triton", "flashinfer", "cutedsl"}:
+        raise ValueError("Invalid VLLM_JUDGE_GDN_PREFILL_BACKEND")
     return JudgeConfig(
         model_path=model_path,
         tensor_parallel_size=tensor_parallel,
@@ -156,7 +172,16 @@ def _load_config(model_hint: Optional[str]) -> JudgeConfig:
         gpu_memory_utilization=gpu_memory_utilization,
         system_prompt=system_prompt,
         chat_template=chat_template,
+        enforce_eager=enforce_eager,
+        gdn_prefill_backend=gdn_prefill_backend,
     )
+
+
+def _judge_runtime_kwargs(config: JudgeConfig) -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {"enforce_eager": config.enforce_eager}
+    if config.gdn_prefill_backend != "auto":
+        kwargs["additional_config"] = {"gdn_prefill_backend": config.gdn_prefill_backend}
+    return kwargs
 
 
 class VLLMJudgeEngine:
@@ -173,6 +198,7 @@ class VLLMJudgeEngine:
             max_model_len=config.max_model_len,
             gpu_memory_utilization=config.gpu_memory_utilization,
             max_num_seqs=config.max_num_seqs,
+            **_judge_runtime_kwargs(config),
         )
         self.supports_multimodal = hasattr(self._llm, "chat")
         self._tokenizer = self._llm.get_tokenizer()
@@ -322,6 +348,7 @@ class VLLMJudgeEngineQwen3:
             max_model_len=config.max_model_len,
             gpu_memory_utilization=config.gpu_memory_utilization,
             max_num_seqs=config.max_num_seqs,
+            **_judge_runtime_kwargs(config),
         )
         self.supports_multimodal = hasattr(self._llm, "chat")
         self._tokenizer = self._llm.get_tokenizer()

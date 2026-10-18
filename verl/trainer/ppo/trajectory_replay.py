@@ -29,11 +29,15 @@ def apportion(total, weights):
     return counts
 
 
-def replay_prompt_target(batch_size, fraction):
-    """Round to balanced A/R pairs, retaining at least one fresh task."""
+def replay_prompt_target(batch_size, fraction, batch_mode="replace"):
+    """Round to balanced pairs; append mode preserves the full fresh batch."""
     if not 0 <= fraction < 1:
         raise ValueError("Replay prompt_fraction must satisfy 0 <= fraction < 1")
-    return min(2 * int(math.floor(batch_size * fraction / 2 + 0.5)), 2 * ((batch_size - 1) // 2))
+    if batch_mode not in ("replace", "append"):
+        raise ValueError("Replay batch_mode must be 'replace' or 'append'")
+    expected = batch_size * fraction / (1 - fraction) if batch_mode == "append" else batch_size * fraction
+    paired = 2 * int(math.floor(expected / 2 + 0.5))
+    return paired if batch_mode == "append" else min(paired, 2 * ((batch_size - 1) // 2))
 
 
 def choose_task_rows(batch, task_count, domain_weights, rng):

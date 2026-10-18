@@ -16,6 +16,7 @@ def test_shared_configuration_defaults_keep_features_disabled():
     trainer = yaml.safe_load((ROOT / "verl/trainer/config/ppo_trainer.yaml").read_text())["trainer"]
     rollout = yaml.safe_load((ROOT / "verl/trainer/config/rollout/rollout.yaml").read_text())["multi_turn"]
     assert trainer["trajectory_replay"]["enabled"] is False
+    assert trainer["trajectory_replay"]["batch_mode"] == "replace"
     assert rollout["prompt_group_schedule_enabled"] is False
     assert rollout["conditional_answer_retry_critic_mode"] == "legacy"
 
@@ -49,6 +50,7 @@ def test_new_configuration_preserves_base_except_authorized_features():
     assert feature["actor_rollout_ref"]["actor"]["policy_loss"]["retry_critic"]["enabled"] is False
     replay = feature["trainer"]["trajectory_replay"]
     assert replay["enabled"] and replay["prompt_fraction"] == 0.2 and replay["capacity"] == 8192
+    assert replay["batch_mode"] == "append"
     assert replay["normal_budget"] == 4096 and replay["overlong_buffer"] == 1024
     assert replay["schedule_single_fraction"] == 0.10 and replay["schedule_double_fraction"] == 0.05
     assert (replay["schedule_first_turn"], replay["schedule_last_turn"], replay["schedule_min_gap"]) == (2, 9, 2)
