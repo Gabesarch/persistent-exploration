@@ -170,7 +170,12 @@ class vLLMColocateWorkerExtension:
         instance._is_modelopt_qat = _is_modelopt_qat
         return instance
 
-    def monkey_patch_model(self, vocab_size: int):
+    def monkey_patch_model(self, vocab_size: int, gemma4_preserve_constant_norm_weights: bool = False):
+        if gemma4_preserve_constant_norm_weights:
+            from verl.models.gemma4.vllm_state import preserve_constant_norm_weights
+
+            names = preserve_constant_norm_weights(self.model_runner.model)
+            logger.info("Gemma constant norm weights protected across sleep: %d", len(names))
         # patch compute_logits to avoid sampling OOV token
         monkey_patch_compute_logits(self.model_runner.model, vocab_size)
         # patch weight loader to support MoE model

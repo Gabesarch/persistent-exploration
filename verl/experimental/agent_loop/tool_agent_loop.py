@@ -218,6 +218,17 @@ class AgentData:
 
 @register("tool_agent")
 class ToolAgentLoop(AgentLoopBase):
+    skip_response_special_tokens = True
+
+    def _has_final_answer(self, text):
+        return "<answer>" in text
+
+    def _parse_solver_output(self, text):
+        return _parse_multiturn_tool_calling_output(text)
+
+    def _critic_closing_text(self):
+        return "\n</answer><|im_end|>\n"
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -1115,7 +1126,7 @@ class ToolAgentLoop(AgentLoopBase):
                 None,
                 lambda: self.tokenizer.decode(
                     assistant_prefill_ids + teacher_only_prefill_ids + agent_data.response_ids,
-                    skip_special_tokens=True,
+                    skip_special_tokens=self.skip_response_special_tokens,
                 ),
             )
             assistant_message = apply_response_display_prefix(assistant_message, self.response_display_prefix)
@@ -1129,13 +1140,15 @@ class ToolAgentLoop(AgentLoopBase):
             }
             if teacher_only_prefill_ids:
                 event["teacher_prompt_text"] = self.tokenizer.decode(
-                    generation_prompt_ids, skip_special_tokens=True
+                    generation_prompt_ids, skip_special_tokens=self.skip_response_special_tokens
                 )
                 event["teacher_prompt_suffix"] = self.tokenizer.decode(
-                    teacher_only_prefill_ids, skip_special_tokens=True
+                    teacher_only_prefill_ids, skip_special_tokens=self.skip_response_special_tokens
                 )
                 event["stored_student_turn"] = apply_response_display_prefix(
-                    self.tokenizer.decode(agent_data.response_ids, skip_special_tokens=True),
+                    self.tokenizer.decode(
+                        agent_data.response_ids, skip_special_tokens=self.skip_response_special_tokens
+                    ),
                     self.response_display_prefix,
                 )
             agent_data.debug_events.append(event)
@@ -1157,9 +1170,11 @@ class ToolAgentLoop(AgentLoopBase):
             return AgentState.TERMINATED
         if forced_required_tag == "<answer>":
             assistant_message = await self.loop.run_in_executor(
-                None, lambda: self.tokenizer.decode(agent_data.response_ids, skip_special_tokens=True)
+                None, lambda: self.tokenizer.decode(
+                    agent_data.response_ids, skip_special_tokens=self.skip_response_special_tokens
+                )
             )
-            if agent_data.tool_calls or "<answer>" not in assistant_message:
+            if agent_data.tool_calls or not self._has_final_answer(assistant_message):
                 reason = "unexpected_tool_call_on_final_turn" if agent_data.tool_calls else "missing_final_answer"
                 self._mark_forced_structure_error(agent_data, reason)
                 return AgentState.TERMINATED
@@ -1173,10 +1188,12 @@ class ToolAgentLoop(AgentLoopBase):
             and rollout_kwargs is not None
         ):
             assistant_message = await self.loop.run_in_executor(
-                None, lambda: self.tokenizer.decode(agent_data.response_ids, skip_special_tokens=True)
+                None, lambda: self.tokenizer.decode(
+                    agent_data.response_ids, skip_special_tokens=self.skip_response_special_tokens
+                )
             )
             assistant_message = apply_response_display_prefix(assistant_message, self.response_display_prefix)
-            if "<answer>" in assistant_message:
+            if self._has_final_answer(assistant_message):
                 if self._retry_critic_validation_active(rollout_kwargs):
                     retry_state = await self._maybe_retry_answer_with_critic(
                         agent_data=agent_data,
@@ -1207,7 +1224,9 @@ class ToolAgentLoop(AgentLoopBase):
         # Handle interaction if needed
         if self.interaction_config_file:
             assistant_message = await self.loop.run_in_executor(
-                None, lambda: self.tokenizer.decode(agent_data.response_ids, skip_special_tokens=True)
+                None, lambda: self.tokenizer.decode(
+                    agent_data.response_ids, skip_special_tokens=self.skip_response_special_tokens
+                )
             )
             add_messages.append({"role": "assistant", "content": assistant_message})
             agent_data.messages.extend(add_messages)
@@ -1278,7 +1297,9 @@ class ToolAgentLoop(AgentLoopBase):
         response_start: int,
         response_end: int,
     ) -> None:
-        suffix_text = self.tokenizer.decode(agent_data.response_ids, skip_special_tokens=True)
+        suffix_text = self.tokenizer.decode(
+            agent_data.response_ids, skip_special_tokens=self.skip_response_special_tokens
+        )
         standalone_text = apply_response_display_prefix(
             suffix_text,
             self.response_display_prefix or "<think>\n",
@@ -1558,7 +1579,7 @@ class ToolAgentLoop(AgentLoopBase):
         if token_id is None:
             raise ValueError(f"unsupported retry critic label {label!r}")
         prefix_ids = await self._retry_critic_prompt_prefix_ids()
-        closing_ids = self.tokenizer.encode("\n</answer><|im_end|>\n", add_special_tokens=False)
+        closing_ids = self.tokenizer.encode(self._critic_closing_text(), add_special_tokens=False)
         sidecar_ids = prefix_ids + [int(token_id)] + closing_ids
         if len(agent_data.response_mask) + len(sidecar_ids) > self.response_length:
             agent_data.extra_fields["retry_critic_supervision_skipped_reason"] = "response_length"
@@ -1736,7 +1757,7 @@ class ToolAgentLoop(AgentLoopBase):
         )
         if len(critic_output.token_ids) > max_tokens:
             raise ValueError("reasoning critic server exceeded its hard response budget")
-        decoded = self.tokenizer.decode(critic_output.token_ids, skip_special_tokens=True)
+        decoded = self.tokenizer.decode(critic_output.token_ids, skip_special_tokens=self.skip_response_special_tokens)
         eos = getattr(self.tokenizer, "eos_token", None)
         if eos and decoded.endswith(eos):
             decoded = decoded[:-len(eos)]
@@ -1896,7 +1917,7 @@ class ToolAgentLoop(AgentLoopBase):
 
         response_ids = agent_data.prompt_ids[-len(agent_data.response_mask) :] if agent_data.response_mask else []
         solution_str = await self.loop.run_in_executor(
-            None, lambda: self.tokenizer.decode(response_ids, skip_special_tokens=True)
+            None, lambda: self.tokenizer.decode(response_ids, skip_special_tokens=self.skip_response_special_tokens)
         )
         solution_str = apply_response_display_prefix(solution_str, self.response_display_prefix)
         return await self._score_solution_with_optional_llm_judge(
@@ -1916,7 +1937,7 @@ class ToolAgentLoop(AgentLoopBase):
 
         response_ids = agent_data.prompt_ids[-len(agent_data.response_mask) :] if agent_data.response_mask else []
         solution_str = await self.loop.run_in_executor(
-            None, lambda: self.tokenizer.decode(response_ids, skip_special_tokens=True)
+            None, lambda: self.tokenizer.decode(response_ids, skip_special_tokens=self.skip_response_special_tokens)
         )
         solution_str = apply_response_display_prefix(solution_str, self.response_display_prefix)
         grade = await self._score_solution_with_optional_llm_judge(
@@ -2006,7 +2027,7 @@ class ToolAgentLoop(AgentLoopBase):
         if not getattr(self, "llm_judge_prompt_template", None):
             return {"llm_judge_used": False, "llm_judge_error": "missing_prompt_template"}
 
-        is_valid, final_answer_text, _, _ = _parse_multiturn_tool_calling_output(solution_str)
+        is_valid, final_answer_text, _, _ = self._parse_solver_output(solution_str)
         if not is_valid or not final_answer_text:
             if "<answer>" in str(solution_str) and "</answer>" in str(solution_str):
                 return {"llm_judge_used": False, "llm_judge_error": "missing_final_answer"}
@@ -2050,7 +2071,9 @@ class ToolAgentLoop(AgentLoopBase):
             timeout_s = getattr(self, "llm_judge_timeout_s", None)
             output = await asyncio.wait_for(judge_coro, timeout=float(timeout_s)) if timeout_s else await judge_coro
             raw_suffix = await self.loop.run_in_executor(
-                None, lambda: self.tokenizer.decode(output.token_ids, skip_special_tokens=True)
+                None, lambda: self.tokenizer.decode(
+                    output.token_ids, skip_special_tokens=self.skip_response_special_tokens
+                )
             )
             parsed = self._parse_llm_judge_response(raw_suffix)
         except Exception as exc:  # noqa: BLE001 - judge failures should be recoverable.
@@ -2394,6 +2417,9 @@ class ToolAgentLoop(AgentLoopBase):
             agent_data.debug_events.append(event)
             self._debug_append_event(event)
 
+    async def _render_tool_response(self, agent_data, messages, **kwargs):
+        return await self.apply_chat_template(messages, **kwargs)
+
     async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
         """Handle the processing tools state: execute tool calls and prepare tool responses."""
         add_messages: list[dict[str, Any]] = []
@@ -2439,8 +2465,10 @@ class ToolAgentLoop(AgentLoopBase):
                     "terminal_reason": tool_response.terminal_reason,
                 }
             )
-            response_ids = await self.apply_chat_template(
-                [{"role": "tool", "content": terminal_text}],
+            response_ids = await getattr(
+                self, "_render_tool_response", lambda data, messages, **kw: self.apply_chat_template(messages, **kw)
+            )(
+                agent_data, [{"role": "tool", "content": terminal_text}],
                 images=None,
                 videos=None,
                 remove_system_prompt=True,
@@ -2565,8 +2593,10 @@ class ToolAgentLoop(AgentLoopBase):
             # to stay compatible with downstream image processing logic!
             images = new_images_this_turn if new_images_this_turn else None
             videos = None
-            response_ids = await self.apply_chat_template(
-                add_messages,
+            response_ids = await getattr(
+                self, "_render_tool_response", lambda data, messages, **kw: self.apply_chat_template(messages, **kw)
+            )(
+                agent_data, add_messages,
                 images=images,
                 videos=videos,
                 remove_system_prompt=True,
@@ -2841,7 +2871,9 @@ class ToolAgentLoop(AgentLoopBase):
         if not debug_dir:
             return
         final_response = await self.loop.run_in_executor(
-            None, lambda: self.tokenizer.decode(output.response_ids, skip_special_tokens=True)
+            None, lambda: self.tokenizer.decode(
+                output.response_ids, skip_special_tokens=self.skip_response_special_tokens
+            )
         )
         final_response = apply_response_display_prefix(final_response, self.response_display_prefix)
         record = {

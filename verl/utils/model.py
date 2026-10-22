@@ -750,6 +750,8 @@ def extract_multi_modal_inputs(
         if has_image_bound:  # minicpm-o logic
             multi_modal_inputs[key] = values
         else:
+            if key == "mm_token_type_ids" and len({v.shape[-1] for v in values}) != 1:
+                raise ValueError("modality masks must align with padded training input_ids before batching")
             multi_modal_inputs[key] = torch.cat(values, dim=0)
 
     return multi_modal_inputs

@@ -451,7 +451,9 @@ def get_fsdp_full_state_dict(model: torch.nn.Module, offload_to_cpu: bool = True
         raise NotImplementedError(f"Unknown FSDP version {fsdp_version}")
 
 
-def fsdp2_load_full_state_dict(model: torch.nn.Module, full_state: dict, device_mesh=None, cpu_offload=None):
+def fsdp2_load_full_state_dict(
+    model: torch.nn.Module, full_state: dict, device_mesh=None, cpu_offload=None, *, sync_buffers_by_name=False
+):
     """
     Loads the full state dict (could be only on rank 0) into the sharded model. This is done by broadcasting the
     parameters from rank 0 to all other ranks. This function modifies the model in-place.
@@ -479,8 +481,13 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_state: dict, device_
     set_model_state_dict(model, full_state, options=options)
 
     # rotary_emb is not in state_dict, so we need to broadcast it manually
-    for name, buf in model.named_buffers():
-        dist.broadcast(buf, src=0)
+    if sync_buffers_by_name:
+        from verl.models.gemma4.fsdp import broadcast_buffers_by_name
+
+        broadcast_buffers_by_name(model)
+    else:
+        for name, buf in model.named_buffers():
+            dist.broadcast(buf, src=0)
 
     if cpu_offload:
         model.to("cpu", non_blocking=True)
@@ -548,6 +555,12 @@ def apply_fsdp2(model, fsdp_kwargs, config):
     assert len(fsdp_transformer_layer_cls_to_wrap) > 0 and fsdp_transformer_layer_cls_to_wrap[0] is not None
 
     modules = _select_fsdp2_wrap_targets(model, fsdp_transformer_layer_cls_to_wrap)
+    if config.get("freeze_audio_tower", False):
+        modules = [module for module in modules if any(p.requires_grad for p in module.parameters())]
+    if config.get("gemma4_group_text_layers", False):
+        from verl.models.gemma4.fsdp import group_text_wrap_targets
+
+        modules = group_text_wrap_targets(model, modules)
 
     for idx, module in enumerate(modules):
         # if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:

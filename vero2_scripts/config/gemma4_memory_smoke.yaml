@@ -1,0 +1,77 @@
+# Memory-fix smoke: two GPUs and production context/turn limits.
+# Retain the previously authorized smoke-only untagged accuracy adapter.
+defaults:
+- branchstrata20_fresh_lr1e5_critic_gemma4_e4b_recipe
+- _self_
+hydra:
+  searchpath:
+  - file://${oc.env:VERL_ROOT}/verl/trainer/config
+data:
+  train_max_samples: 4
+  val_max_samples: 4
+  shuffle: false
+  seed: 42
+  train_batch_size: 2
+  val_batch_size: 2
+  filter_overlong_prompts_workers: 1
+  max_prompt_length: 16384
+  max_response_length: 24576
+actor_rollout_ref:
+  actor:
+    ppo_mini_batch_size: 2
+    ppo_micro_batch_size_per_gpu: 1
+    ppo_max_token_len_per_gpu: 49296
+    optim:
+      lr_warmup_steps: 0
+    fsdp_config:
+      fsdp_size: 2
+      param_offload: true
+      optimizer_offload: true
+      gemma4_smoke_diagnostics: true
+      offload_policy: true
+  rollout:
+    tensor_model_parallel_size: 2
+    agent:
+      num_workers: 1
+      default_agent_loop: gemma4_untagged_accuracy_smoke
+      agent_loop_config_path: ${oc.env:VERL_ROOT}/vero2_scripts/config/gemma4_untagged_accuracy_smoke_agents.yaml
+    n: 2
+    enforce_eager: true
+    max_model_len: 40960
+    max_num_seqs: 4
+    max_num_batched_tokens: 8192
+    multi_turn:
+      max_assistant_turns: 11
+      max_user_turns: 10
+      conditional_answer_retry_max_retries: 1
+      final_answer_token_margin: 2048
+    log_prob_max_token_len_per_gpu: 49296
+    lazy_multi_modal_inputs:
+      cleanup_crop_cache: false
+  ref:
+    fsdp_config:
+      fsdp_size: 2
+      param_offload: true
+    log_prob_max_token_len_per_gpu: 49296
+reward:
+  custom_reward_function:
+    path: ${oc.env:VERL_ROOT}/verl/utils/reward_score/gemma4_untagged_accuracy_smoke.py
+  reward_kwargs:
+    overlong_buffer_cfg:
+      len: 2048
+trainer:
+  n_gpus_per_node: 2
+  total_training_steps: 2
+  total_epochs: 1
+  save_freq: 1
+  test_freq: -1
+  logger:
+  - console
+  resume_mode: disable
+  experiment_name: gemma4_memory_smoke_${oc.env:SLURM_JOB_ID,local}
+  comprehensive_debug_logging:
+    log_every_n_steps: 1
+    save_cropped_images: true
+    save_source_images: true
+    gpu_memory_logging:
+      enabled: true

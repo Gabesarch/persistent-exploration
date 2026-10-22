@@ -968,6 +968,10 @@ class AgentLoopWorker:
         if self.processor is None:
             return multi_modal_inputs
 
+        if self.processor.__class__.__name__ == "Gemma4Processor":
+            from verl.models.gemma4.processing import multimodal_inputs
+            return multimodal_inputs(self.processor, input_ids, output.multi_modal_data.get("images"))
+
         images = output.multi_modal_data.get("images")
         videos = output.multi_modal_data.get("videos")
         # split the videos and according metadatas
@@ -999,7 +1003,7 @@ class AgentLoopWorker:
 
     def _compute_position_ids(self, input_ids, attention_mask, multi_modal_inputs) -> torch.Tensor:
         """Compute position ids for multi-modal inputs."""
-        if self.processor is None:
+        if self.processor is None or not hasattr(self.processor, "get_rope_index"):
             return compute_position_id_with_mask(attention_mask)  # (1, seq_len)
 
         multi_modal_kwargs = {

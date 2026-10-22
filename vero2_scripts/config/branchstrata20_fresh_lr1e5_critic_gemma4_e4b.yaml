@@ -1,0 +1,6 @@
+defaults:
+- branchstrata20_fresh_lr1e5_critic_gemma4_e4b_recipe
+- _self_
+hydra:
+  searchpath:
+  - file://${oc.env:VERL_ROOT}/verl/trainer/config

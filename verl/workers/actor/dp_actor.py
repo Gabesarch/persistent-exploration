@@ -28,6 +28,7 @@ from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
+from verl.models.gemma4.profiling import actor_stage, profile_actor, stage
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.crop_cache import CROP_IMAGE_REFS_KEY
@@ -146,6 +147,7 @@ class DataParallelPPOActor(BasePPOActor):
                 f"{self.use_fused_kernels=} or {self.use_prefix_grouper=} for now."
             )
 
+    @actor_stage
     def _extract_multi_modal_inputs(self, micro_batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         if "multi_modal_inputs" not in micro_batch:
             return {}
@@ -175,6 +177,7 @@ class DataParallelPPOActor(BasePPOActor):
         )
         return extract_multi_modal_inputs(rebuilt_multi_modal_inputs)
 
+    @actor_stage
     def _forward_micro_batch(
         self, micro_batch: dict[str, torch.Tensor], temperature: float, calculate_entropy: bool = False
     ) -> dict[str, torch.Tensor]:
@@ -406,6 +409,27 @@ class DataParallelPPOActor(BasePPOActor):
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
 
             else:  # not using rmpad and no ulysses sp
+                if self.config.fsdp_config.get("gemma4_policy_chunk_size", 0):
+                    if self.use_fused_kernels or self.use_ulysses_sp or calculate_sum_pi_squared:
+                        raise ValueError("Gemma chunked policy requires unfused SP=1 without sum_pi_squared")
+                    if self.config.fsdp_config.get("gemma4_trim_padding", False):
+                        from verl.models.gemma4.trimming import validate_loss_masks
+
+                        validate_loss_masks(micro_batch)
+                    output = self.actor_module(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        **multi_modal_inputs,
+                        use_cache=False,
+                        gemma4_response_labels=micro_batch["responses"],
+                        gemma4_temperature=temperature,
+                        gemma4_calculate_entropy=calculate_entropy,
+                    )
+                    result = {"log_probs": output["log_probs"]}
+                    if calculate_entropy:
+                        result["entropys"] = output["entropys"]
+                    return result
                 extra_args = {}
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
@@ -451,19 +475,28 @@ class DataParallelPPOActor(BasePPOActor):
                 outputs["sum_pi_squared"] = sum_pi_squared
             return outputs
 
+    @actor_stage
     def _optimizer_step(self):
-        assert self.config.grad_clip is not None
-        if self.scaler is not None:
-            self.scaler.unscale_(self.actor_optimizer)
-        if isinstance(self.actor_module, FSDP):
-            grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
-        elif isinstance(self.actor_module, FSDPModule):
-            grad_norm = fsdp2_clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
-        else:
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
+        gemma_probe = None
+        if self.config.get("fsdp_config", {}).get("gemma4_smoke_diagnostics", False):
+            from verl.models.gemma4.training_diagnostics import before_optimizer_step
 
-        if isinstance(grad_norm, DTensor):
-            grad_norm = grad_norm.full_tensor()
+            gemma_probe = before_optimizer_step(self.actor_module)
+        with stage("gradient_clipping"):
+            assert self.config.grad_clip is not None
+            if self.scaler is not None:
+                self.scaler.unscale_(self.actor_optimizer)
+            if isinstance(self.actor_module, FSDP):
+                grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
+            elif isinstance(self.actor_module, FSDPModule):
+                grad_norm = fsdp2_clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
+            else:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.actor_module.parameters(), max_norm=self.config.grad_clip
+                )
+
+            if isinstance(grad_norm, DTensor):
+                grad_norm = grad_norm.full_tensor()
 
         # if grad_norm is not finite, skip the update
         if self.scaler is not None:
@@ -474,7 +507,8 @@ class DataParallelPPOActor(BasePPOActor):
                 print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
                 self.actor_optimizer.zero_grad()
             else:
-                self.actor_optimizer.step()
+                with stage("optimizer_step"):
+                    self.actor_optimizer.step()
 
         # Clear cached weight scales for QAT (weights changed)
         if getattr(self.actor_module, "_qat_fuse_enabled", False):
@@ -482,9 +516,14 @@ class DataParallelPPOActor(BasePPOActor):
 
             invalidate_all_scales(self.actor_module)
 
+        if gemma_probe is not None:
+            from verl.models.gemma4.training_diagnostics import after_optimizer_step
+
+            self._gemma4_smoke_metrics = after_optimizer_step(gemma_probe)
         return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
+    @profile_actor
     def compute_log_prob(self, data: DataProto, calculate_entropy: bool = False) -> dict[str, torch.Tensor]:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
 
@@ -577,6 +616,7 @@ class DataParallelPPOActor(BasePPOActor):
         return outputs
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
+    @profile_actor
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
         self.actor_module.train()
@@ -700,9 +740,7 @@ class DataParallelPPOActor(BasePPOActor):
                     if retry_critic_dataset_balance:
                         num_strata = len(retry_critic_stratum_names)
                         critic_stratum_id = mini_batch.batch["retry_critic_stratum_id"].to(dtype=torch.long)
-                        invalid_rows = critic_rows & (
-                            (critic_stratum_id < 0) | (critic_stratum_id >= num_strata)
-                        )
+                        invalid_rows = critic_rows & ((critic_stratum_id < 0) | (critic_stratum_id >= num_strata))
                         if bool(invalid_rows.any().item()):
                             raise ValueError("Active retry critic rows contain invalid dataset stratum ids.")
                         active_stratum_id = critic_stratum_id[critic_rows]
@@ -714,9 +752,7 @@ class DataParallelPPOActor(BasePPOActor):
                             weights=critic_parent_weight[critic_rows].to(dtype=torch.float64),
                             minlength=num_strata,
                         )
-                        critic_stats = torch.cat((stratum_examples, stratum_parent_mass)).to(
-                            device=get_device_id()
-                        )
+                        critic_stats = torch.cat((stratum_examples, stratum_parent_mass)).to(device=get_device_id())
                     else:
                         critic_stats = torch.tensor(
                             [
@@ -732,9 +768,7 @@ class DataParallelPPOActor(BasePPOActor):
                         torch.distributed.all_reduce(critic_stats, op=torch.distributed.ReduceOp.SUM)
                     if retry_critic_dataset_balance:
                         num_strata = len(retry_critic_stratum_names)
-                        global_critic_stratum_examples = [
-                            int(value) for value in critic_stats[:num_strata].tolist()
-                        ]
+                        global_critic_stratum_examples = [int(value) for value in critic_stats[:num_strata].tolist()]
                         global_critic_stratum_parent_mass = [
                             float(value) for value in critic_stats[num_strata:].tolist()
                         ]
@@ -777,9 +811,7 @@ class DataParallelPPOActor(BasePPOActor):
                         critic_bool = retry_critic_mask.to(dtype=torch.bool)
                         if torch.any(response_mask.to(dtype=torch.bool) & critic_bool):
                             raise ValueError("response_mask and retry_critic_mask must be disjoint")
-                        if retry_sft_mask is not None and torch.any(
-                            retry_sft_mask.to(dtype=torch.bool) & critic_bool
-                        ):
+                        if retry_sft_mask is not None and torch.any(retry_sft_mask.to(dtype=torch.bool) & critic_bool):
                             raise ValueError("retry_sft_mask and retry_critic_mask must be disjoint")
                     old_log_prob = model_inputs["old_log_probs"]
                     advantages = model_inputs["advantages"]
@@ -801,174 +833,176 @@ class DataParallelPPOActor(BasePPOActor):
                     log_prob = outputs["log_probs"]
                     entropy = outputs["entropys"] if calculate_entropy else None
 
-                    # for fully_async_policy
-                    if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
-                        old_log_prob = model_inputs["old_log_probs"]
-                    else:
-                        if on_policy:
-                            old_log_prob = log_prob.detach()
-                        else:
+                    with stage("loss_construction"):
+                        # for fully_async_policy
+                        if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
                             old_log_prob = model_inputs["old_log_probs"]
-
-                    loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-                    # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
-
-                    # Extract pre-computed rollout correction weights if present
-                    # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
-                    rollout_is_weights = model_inputs.get("rollout_is_weights", None)
-
-                    # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
-                    # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
-                    policy_loss_fn = get_policy_loss_fn(loss_mode)
-
-                    branch_policy_loss_weight = model_inputs.get("branch_policy_loss_weight", None)
-                    branch_policy_loss_is_branch = model_inputs.get("branch_policy_loss_is_branch", None)
-
-                    # Compute policy loss (any function is expected to return 2 values)
-                    policy_loss_kwargs = {}
-                    if branch_strata_enabled:
-                        policy_loss_kwargs.update(
-                            branch_policy_loss_weight=branch_policy_loss_weight,
-                            branch_policy_loss_is_branch=branch_policy_loss_is_branch,
-                        )
-                    pg_loss, pg_metrics = policy_loss_fn(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        loss_agg_mode=loss_agg_mode,
-                        config=self.config,
-                        rollout_is_weights=rollout_is_weights,
-                        **policy_loss_kwargs,
-                    )
-                    micro_batch_metrics.update(pg_metrics)
-
-                    # Skip if using bypass_mode loss (metrics already computed in pg_metrics)
-                    rollout_log_prob = model_inputs.get("rollout_log_probs", None)
-                    if loss_mode != "bypass_mode" and rollout_log_prob is not None:
-                        # Compute metrics using CURRENT policy π_θ vs π_rollout
-                        # Tracks evolving off-policy gap as π_θ updates during mini-batch training
-                        from verl.trainer.ppo.rollout_corr_helper import compute_rollout_corr_metrics_from_logprobs
-
-                        rollout_corr_metrics = compute_rollout_corr_metrics_from_logprobs(
-                            log_prob=log_prob,
-                            rollout_log_prob=rollout_log_prob,
-                            response_mask=response_mask,
-                        )
-                        micro_batch_metrics.update(rollout_corr_metrics)
-
-                    policy_loss = pg_loss
-                    if calculate_entropy and entropy is not None:
-                        entropy_agg = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-                        micro_batch_metrics["actor/entropy"] = entropy_agg.detach().item()
-                        if entropy_coeff != 0:
-                            policy_loss -= entropy_agg * entropy_coeff
-
-                    if self.config.use_kl_loss:
-                        ref_log_prob = model_inputs["ref_log_prob"]
-                        # compute kl loss
-                        kld = kl_penalty(
-                            logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
-                        )
-                        kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-
-                        policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
-                        metrics["actor/kl_loss"] += kl_loss.detach().item() * loss_scale_factor
-                        micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
-
-                    rl_loss_for_backward = policy_loss * loss_scale_factor
-                    retry_sft_loss = log_prob.sum() * 0.0
-                    if retry_sft_enabled and global_retry_sft_tokens > 0:
-                        retry_sft_loss = masked_sft_nll(
-                            log_prob,
-                            retry_sft_mask.to(dtype=torch.bool),
-                            batch_num_tokens=global_retry_sft_tokens,
-                            dp_size=dp_size,
-                        )
-                        retry_sft_fraction = float(self.config.policy_loss.retry_sft.loss_fraction)
-                        loss = combine_retry_sft_loss(
-                            rl_loss_for_backward,
-                            retry_sft_loss,
-                            loss_fraction=retry_sft_fraction,
-                            has_rl=global_rl_tokens > 0,
-                            has_retry_sft=True,
-                        )
-                    else:
-                        retry_sft_fraction = 0.0
-                        loss = combine_retry_sft_loss(
-                            rl_loss_for_backward,
-                            retry_sft_loss,
-                            loss_fraction=float(self.config.policy_loss.retry_sft.loss_fraction)
-                            if retry_sft_enabled
-                            else 0.0,
-                            has_rl=global_rl_tokens > 0 if retry_sft_enabled else True,
-                            has_retry_sft=False,
-                        )
-                    retry_critic_loss = log_prob.sum() * 0.0
-                    retry_critic_accept_nll = log_prob.sum() * 0.0
-                    retry_critic_retry_nll = log_prob.sum() * 0.0
-                    retry_critic_fraction = 0.0
-                    has_critic = any(global_critic_examples)
-                    if retry_critic_enabled and has_critic:
-                        if retry_critic_dataset_balance:
-                            retry_critic_loss, stratum_nll, present_strata = (
-                                parent_balanced_retry_critic_strata_loss(
-                                    log_prob,
-                                    retry_critic_mask,
-                                    model_inputs["retry_critic_stratum_id"],
-                                    model_inputs["retry_critic_parent_weight"],
-                                    global_stratum_parent_mass=global_critic_stratum_parent_mass,
-                                    dp_size=dp_size,
-                                )
-                            )
-                            accept_present = present_strata[0::2]
-                            retry_present = present_strata[1::2]
-                            if bool(accept_present.any().item()):
-                                retry_critic_accept_nll = stratum_nll[0::2][accept_present].mean()
-                            if bool(retry_present.any().item()):
-                                retry_critic_retry_nll = stratum_nll[1::2][retry_present].mean()
-                            for stratum_index, stratum_name in enumerate(retry_critic_stratum_names):
-                                if bool(present_strata[stratum_index].item()):
-                                    metrics[f"actor/retry_critic_strata/{stratum_name}_nll"] = (
-                                        metrics.get(f"actor/retry_critic_strata/{stratum_name}_nll", 0.0)
-                                        + stratum_nll[stratum_index].detach().item()
-                                    )
                         else:
-                            (
-                                retry_critic_loss,
-                                retry_critic_accept_nll,
-                                retry_critic_retry_nll,
-                                _,
-                                _,
-                            ) = parent_balanced_retry_critic_loss(
+                            if on_policy:
+                                old_log_prob = log_prob.detach()
+                            else:
+                                old_log_prob = model_inputs["old_log_probs"]
+
+                        loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+                        # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
+
+                        # Extract pre-computed rollout correction weights if present
+                        # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
+                        rollout_is_weights = model_inputs.get("rollout_is_weights", None)
+
+                        # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
+                        # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
+                        policy_loss_fn = get_policy_loss_fn(loss_mode)
+
+                        branch_policy_loss_weight = model_inputs.get("branch_policy_loss_weight", None)
+                        branch_policy_loss_is_branch = model_inputs.get("branch_policy_loss_is_branch", None)
+
+                        # Compute policy loss (any function is expected to return 2 values)
+                        policy_loss_kwargs = {}
+                        if branch_strata_enabled:
+                            policy_loss_kwargs.update(
+                                branch_policy_loss_weight=branch_policy_loss_weight,
+                                branch_policy_loss_is_branch=branch_policy_loss_is_branch,
+                            )
+                        pg_loss, pg_metrics = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                            **policy_loss_kwargs,
+                        )
+                        micro_batch_metrics.update(pg_metrics)
+
+                        # Skip if using bypass_mode loss (metrics already computed in pg_metrics)
+                        rollout_log_prob = model_inputs.get("rollout_log_probs", None)
+                        if loss_mode != "bypass_mode" and rollout_log_prob is not None:
+                            # Compute metrics using CURRENT policy π_θ vs π_rollout
+                            # Tracks evolving off-policy gap as π_θ updates during mini-batch training
+                            from verl.trainer.ppo.rollout_corr_helper import compute_rollout_corr_metrics_from_logprobs
+
+                            rollout_corr_metrics = compute_rollout_corr_metrics_from_logprobs(
+                                log_prob=log_prob,
+                                rollout_log_prob=rollout_log_prob,
+                                response_mask=response_mask,
+                            )
+                            micro_batch_metrics.update(rollout_corr_metrics)
+
+                        policy_loss = pg_loss
+                        if calculate_entropy and entropy is not None:
+                            entropy_agg = agg_loss(
+                                loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode
+                            )
+                            micro_batch_metrics["actor/entropy"] = entropy_agg.detach().item()
+                            if entropy_coeff != 0:
+                                policy_loss -= entropy_agg * entropy_coeff
+
+                        if self.config.use_kl_loss:
+                            ref_log_prob = model_inputs["ref_log_prob"]
+                            # compute kl loss
+                            kld = kl_penalty(
+                                logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
+                            )
+                            kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+                            policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+                            metrics["actor/kl_loss"] += kl_loss.detach().item() * loss_scale_factor
+                            micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
+
+                        rl_loss_for_backward = policy_loss * loss_scale_factor
+                        retry_sft_loss = log_prob.sum() * 0.0
+                        if retry_sft_enabled and global_retry_sft_tokens > 0:
+                            retry_sft_loss = masked_sft_nll(
                                 log_prob,
-                                retry_critic_mask,
-                                model_inputs["retry_critic_is_retry"],
-                                model_inputs["retry_critic_parent_weight"],
-                                global_accept_parent_mass=global_critic_parent_mass[0],
-                                global_retry_parent_mass=global_critic_parent_mass[1],
+                                retry_sft_mask.to(dtype=torch.bool),
+                                batch_num_tokens=global_retry_sft_tokens,
                                 dp_size=dp_size,
                             )
-                        retry_critic_fraction = float(self.config.policy_loss.retry_critic.loss_fraction)
-                    loss = combine_retry_critic_loss(
-                        loss,
-                        retry_critic_loss,
-                        loss_fraction=float(self.config.policy_loss.retry_critic.loss_fraction)
-                        if retry_critic_enabled
-                        else 0.0,
-                        has_existing=(global_rl_tokens > 0 or global_retry_sft_tokens > 0),
-                        has_critic=retry_critic_enabled and has_critic,
-                    )
-                    if self.scaler is not None:
-                        self.scaler.scale(loss).backward()
-                    else:
-                        loss.backward()
+                            retry_sft_fraction = float(self.config.policy_loss.retry_sft.loss_fraction)
+                            loss = combine_retry_sft_loss(
+                                rl_loss_for_backward,
+                                retry_sft_loss,
+                                loss_fraction=retry_sft_fraction,
+                                has_rl=global_rl_tokens > 0,
+                                has_retry_sft=True,
+                            )
+                        else:
+                            retry_sft_fraction = 0.0
+                            loss = combine_retry_sft_loss(
+                                rl_loss_for_backward,
+                                retry_sft_loss,
+                                loss_fraction=float(self.config.policy_loss.retry_sft.loss_fraction)
+                                if retry_sft_enabled
+                                else 0.0,
+                                has_rl=global_rl_tokens > 0 if retry_sft_enabled else True,
+                                has_retry_sft=False,
+                            )
+                        retry_critic_loss = log_prob.sum() * 0.0
+                        retry_critic_accept_nll = log_prob.sum() * 0.0
+                        retry_critic_retry_nll = log_prob.sum() * 0.0
+                        retry_critic_fraction = 0.0
+                        has_critic = any(global_critic_examples)
+                        if retry_critic_enabled and has_critic:
+                            if retry_critic_dataset_balance:
+                                retry_critic_loss, stratum_nll, present_strata = (
+                                    parent_balanced_retry_critic_strata_loss(
+                                        log_prob,
+                                        retry_critic_mask,
+                                        model_inputs["retry_critic_stratum_id"],
+                                        model_inputs["retry_critic_parent_weight"],
+                                        global_stratum_parent_mass=global_critic_stratum_parent_mass,
+                                        dp_size=dp_size,
+                                    )
+                                )
+                                accept_present = present_strata[0::2]
+                                retry_present = present_strata[1::2]
+                                if bool(accept_present.any().item()):
+                                    retry_critic_accept_nll = stratum_nll[0::2][accept_present].mean()
+                                if bool(retry_present.any().item()):
+                                    retry_critic_retry_nll = stratum_nll[1::2][retry_present].mean()
+                                for stratum_index, stratum_name in enumerate(retry_critic_stratum_names):
+                                    if bool(present_strata[stratum_index].item()):
+                                        metrics[f"actor/retry_critic_strata/{stratum_name}_nll"] = (
+                                            metrics.get(f"actor/retry_critic_strata/{stratum_name}_nll", 0.0)
+                                            + stratum_nll[stratum_index].detach().item()
+                                        )
+                            else:
+                                (
+                                    retry_critic_loss,
+                                    retry_critic_accept_nll,
+                                    retry_critic_retry_nll,
+                                    _,
+                                    _,
+                                ) = parent_balanced_retry_critic_loss(
+                                    log_prob,
+                                    retry_critic_mask,
+                                    model_inputs["retry_critic_is_retry"],
+                                    model_inputs["retry_critic_parent_weight"],
+                                    global_accept_parent_mass=global_critic_parent_mass[0],
+                                    global_retry_parent_mass=global_critic_parent_mass[1],
+                                    dp_size=dp_size,
+                                )
+                            retry_critic_fraction = float(self.config.policy_loss.retry_critic.loss_fraction)
+                        loss = combine_retry_critic_loss(
+                            loss,
+                            retry_critic_loss,
+                            loss_fraction=float(self.config.policy_loss.retry_critic.loss_fraction)
+                            if retry_critic_enabled
+                            else 0.0,
+                            has_existing=(global_rl_tokens > 0 or global_retry_sft_tokens > 0),
+                            has_critic=retry_critic_enabled and has_critic,
+                        )
+                    with stage("backward"):
+                        if self.scaler is not None:
+                            self.scaler.scale(loss).backward()
+                        else:
+                            loss.backward()
 
                     metrics["actor/pg_loss"] += pg_loss.detach().item() * loss_scale_factor
                     metrics["actor/retry_sft_loss"] += retry_sft_loss.detach().item()
-                    metrics["actor/retry_sft_weighted_loss"] += (
-                        retry_sft_loss.detach().item() * retry_sft_fraction
-                    )
+                    metrics["actor/retry_sft_weighted_loss"] += retry_sft_loss.detach().item() * retry_sft_fraction
                     metrics["actor/retry_critic_loss"] += retry_critic_loss.detach().item()
                     metrics["actor/retry_critic_accept_nll"] += retry_critic_accept_nll.detach().item()
                     metrics["actor/retry_critic_retry_nll"] += retry_critic_retry_nll.detach().item()
@@ -980,6 +1014,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
+                mini_batch_metrics.update(getattr(self, "_gemma4_smoke_metrics", {}))
                 if retry_critic_enabled:
                     mini_batch_metrics.update(
                         {
@@ -992,20 +1027,14 @@ class DataParallelPPOActor(BasePPOActor):
                         }
                     )
                     if retry_critic_dataset_balance:
-                        mini_batch_metrics["actor/retry_critic_configured_strata"] = len(
-                            retry_critic_stratum_names
-                        )
+                        mini_batch_metrics["actor/retry_critic_configured_strata"] = len(retry_critic_stratum_names)
                         mini_batch_metrics["actor/retry_critic_present_strata"] = sum(
                             count > 0 for count in global_critic_stratum_examples
                         )
                         for stratum_index, stratum_name in enumerate(retry_critic_stratum_names):
                             prefix = f"actor/retry_critic_strata/{stratum_name}"
-                            mini_batch_metrics[f"{prefix}_examples"] = global_critic_stratum_examples[
-                                stratum_index
-                            ]
-                            mini_batch_metrics[f"{prefix}_parents"] = global_critic_stratum_parent_mass[
-                                stratum_index
-                            ]
+                            mini_batch_metrics[f"{prefix}_examples"] = global_critic_stratum_examples[stratum_index]
+                            mini_batch_metrics[f"{prefix}_parents"] = global_critic_stratum_parent_mass[stratum_index]
                             mini_batch_metrics[f"{prefix}_missing"] = float(
                                 global_critic_stratum_examples[stratum_index] == 0
                             )

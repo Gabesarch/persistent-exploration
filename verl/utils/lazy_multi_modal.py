@@ -34,6 +34,8 @@ METADATA_COMPARE_KEYS = (
     "image_grid_thw",
     "video_grid_thw",
     "images_seqlens",
+    "image_position_ids",
+    "mm_token_type_ids",
 )
 
 
@@ -63,7 +65,9 @@ def should_rehydrate_multi_modal_inputs(batch_multi_modal_inputs: Sequence[Any])
             sample_inputs = sample_inputs.data
         if not isinstance(sample_inputs, Mapping):
             continue
-        has_image_metadata = "image_grid_thw" in sample_inputs and "pixel_values" not in sample_inputs
+        has_image_metadata = (
+            "image_grid_thw" in sample_inputs or "image_position_ids" in sample_inputs
+        ) and "pixel_values" not in sample_inputs
         has_video_metadata = "video_grid_thw" in sample_inputs and "pixel_values_videos" not in sample_inputs
         if has_image_metadata or has_video_metadata:
             return True
@@ -119,6 +123,9 @@ def _compute_multi_modal_inputs_for_sample(
     input_ids: torch.Tensor,
     multi_modal_data: dict[str, Any],
 ) -> dict[str, torch.Tensor]:
+    if processor.__class__.__name__ == "Gemma4Processor":
+        from verl.models.gemma4.processing import multimodal_inputs
+        return multimodal_inputs(processor, input_ids, multi_modal_data.get("images"))
     images = multi_modal_data.get("images")
     videos = multi_modal_data.get("videos")
     if videos is not None:
