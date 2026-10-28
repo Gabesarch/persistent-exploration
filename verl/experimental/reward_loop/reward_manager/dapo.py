@@ -36,6 +36,7 @@ class DAPORewardManager(RewardManagerBase):
         self.overlong_buffer_cfg = overlong_buffer_cfg
         self.max_resp_len = reward_kwargs.get("max_resp_len", None)
         self.reward_response_prefix = reward_kwargs.get("reward_response_prefix", "")
+        self.skip_special_tokens = reward_kwargs.get("skip_special_tokens", True)
         self.reward_router_address = reward_router_address
         self.reward_model_tokenizer = reward_model_tokenizer
         self.debug_options = get_debug_options(config)
@@ -70,7 +71,7 @@ class DAPORewardManager(RewardManagerBase):
             extra_info.update(tool_extra_fields)
 
         response_str = await self.loop.run_in_executor(
-            None, lambda: self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+            None, lambda: self.tokenizer.decode(valid_response_ids, skip_special_tokens=self.skip_special_tokens)
         )
         if self.reward_response_prefix:
             response_str = f"{self.reward_response_prefix}{response_str}"

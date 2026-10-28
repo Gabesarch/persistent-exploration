@@ -84,6 +84,9 @@ policy_loss:
     # Enable separate canonical and branch GSPO loss strata.
     enabled: false
 
+    # Log signed advantage mass after loss masking and row weighting, once per full batch.
+    log_advantage_mass: false
+
     # Maximum fraction of policy loss assigned to branch suffixes.
     branch_fraction: 0.2
 

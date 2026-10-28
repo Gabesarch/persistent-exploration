@@ -35,6 +35,7 @@ class DAPORewardManager(AbstractRewardManager):
         max_resp_len=None,
         overlong_buffer_cfg=None,
         reward_response_prefix="",
+        skip_special_tokens=True,
     ) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
@@ -43,6 +44,7 @@ class DAPORewardManager(AbstractRewardManager):
         self.overlong_buffer_cfg = overlong_buffer_cfg
         self.max_resp_len = max_resp_len
         self.reward_response_prefix = reward_response_prefix
+        self.skip_special_tokens = skip_special_tokens
 
         if self.overlong_buffer_cfg is not None:
             assert self.max_resp_len is not None, (
@@ -86,7 +88,7 @@ class DAPORewardManager(AbstractRewardManager):
 
             # decode
             prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
-            response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+            response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=self.skip_special_tokens)
             eos_token = self.tokenizer.eos_token
             if response_str.endswith(eos_token):
                 response_str = response_str[: -len(eos_token)]

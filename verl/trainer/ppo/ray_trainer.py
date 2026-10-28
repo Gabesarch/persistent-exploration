@@ -45,6 +45,7 @@ from verl.trainer.distillation.losses import is_distillation_enabled
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
+    compute_branch_advantage_mass_metrics,
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
@@ -52,6 +53,16 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import extract_reward
+from verl.trainer.ppo.trajectory_replay import (
+    assign_prompt_group_schedules,
+    attach_mixed_loss_weights,
+    choose_task_rows,
+    compute_mixed_advantages,
+    fitting_replay_samples,
+    judge_row_mask,
+    object_array,
+    replay_prompt_target,
+)
 from verl.trainer.ppo.utils import (
     Role,
     WorkerType,
@@ -91,6 +102,7 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
+from verl.utils.trajectory_replay import ReplayCache, build_judge_messages
 from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
@@ -351,6 +363,211 @@ class RayPPOTrainer:
         self._validate_lazy_multi_modal_inputs_config()
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+        self._initialize_trajectory_replay()
+
+    def _trajectory_replay_config(self):
+        return self.config.get("trainer", {}).get("trajectory_replay", {})
+
+    def _reset_trajectory_replay_cache(self):
+        cache = getattr(self, "trajectory_replay_cache", None)
+        if cache is not None:
+            # A fresh actor must never consume live entries left after a failed run.
+            cache.entries, cache.step = [], 0
+            cache.commit([], 0)
+            cache.garbage_collect()
+
+    def _initialize_trajectory_replay(self):
+        config = self._trajectory_replay_config()
+        self.trajectory_replay_cache = None
+        self._replay_prompt_lengths = {}
+        self._replay_restore_step = -1
+        if not config.get("enabled", False):
+            return
+        if self.config.algorithm.adv_estimator not in ("gdpo", "grpo"):
+            raise ValueError("Trajectory replay requires GDPO or GRPO group advantages")
+        policy_loss = self.config.actor_rollout_ref.actor.policy_loss
+        if policy_loss.loss_mode != "gspo" or not self._branch_strata_config().get("enabled", False):
+            raise ValueError("Trajectory replay requires GSPO with branch-strata row weights")
+        if self._retry_critic_config().get("enabled", False) or policy_loss.get("retry_sft", {}).get("enabled", False):
+            raise ValueError("Trajectory replay cannot be combined with supervised retry losses")
+        multi_turn = self.config.actor_rollout_ref.rollout.multi_turn
+        if multi_turn.get("conditional_answer_retry_critic_oracle_supervision_enabled", True):
+            raise ValueError("Trajectory replay requires oracle critic token supervision to be disabled")
+        if multi_turn.get("conditional_answer_retry_accept_partial_credit", True):
+            raise ValueError("Trajectory replay uses full-credit-only candidate acceptance")
+        if float(config.get("format_weight", 0.2)) != 0.2:
+            raise ValueError("Trajectory replay requires judge GDPO weights [0.8, 0.2]")
+        hard_cap = int(config.get("normal_budget", 4096)) + int(config.get("overlong_buffer", 1024))
+        if int(config.get("normal_budget", 4096)) <= 0 or int(config.get("overlong_buffer", 1024)) <= 0:
+            raise ValueError("Replay judge normal budget and overlong buffer must be positive")
+        if hard_cap > self.config.data.max_response_length:
+            raise ValueError("Replay judge hard cap exceeds the padded response length")
+        replay_prompt_target(
+            self.config.data.train_batch_size, float(config.get("prompt_fraction", 0.2)),
+            config.get("batch_mode", "replace"),
+        )
+        self.trajectory_replay_cache = ReplayCache(
+            os.path.join(self.config.trainer.default_local_dir, "trajectory_replay"),
+            capacity=int(config.get("capacity", 8192)), seed=int(config.get("seed", 42)),
+        )
+
+    def _replay_prompt_fits(self, entry):
+        """Preflight exact persisted evidence with the worker's chat template."""
+        from PIL import Image
+
+        from verl.utils.chat_template import apply_chat_template
+
+        if entry["entry_id"] in self._replay_prompt_lengths:
+            return self._replay_prompt_lengths[entry["entry_id"]] <= self.config.data.max_prompt_length
+        config = self._trajectory_replay_config()
+        messages = build_judge_messages(
+            entry["question"], entry["answer"], entry["images"],
+            config.get("system_prompt_path") or config.get("system_prompt"),
+        )
+        kwargs = dict(self.config.data.get("apply_chat_template_kwargs", {}))
+        custom_template = self.config.actor_rollout_ref.model.get("custom_chat_template")
+        if custom_template:
+            kwargs["chat_template"] = custom_template
+        try:
+            if self.processor is None:
+                raw_prompt = apply_chat_template(self.tokenizer, messages, tokenize=False, **kwargs)
+                if not raw_prompt.rstrip().endswith("<think>"):
+                    raw_prompt += "<think>\n"
+                length = len(self.tokenizer.encode(raw_prompt, add_special_tokens=False))
+            else:
+                images = []
+                for ref in entry["images"]:
+                    with Image.open(ref["path"]) as image:
+                        images.append(image.convert("RGB").copy())
+                raw_prompt = apply_chat_template(self.processor, messages, tokenize=False, **kwargs)
+                if not raw_prompt.rstrip().endswith("<think>"):
+                    raw_prompt += "<think>\n"
+                encoded = self.processor(text=[raw_prompt], images=images or None, return_tensors="pt")
+                length = int(encoded["input_ids"].shape[-1])
+            self._replay_prompt_lengths[entry["entry_id"]] = length
+            if length > self.config.data.max_prompt_length:
+                print(
+                    f"Skipping replay prompt {entry['entry_id']}: {length} prompt tokens exceed "
+                    f"limit {self.config.data.max_prompt_length}; preserving exact evidence."
+                )
+            return length <= self.config.data.max_prompt_length
+        except (OSError, ValueError, RuntimeError) as exc:
+            print(f"Skipping replay prompt {entry['entry_id']}: {type(exc).__name__}: {exc}")
+            return False
+
+    def _prepare_trajectory_replay_batch(self, batch, metrics):
+        config = self._trajectory_replay_config()
+        replay_enabled = bool(config.get("enabled", False))
+        schedule_enabled = bool(
+            self.config.actor_rollout_ref.rollout.multi_turn.get("prompt_group_schedule_enabled", False)
+        )
+        if not replay_enabled and not schedule_enabled:
+            return batch
+        target = 0
+        candidates = []
+        base_count = len(batch)
+        batch_mode = config.get("batch_mode", "replace")
+        if replay_enabled:
+            self.trajectory_replay_cache.reload()
+            retained_ids = {entry["entry_id"] for entry in self.trajectory_replay_cache.entries}
+            self._replay_prompt_lengths = {
+                key: value for key, value in getattr(self, "_replay_prompt_lengths", {}).items() if key in retained_ids
+            }
+            target = replay_prompt_target(base_count, float(config.get("prompt_fraction", 0.2)), batch_mode)
+            candidates, skipped = fitting_replay_samples(
+                self.trajectory_replay_cache, target, self.global_steps, self._replay_prompt_fits,
+            )
+            metrics["replay/skipped_prompts"] = skipped
+            metrics["replay/cache_entries"] = len(self.trajectory_replay_cache.entries)
+        count = len(candidates)
+        task_count = base_count if batch_mode == "append" else base_count - count
+        rng = np.random.default_rng(np.random.SeedSequence([int(config.get("seed", 42)), self.global_steps]))
+        if count:
+            if batch_mode == "append":
+                # Clone row slots only. Replace their prompts/provenance below;
+                # never consume or reorder additional rows from the dataloader.
+                judge_rows = batch.select_idxs(np.arange(count) % base_count)
+                batch = DataProto.concat([batch, judge_rows])
+            else:
+                domain_weights = getattr(self.train_dataset, "per_batch_domain_weights", None)
+                fresh = choose_task_rows(batch, task_count, domain_weights, rng)
+                replaced = np.setdiff1d(np.arange(len(batch)), fresh)
+                batch = batch.select_idxs(np.concatenate([fresh, replaced]))
+        flags = np.zeros(len(batch), dtype=bool)
+        flags[task_count:] = True
+        if replay_enabled:
+            batch.non_tensor_batch["is_replay_judge"] = object_array(flags.tolist())
+            batch.non_tensor_batch["replay_candidate"] = object_array([None] * task_count + candidates)
+            default_agent = self.config.actor_rollout_ref.rollout.agent.default_agent_loop
+            batch.non_tensor_batch["agent_name"] = object_array(
+                [default_agent] * task_count + ["replay_judge_agent"] * count
+            )
+            for offset, entry in enumerate(candidates, task_count):
+                batch.non_tensor_batch["raw_prompt"][offset] = build_judge_messages(
+                    entry["question"], entry["answer"], entry["images"],
+                    config.get("system_prompt_path") or config.get("system_prompt"),
+                )
+                batch.non_tensor_batch["data_source"][offset] = "trajectory_replay_judge"
+                batch.non_tensor_batch["reward_model"][offset] = {"ground_truth": entry["label"]}
+                for key in ("extra_info", "tools_kwargs", "interaction_kwargs"):
+                    if key in batch.non_tensor_batch:
+                        batch.non_tensor_batch[key][offset] = {}
+                if "index" in batch.non_tensor_batch:
+                    batch.non_tensor_batch["index"][offset] = -offset - 1
+                if "ability" in batch.non_tensor_batch:
+                    batch.non_tensor_batch["ability"][offset] = "replay_judge"
+            share = float(config.get("prompt_fraction", 0.2)) * count / target if target else 0.0
+            batch.meta_info["replay_loss_share"] = share
+            rollout_n = int(self.config.actor_rollout_ref.rollout.get("n", 1))
+            metrics.update({
+                "replay/append_mode": int(batch_mode == "append"),
+                "replay/base_prompt_count": base_count,
+                "replay/task_prompt_count": task_count,
+                "replay/total_prompt_count": len(batch),
+                "replay/task_rollout_count": task_count * rollout_n,
+                "replay/critic_rollout_count": count * rollout_n,
+                "replay/total_rollout_count": len(batch) * rollout_n,
+                "replay/rollout_n": rollout_n,
+                "replay/configured_prompt_fraction": float(config.get("prompt_fraction", 0.2)),
+                "replay/prompt_target": target, "replay/prompt_count": count,
+                "replay/prompt_fraction": count / len(batch), "replay/accept_prompts": count // 2,
+                "replay/reject_prompts": count // 2, "replay/loss_share": share,
+                "replay/cache_restore_step": self._replay_restore_step,
+                "replay/restored_entries": getattr(self, "_replay_restored_entries", 0),
+                "replay/supervised_critic_enabled": 0,
+            })
+        if schedule_enabled:
+            schedules = assign_prompt_group_schedules(task_count, config, self.global_steps)
+            batch.non_tensor_batch["prompt_group_schedule"] = object_array(list(schedules) + [None] * count)
+            for category in ("normal", "single", "double"):
+                metrics[f"prompt_schedule/{category}_groups"] = sum(s["category"] == category for s in schedules)
+        return batch
+
+    def _replay_training_metrics(self, batch, metrics):
+        judge = judge_row_mask(batch)
+        padding = np.asarray(
+            batch.non_tensor_batch.get("__branch_padding_row", np.zeros(len(batch), dtype=bool)), dtype=bool
+        )
+        indices = np.flatnonzero(judge & ~padding)
+        mask = batch.batch["response_mask"][indices].bool()
+        metrics["replay/active_policy_tokens"] = int(mask.sum().item())
+        metrics["replay/nonzero_advantage_tokens"] = int(
+            ((batch.batch["advantages"][indices] != 0) & mask).sum().item()
+        )
+        for field, name in (
+            ("judge_reasoning_tokens", "reasoning_tokens"),
+            ("judge_prefill_active_tokens", "prefill_active_tokens"),
+        ):
+            values = batch.non_tensor_batch.get(field, np.zeros(len(batch)))
+            metrics[f"replay/{name}"] = sum(int(values[i] or 0) for i in indices)
+        for field, name in (
+            ("accuracy", "decision_accuracy"), ("raw_format", "format_valid"),
+            ("overlong_reward", "overlong_reward"),
+        ):
+            values = batch.non_tensor_batch.get(field, np.zeros(len(batch)))
+            metrics[f"replay/{name}"] = (
+                float(np.mean([float(values[i] or 0) for i in indices])) if len(indices) else 0.0
+            )
 
     def _branch_strata_config(self):
         policy_loss = self.config.actor_rollout_ref.actor.get("policy_loss", {})
@@ -358,6 +575,8 @@ class RayPPOTrainer:
 
     def _validate_branch_strata_config(self) -> None:
         strata = self._branch_strata_config()
+        if strata and strata.get("log_advantage_mass", False) and not strata.get("enabled", False):
+            raise ValueError("policy_loss.branch_strata.log_advantage_mass requires branch strata to be enabled.")
         if not strata or not bool(strata.get("enabled", False)):
             return
         if self.use_legacy_worker_impl == "disable":
@@ -469,6 +688,16 @@ class RayPPOTrainer:
         strata = self._branch_strata_config()
         if not strata or not bool(strata.get("enabled", False)):
             return
+        if self._trajectory_replay_config().get("enabled", False):
+            attach_mixed_loss_weights(
+                batch, strata, float(batch.meta_info.get("replay_loss_share", 0.0)), metrics,
+                allow_inactive_canonical=bool(
+                    self.config.actor_rollout_ref.rollout.multi_turn.get(
+                        "conditional_answer_retry_mask_canonical_prefix", False
+                    )
+                ),
+            )
+            return
         branch_key = str(strata.get("branch_indicator_key", "is_conditional_answer_retry_branch"))
         parent_key = str(strata.get("parent_id_key", "request_id"))
         if branch_key not in batch.non_tensor_batch:
@@ -490,6 +719,9 @@ class RayPPOTrainer:
                 self.config.actor_rollout_ref.actor.get("policy_loss", {})
                 .get("retry_sft", {})
                 .get("enabled", False)
+            ) or bool(
+                self.config.actor_rollout_ref.get("rollout", {}).get("multi_turn", {})
+                .get("conditional_answer_retry_mask_canonical_prefix", False)
             ),
         )
         batch.batch["branch_policy_loss_weight"] = weights
@@ -1070,6 +1302,8 @@ class RayPPOTrainer:
 
     def _get_gen_batch(self, batch: DataProto, *, validate: bool = False) -> DataProto:
         reward_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+        if self._trajectory_replay_config().get("enabled", False):
+            reward_keys.update(set({"is_replay_judge", "replay_candidate"}) & batch.non_tensor_batch.keys())
         dataset_balance = self._retry_critic_dataset_balance_config()
         if dataset_balance and bool(dataset_balance.get("enabled", False)):
             dataset_key = str(dataset_balance.get("key", "mixture_source")).strip()
@@ -1646,6 +1880,8 @@ class RayPPOTrainer:
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
+        if getattr(self, "trajectory_replay_cache", None) is not None:
+            self.trajectory_replay_cache.snapshot(local_global_step_folder)
 
         # latest checkpointed iteration tracker (for atomic usage)
         if (
@@ -1665,6 +1901,7 @@ class RayPPOTrainer:
 
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
+            self._reset_trajectory_replay_cache()
             return 0
 
         if self.config.trainer.default_hdfs_dir is not None:
@@ -1677,6 +1914,7 @@ class RayPPOTrainer:
         )
         if global_step_folder is None:
             print("Training from scratch")
+            self._reset_trajectory_replay_cache()
             return 0
         print(f"Load from checkpoint folder: {global_step_folder}")
         # set global step
@@ -1691,6 +1929,14 @@ class RayPPOTrainer:
         self.actor_rollout_wg.load_checkpoint(
             actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
         )
+        if getattr(self, "trajectory_replay_cache", None) is not None:
+            self.trajectory_replay_cache.restore(global_step_folder)
+            if self.trajectory_replay_cache.step != self.global_steps:
+                raise ValueError("Actor checkpoint and trajectory replay snapshot have different steps")
+            self._replay_restore_step = self.global_steps
+            self._replay_restored_entries = len(self.trajectory_replay_cache.entries)
+            print(f"Restored trajectory replay cache at step {self.global_steps}: "
+                  f"{len(self.trajectory_replay_cache.entries)} entries")
         # load critic
         if self.use_critic:
             self.critic_wg.load_checkpoint(
@@ -2104,6 +2350,7 @@ class RayPPOTrainer:
                     )
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                 batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+                batch = self._prepare_trajectory_replay_batch(batch, metrics)
                 with self._gpu_memory_stage("step_start", batch=batch, epoch=epoch):
                     pass
 
@@ -2136,6 +2383,11 @@ class RayPPOTrainer:
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
+                    replay_candidates = []
+                    if self._trajectory_replay_config().get("enabled", False):
+                        for entries in gen_batch_output.non_tensor_batch.get("replay_candidate_entries", []):
+                            if isinstance(entries, list):
+                                replay_candidates.extend(entries)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with marked_timer("gen_max", timing_raw, color="purple"):
@@ -2230,21 +2482,17 @@ class RayPPOTrainer:
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             with self._gpu_memory_stage("old_log_prob", batch=batch, epoch=epoch):
                                 old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
-                            entropys = old_log_prob.batch["entropys"]
-                            response_masks = batch.batch["response_mask"]
-                            actor_config = self.config.actor_rollout_ref.actor
-                            entropy_agg = agg_loss(
-                                loss_mat=entropys,
-                                loss_mask=response_masks,
-                                loss_agg_mode=actor_config.loss_agg_mode,
-                                loss_scale_factor=actor_config.loss_scale_factor,
-                            )
-                            old_log_prob_metrics = {
-                                "actor/entropy": entropy_agg.detach().item(),
-                                "perf/mfu/actor_infer": old_log_prob_mfu,
-                            }
+                            old_log_prob_metrics = {"perf/mfu/actor_infer": old_log_prob_mfu}
+                            if "entropys" in old_log_prob.batch:
+                                actor_config = self.config.actor_rollout_ref.actor
+                                entropy_agg = agg_loss(
+                                    loss_mat=old_log_prob.batch.pop("entropys"),
+                                    loss_mask=batch.batch["response_mask"],
+                                    loss_agg_mode=actor_config.loss_agg_mode,
+                                    loss_scale_factor=actor_config.loss_scale_factor,
+                                )
+                                old_log_prob_metrics["actor/entropy"] = entropy_agg.detach().item()
                             metrics.update(old_log_prob_metrics)
-                            old_log_prob.batch.pop("entropys")
                             if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
                                 raise ValueError(
                                     "Detected conflicting router replay configuration: "
@@ -2320,15 +2568,27 @@ class RayPPOTrainer:
                                 "norm_adv_by_std_in_grpo", True
                             )  # GRPO adv normalization factor
 
-                            batch = compute_advantage(
-                                batch,
-                                adv_estimator=self.config.algorithm.adv_estimator,
-                                gamma=self.config.algorithm.gamma,
-                                lam=self.config.algorithm.lam,
-                                num_repeat=self.config.actor_rollout_ref.rollout.n,
-                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                                config=self.config.algorithm,
-                            )
+                            if self._trajectory_replay_config().get("enabled", False):
+                                batch = compute_mixed_advantages(
+                                    batch, self.config.algorithm, compute_advantage,
+                                    self.config.actor_rollout_ref.rollout.n,
+                                )
+                                self._replay_training_metrics(batch, metrics)
+                                for objective in ("task", "judge"):
+                                    diagnostics = batch.meta_info.get(f"gdpo_{objective}_diagnostics", {})
+                                    metrics.update({f"{objective}/{key}": value for key, value in diagnostics.items()})
+                            else:
+                                batch = compute_advantage(
+                                    batch,
+                                    adv_estimator=self.config.algorithm.adv_estimator,
+                                    gamma=self.config.algorithm.gamma,
+                                    lam=self.config.algorithm.lam,
+                                    num_repeat=self.config.actor_rollout_ref.rollout.n,
+                                    norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                    config=self.config.algorithm,
+                                )
+                            if self._branch_strata_config().get("log_advantage_mass", False):
+                                metrics.update(compute_branch_advantage_mass_metrics(batch))
 
                     # update critic
                     if self.use_critic:
@@ -2348,6 +2608,11 @@ class RayPPOTrainer:
                         with marked_timer("update_actor", timing_raw, color="red"):
                             with self._gpu_memory_stage("update_actor", batch=batch, epoch=epoch):
                                 actor_output = self._update_actor(batch)
+                        if self._trajectory_replay_config().get("enabled", False):
+                            self.trajectory_replay_cache.commit(replay_candidates, self.global_steps)
+                            metrics["replay/committed_entries"] = len(replay_candidates)
+                            metrics["replay/cache_entries"] = len(self.trajectory_replay_cache.entries)
+                            metrics["replay/removed_image_assets"] = self.trajectory_replay_cache.garbage_collect()
 
                         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                         esi_close_to_expiration = should_save_ckpt_esi(
@@ -2429,6 +2694,12 @@ class RayPPOTrainer:
                     for key in gdpo_reward_keys:
                         if key in batch.non_tensor_batch:
                             vals = np.asarray(batch.non_tensor_batch[key], dtype=np.float32)
+                            if self._trajectory_replay_config().get("enabled", False):
+                                padding = np.asarray(batch.non_tensor_batch.get(
+                                    "__branch_padding_row", np.zeros(len(batch), dtype=bool)), dtype=bool)
+                                vals = vals[~judge_row_mask(batch) & ~padding]
+                            if not len(vals):
+                                continue
                             metrics[f"gdpo/{key}/mean"] = float(np.mean(vals))
                             metrics[f"gdpo/{key}/std"] = float(np.std(vals))
                             metrics[f"gdpo/{key}/max"] = float(np.max(vals))

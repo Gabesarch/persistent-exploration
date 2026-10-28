@@ -130,6 +130,25 @@ algorithm:
 # config for the trainer
 trainer:
 
+  # Opt-in on-policy reasoning judge replay. Disabled for all existing runs.
+  trajectory_replay:
+    enabled: false
+    batch_mode: replace
+    prompt_fraction: 0.20
+    capacity: 8192
+    seed: 42
+    normal_budget: 4096
+    overlong_buffer: 1024
+    format_weight: 0.20
+    system_prompt_path: null
+    system_prompt: null
+    schedule_single_fraction: 0.10
+    schedule_double_fraction: 0.05
+    schedule_first_turn: 2
+    schedule_last_turn: 9
+    schedule_min_gap: 2
+    schedule_seed: 42
+
   # Whether to balance batch sizes across distributed workers
   balance_batch: True
 

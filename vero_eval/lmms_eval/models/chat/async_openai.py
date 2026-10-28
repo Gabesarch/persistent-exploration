@@ -149,6 +149,22 @@ def _composite_zoom_to_original(image_provenance, img_idx, bbox):
     return orig_idx, nsub, bbox_prime
 
 
+def _zoom_bbox_to_xyxy(bbox, coordinate_order="xyxy"):
+    """Convert a model's normalized box into the crop tool's x/y order."""
+    if len(bbox) != 4:
+        raise ValueError("Zoom bbox must contain exactly four coordinates")
+    values = [float(value) for value in bbox]
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("Zoom bbox coordinates must be finite")
+    if coordinate_order == "yxyx":
+        values = [values[1], values[0], values[3], values[2]]
+    elif coordinate_order != "xyxy":
+        raise ValueError(f"Unknown zoom coordinate order: {coordinate_order}")
+    if not (values[0] < values[2] and values[1] < values[3]):
+        raise ValueError("Zoom bbox must have positive width and height")
+    return values
+
+
 def _restore_assistant_forced_prefill(content: str, prefix: str = _ASSISTANT_THINK_PREFIX) -> str:
     """Restore forced assistant prefill that is present in the prompt but omitted from completions."""
     if not content or not prefix:
@@ -160,6 +176,15 @@ def _restore_assistant_forced_prefill(content: str, prefix: str = _ASSISTANT_THI
         return content
     leading_ws_len = len(content) - len(stripped)
     return content[:leading_ws_len] + prefix + stripped
+
+
+def _preserve_assistant_reasoning(message, assistant_dict):
+    """Replay the separately parsed thought channel for opt-in thinking runs."""
+    if os.getenv("LMMS_EVAL_PRESERVE_REASONING", "false").lower() in {"1", "true", "yes", "on"}:
+        reasoning = getattr(message, "reasoning", None) or getattr(message, "reasoning_content", None)
+        if reasoning:
+            assistant_dict["reasoning"] = reasoning
+    return assistant_dict
 
 
 load_dotenv(verbose=True)
@@ -206,8 +231,17 @@ class AsyncOpenAIChat(lmms):
         force_final_answer_prefix: str = "",
         force_final_answer_think_prefill: Optional[str] = None,
         critic_guided_answer_retry: bool = False,
+        critic_guided_answer_retry_source: str = "policy",
+        critic_guided_answer_retry_mode: str = "token",
+        critic_guided_answer_retry_temperature: float = 0.0,
+        critic_guided_answer_retry_top_k: int = -1,
+        critic_guided_answer_retry_top_p: float = 1.0,
         critic_guided_answer_retry_threshold: float = 0.5,
         critic_guided_answer_retry_prefill_profile: str = "persist",
+        first_candidate_answer_turn: int = 0,
+        followup_candidate_answer_turn: int = 0,
+        record_answer_candidates: bool = False,
+        always_retry_answers: bool = False,
         manage_vllm_server_lifecycle: bool = False,
         **kwargs,
     ) -> None:
@@ -264,6 +298,17 @@ class AsyncOpenAIChat(lmms):
         self.tool_image_as_user_turn = parse_bool(tool_image_as_user_turn)
         self.force_tool_calls_until_final_turn = parse_bool(force_tool_calls_until_final_turn)
         self.force_answer_after_max_tool_iterations = parse_bool(force_answer_after_max_tool_iterations)
+        self.first_candidate_answer_turn = int(first_candidate_answer_turn)
+        self.followup_candidate_answer_turn = int(followup_candidate_answer_turn)
+        if self.followup_candidate_answer_turn and not (
+            2 <= self.first_candidate_answer_turn < self.followup_candidate_answer_turn <= self.max_tool_iterations
+        ):
+            raise ValueError("followup_candidate_answer_turn requires first turn < followup turn <= max_tool_iterations")
+        self.record_answer_candidates = parse_bool(record_answer_candidates)
+        if self.first_candidate_answer_turn and not 2 <= self.first_candidate_answer_turn <= self.max_tool_iterations:
+            raise ValueError("first_candidate_answer_turn must be 0 (disabled) or between 2 and max_tool_iterations")
+        if self.first_candidate_answer_turn and self.force_tool_calls_until_final_turn:
+            raise ValueError("first_candidate_answer_turn is incompatible with force_tool_calls_until_final_turn")
         if self.force_tool_calls_until_final_turn and self.max_tool_iterations < 1:
             raise ValueError("max_tool_iterations must be positive when force_tool_calls_until_final_turn is enabled")
         self.force_final_answer_prefix = force_final_answer_prefix or ""
@@ -273,13 +318,38 @@ class AsyncOpenAIChat(lmms):
         self.force_final_answer_think_prefill = force_final_answer_think_prefill or ""
         self._forced_action_tokenizer = None
         self.critic_guided_answer_retry = parse_bool(critic_guided_answer_retry)
+        self.always_retry_answers = parse_bool(always_retry_answers)
+        if self.always_retry_answers and (self.critic_guided_answer_retry or self.force_tool_calls_until_final_turn):
+            raise ValueError("always_retry_answers requires critic and forced-tool modes to be disabled")
+        if self.always_retry_answers and (self.mcp_client is None or self.max_tool_iterations < 1):
+            raise ValueError("always_retry_answers requires tools and a positive tool budget")
+        self.critic_guided_answer_retry_source = str(critic_guided_answer_retry_source)
+        self.critic_guided_answer_retry_mode = str(critic_guided_answer_retry_mode)
+        self.critic_guided_answer_retry_temperature = float(critic_guided_answer_retry_temperature)
+        self.critic_guided_answer_retry_top_k = int(critic_guided_answer_retry_top_k)
+        self.critic_guided_answer_retry_top_p = float(critic_guided_answer_retry_top_p)
+        if self.critic_guided_answer_retry_mode not in {"token", "reasoning"}:
+            raise ValueError("critic_guided_answer_retry_mode must be token or reasoning")
+        if self.critic_guided_answer_retry_source not in {"policy", "ground_truth"}:
+            raise ValueError("critic_guided_answer_retry_source must be policy or ground_truth")
+        if self.critic_guided_answer_retry_source == "ground_truth":
+            if not self.critic_guided_answer_retry:
+                raise ValueError("ground_truth critic requires critic_guided_answer_retry=true")
+            if os.getenv("VLLM_SERVER_JUDGE", "").lower() not in {"1", "true", "yes"}:
+                raise ValueError("ground_truth critic requires a dedicated server judge")
+        self._ground_truth_critic_lock = asyncio.Lock()
         self.critic_guided_answer_retry_threshold = float(critic_guided_answer_retry_threshold)
         from lmms_eval.models.model_utils.critic_thresholds import parse_domain_thresholds
 
         self.critic_domain_thresholds = parse_domain_thresholds(os.getenv("VERO_EVAL_CRITIC_DOMAIN_THRESHOLDS", ""))
         self.critic_guided_answer_retry_prefill_profile = str(critic_guided_answer_retry_prefill_profile)
         self.training_alignment = None
-        if os.getenv("VERO_TRAINING_CONFIG"):
+        if os.getenv("GEMMA_TRAINING_CONFIG"):
+            from lmms_eval.models.model_utils.gemma4_training_alignment import Gemma4TrainingAlignment
+
+            self.training_alignment = Gemma4TrainingAlignment(os.environ["GEMMA_TRAINING_CONFIG"], os.getenv("CHECKPOINT_PATH"))
+            self.training_alignment.configure(self)
+        elif os.getenv("VERO_TRAINING_CONFIG"):
             from lmms_eval.models.model_utils.training_alignment import TrainingAlignment
 
             self.training_alignment = TrainingAlignment(os.environ["VERO_TRAINING_CONFIG"], os.getenv("CHECKPOINT_PATH"))
@@ -293,7 +363,7 @@ class AsyncOpenAIChat(lmms):
             )
         self._retry_critic_accept_token_id = None
         self._retry_critic_retry_token_id = None
-        if self.critic_guided_answer_retry:
+        if self.critic_guided_answer_retry and self.critic_guided_answer_retry_mode == "token":
             tokenizer_name = os.getenv("LMMS_EVAL_HF_TOKENIZER", "Qwen/Qwen3-8B")
             self._forced_action_tokenizer = _get_forced_action_tokenizer(tokenizer_name)
             accept_ids = self._forced_action_tokenizer.encode(
@@ -493,6 +563,10 @@ class AsyncOpenAIChat(lmms):
         if self._forced_action_tokenizer is None:
             self._forced_action_tokenizer = _get_forced_action_tokenizer(tokenizer_name)
 
+        profile = getattr(self, "training_alignment", None)
+        if getattr(profile, "native_gemma4", False):
+            return profile.forced_action_extra_body(self._forced_action_tokenizer, required_tag, self.force_final_answer_prefix)
+
         return build_forced_action_openai_extra_body(
             self._forced_action_tokenizer,
             required_tag,
@@ -509,6 +583,13 @@ class AsyncOpenAIChat(lmms):
     def _with_final_answer_think_prefill(self, payload: dict, *, close_think: bool = False) -> tuple[dict, str]:
         if not self.force_final_answer_think_prefill:
             return payload, ""
+
+        profile = getattr(self, "training_alignment", None)
+        if getattr(profile, "native_gemma4", False):
+            from lmms_eval.models.model_utils.gemma4_training_alignment import THOUGHT
+
+            prefill = THOUGHT + self.force_final_answer_think_prefill
+            return profile.continuation_request(payload, prefill), prefill
 
         payload = dict(payload)
         messages = list(payload.get("messages") or [])
@@ -532,6 +613,8 @@ class AsyncOpenAIChat(lmms):
 
     def _retry_critic_request(self, payload: dict, candidate_content: str) -> dict:
         request_payload = dict(payload)
+        profile = getattr(self, "training_alignment", None)
+        native = getattr(profile, "native_gemma4", False)
         messages = list(payload.get("messages") or [])
         messages.extend(
             [
@@ -567,6 +650,13 @@ class AsyncOpenAIChat(lmms):
             }
         )
         request_payload["extra_body"] = extra_body
+        if native:
+            # Replace Qwen's partial-assistant block with the literal native
+            # Gemma critic prefix from the saved validation configuration.
+            native_payload = profile.critic_request(payload, candidate_content)
+            request_payload["messages"] = native_payload["messages"]
+            request_payload["extra_body"].update(native_payload["extra_body"])
+            request_payload["extra_body"]["top_k"] = -1
         return request_payload
 
     @staticmethod
@@ -624,6 +714,37 @@ class AsyncOpenAIChat(lmms):
         )
 
     async def _obtain_retry_critic_decision(self, payload: dict, candidate_content: str, *, task=""):
+        if getattr(self, "critic_guided_answer_retry_mode", "token") == "reasoning":
+            from lmms_eval.models.model_utils.reasoning_replay_critic import (
+                reasoning_critic_request,
+                reasoning_critic_response,
+            )
+
+            profile = getattr(self, "training_alignment", None)
+            settings = profile.reasoning_critic_settings if profile else {
+                "system_prompt": os.environ["REPLAY_CRITIC_SYSTEM_PROMPT"],
+                "prompt_limit": 16384,
+                "max_tokens": 5120,
+            }
+            request, evidence = reasoning_critic_request(
+                payload, candidate_content, settings["system_prompt"],
+                temperature=getattr(self, "critic_guided_answer_retry_temperature", 0.0),
+                top_k=getattr(self, "critic_guided_answer_retry_top_k", -1),
+                top_p=getattr(self, "critic_guided_answer_retry_top_p", 1.0),
+                max_tokens=settings["max_tokens"],
+            )
+            evidence["critic_prompt_limit"] = settings["prompt_limit"]
+            response = None
+            try:
+                if await self._training_prompt_tokens(request) > settings["prompt_limit"]:
+                    raise ValueError("reasoning critic prompt exceeds configured prompt_length")
+                response = await self._create_training_completion(request, critic=True)
+                return response, reasoning_critic_response(response, evidence)
+            except Exception as exc:
+                if response is not None:
+                    exc.retry_critic_response = response
+                exc.retry_critic_details = evidence
+                raise
         threshold = self._critic_threshold_for_task(task)
         request_payload = self._retry_critic_request(payload, candidate_content)
         response = await self._create_training_completion(request_payload, critic=True)
@@ -651,6 +772,14 @@ class AsyncOpenAIChat(lmms):
         return profile.multi[key] if profile else default
 
     def _retry_tool_call_request(self, payload: dict) -> tuple[dict, str]:
+        profile = getattr(self, "training_alignment", None)
+        if getattr(profile, "native_gemma4", False):
+            from lmms_eval.models.model_utils.gemma4_training_alignment import THOUGHT
+
+            prefill = THOUGHT + profile.multi["conditional_answer_retry_assistant_prefill"]
+            request_payload = profile.continuation_request(payload, prefill)
+            request_payload["tool_choice"] = "auto"
+            return self._with_forced_action_extra_body(request_payload, "<tool_call>"), prefill
         request_payload = dict(payload)
         request_payload["tool_choice"] = "auto"
         messages = list(payload.get("messages") or [])
@@ -703,7 +832,7 @@ class AsyncOpenAIChat(lmms):
         if getattr(message, "tool_calls", None):
             return "unexpected_message_tool_calls"
         content = message.content or ""
-        if "<tool_call>" in content or "</tool_call>" in content:
+        if "<tool_call>" in content or "</tool_call>" in content or "<|tool_call>" in content:
             return "textual_tool_call"
         if content.count("<answer>") == 0:
             return "missing_answer_tag"
@@ -727,7 +856,9 @@ class AsyncOpenAIChat(lmms):
         content = message.content or ""
         if "<answer>" in content or "</answer>" in content:
             return "early_answer_tag"
-        if "</think>" not in content:
+        if "</think>" not in content and not (
+            getattr(message, "reasoning", None) or getattr(message, "reasoning_content", None)
+        ):
             return "missing_think_close"
         if choice.finish_reason != "tool_calls":
             return f"finish_reason_{choice.finish_reason or 'missing'}"
@@ -825,7 +956,7 @@ class AsyncOpenAIChat(lmms):
         # budget, just as tool-response tokens do in training's response_mask.
         body = {key: payload[key] for key in ("model", "messages", "tools") if key in payload}
         extra = payload.get("extra_body") or {}
-        for key in ("continue_final_message", "add_generation_prompt"):
+        for key in ("continue_final_message", "add_generation_prompt", "chat_template_kwargs"):
             if key in extra:
                 body[key] = extra[key]
 
@@ -842,6 +973,7 @@ class AsyncOpenAIChat(lmms):
 
     async def _create_training_completion(self, payload, *, critic=False):
         request = dict(payload)
+        trace_id = request.pop("_eval_trace_id", None)
         initial_tokens = request.pop("_training_initial_tokens", None)
         profile = getattr(self, "training_alignment", None)
         if profile and not critic and initial_tokens is not None:
@@ -850,7 +982,16 @@ class AsyncOpenAIChat(lmms):
             if remaining <= 0:
                 raise RuntimeError("Training response budget exhausted before generation")
             request["max_tokens"] = min(request["max_tokens"], remaining)
-        return await self.client.chat.completions.create(**request)
+        response = await self.client.chat.completions.create(**request)
+        # Opt-in debug artifacts retain exact requests, images and parsed tool calls.
+        # The internal trace key is never sent to the OpenAI-compatible server.
+        trace_dir = os.getenv("LMMS_EVAL_REQUEST_TRACE_DIR")
+        if trace_dir and trace_id:
+            path = os.path.join(trace_dir, trace_id)
+            os.makedirs(path, exist_ok=True)
+            with open(os.path.join(path, f"{time.time_ns()}_{uuid.uuid4().hex}.json"), "w", encoding="utf-8") as stream:
+                json.dump({"request": request, "response": response.model_dump(mode="json")}, stream, ensure_ascii=False)
+        return response
 
     def _rewrite_tool_schemas_for_model(self, tool_list):
         rewritten = []
@@ -907,6 +1048,18 @@ class AsyncOpenAIChat(lmms):
             return self.training_alignment.system_prompt
         if task in self._task_system_prompt_cache:
             return self._task_system_prompt_cache[task]
+        # A run-specific protocol (e.g. Qwen3 XML) must replace task fragments,
+        # since concatenating it with the default JSON rules gives conflicting calls.
+        if os.getenv("RUN_SYSTEM_PROMPT_MODE", "task_metadata").lower() == "run_env":
+            path = os.getenv("TRAINING_SYSTEM_PROMPT") or os.getenv("SYSTEM_PROMPT")
+            if not path:
+                raise ValueError("RUN_SYSTEM_PROMPT_MODE=run_env requires a system prompt file")
+            if not os.path.isfile(path):
+                path = os.path.join(_VERO_EVAL_ROOT, path)
+            with open(path, "r", encoding="utf-8", newline="") as stream:
+                resolved = stream.read()
+            self._task_system_prompt_cache[task] = resolved
+            return resolved
         fragments: List[str] = []
         if self.system_prompt:
             fragments.append(self.system_prompt.strip())
@@ -1005,7 +1158,10 @@ class AsyncOpenAIChat(lmms):
             bbox = (tool_args or {}).get("bbox_2d")
             label = (tool_args or {}).get("label")
             if isinstance(bbox, (list, tuple)):
-                bbox_str = "[" + ", ".join(str(int(v)) for v in bbox) + "]"
+                if getattr(getattr(self, "training_alignment", None), "native_gemma4", False):
+                    bbox_str = str(list(bbox))
+                else:
+                    bbox_str = "[" + ", ".join(str(int(v)) for v in bbox) + "]"
             else:
                 bbox_str = str(bbox)
             wording = f"Zoomed in on the image to the region {bbox_str} with label {label}."
@@ -1084,7 +1240,8 @@ class AsyncOpenAIChat(lmms):
         profile = getattr(self, "training_alignment", None)
         if profile:
             task_metadata = dict(task_metadata, show_initial_image_index_hint=False,
-                                 restore_assistant_forced_prefill=True, image_indexing=profile.image_indexing)
+                                 restore_assistant_forced_prefill=not getattr(profile, "native_gemma4", False),
+                                 image_indexing=profile.image_indexing)
             gen_kwargs = {**gen_kwargs, **profile.generation_kwargs()}
         show_initial_image_index_hint = parse_bool(task_metadata.get("show_initial_image_index_hint", True))
 
@@ -1115,6 +1272,9 @@ class AsyncOpenAIChat(lmms):
 
         try:
             payload = {"messages": messages}
+            if os.getenv("LMMS_EVAL_REQUEST_TRACE_DIR"):
+                safe_task = re.sub(r"[^A-Za-z0-9_.-]", "_", str(task))
+                payload["_eval_trace_id"] = f"{safe_task}_{doc_id}_{idx}_{uuid.uuid4().hex}"
             payload["model"] = self.model_version
             all_response = ""
             total_input_tokens = 0
@@ -1160,6 +1320,10 @@ class AsyncOpenAIChat(lmms):
                         "force_tool_calls_until_final_turn requires a final <answer> block and is incompatible "
                         f"with terminal tools for task {task!r}: {sorted(terminal_tools)}"
                     )
+            if getattr(self, "first_candidate_answer_turn", 0) and (not functions or terminal_tools):
+                raise ValueError("first_candidate_answer_turn requires MCP tools and an <answer> final-answer protocol")
+            if getattr(self, "always_retry_answers", False) and (not functions or terminal_tools):
+                raise ValueError("always_retry_answers requires MCP tools and an <answer> final-answer protocol")
             # Per-task image-indexing mode controls the model-visible tool_response wording
             # (training_faithful | multi_index | None=default). See _tool_image_registered_text.
             image_indexing_mode = task_metadata.get("image_indexing")
@@ -1172,12 +1336,24 @@ class AsyncOpenAIChat(lmms):
             forced_final_answer_valid = False
             retry_depth = 0
             retry_critic_records = []
+            answer_retry_records = []
+            first_candidate_seen_turn = None
+            first_candidate_forced_turn = None
+            candidate_answer_turns = []
+            candidate_forced_turns = []
             training_remaining = None
             if profile:
                 payload["_training_initial_tokens"] = await self._training_prompt_tokens(payload)
                 training_remaining = profile.data["max_response_length"]
 
             def _retry_critic_metadata():
+                if getattr(self, "always_retry_answers", False):
+                    return {"answer_retry": {
+                        "enabled": True,
+                        "critic_used": False,
+                        "prefill_profile": self.critic_guided_answer_retry_prefill_profile,
+                        "decisions": answer_retry_records,
+                    }}
                 if not self.critic_guided_answer_retry:
                     return None
                 probabilities = [
@@ -1185,9 +1361,10 @@ class AsyncOpenAIChat(lmms):
                     for record in retry_critic_records
                     if isinstance(record.get("p_retry"), int | float)
                 ]
-                return {
+                metadata = {
                     "retry_critic": {
                         "enabled": True,
+                        "source": getattr(self, "critic_guided_answer_retry_source", "policy"),
                         "threshold": critic_threshold,
                         "prefill_profile": self.critic_guided_answer_retry_prefill_profile,
                         "decisions": retry_critic_records,
@@ -1217,6 +1394,27 @@ class AsyncOpenAIChat(lmms):
                         },
                     }
                 }
+                if getattr(self, "critic_guided_answer_retry_mode", "token") == "reasoning":
+                    metadata["retry_critic"]["mode"] = "reasoning"
+                    metadata["retry_critic"]["sampling_params"] = {
+                        "temperature": getattr(self, "critic_guided_answer_retry_temperature", 0.0),
+                        "top_k": getattr(self, "critic_guided_answer_retry_top_k", -1),
+                        "top_p": getattr(self, "critic_guided_answer_retry_top_p", 1.0),
+                        "n": 1,
+                    }
+                if getattr(self, "first_candidate_answer_turn", 0) or getattr(self, "record_answer_candidates", False):
+                    metadata["first_candidate_schedule"] = {
+                        "deadline_turn": getattr(self, "first_candidate_answer_turn", 0),
+                        "forced_turn": first_candidate_forced_turn,
+                        "first_candidate_turn": first_candidate_seen_turn,
+                    }
+                if getattr(self, "followup_candidate_answer_turn", 0):
+                    metadata["candidate_answer_schedule"] = {
+                        "deadline_turns": [self.first_candidate_answer_turn, self.followup_candidate_answer_turn],
+                        "candidate_turns": list(candidate_answer_turns),
+                        "forced_turns": list(candidate_forced_turns),
+                    }
+                return metadata
 
             def _add_usage(usage_response, *, source: str):
                 nonlocal total_input_tokens, total_output_tokens, total_reasoning_tokens
@@ -1256,14 +1454,42 @@ class AsyncOpenAIChat(lmms):
                 return None
 
             async def _maybe_replace_answer_with_retry_tool(current_response, current_prefill):
-                nonlocal retry_depth
-                if not self.critic_guided_answer_retry:
-                    return current_response, current_prefill, False
+                nonlocal retry_depth, first_candidate_seen_turn
                 message = current_response.choices[0].message
                 if getattr(message, "tool_calls", None):
                     return current_response, current_prefill, False
                 candidate_content = f"{current_prefill}{message.content or ''}"
+                if getattr(profile, "native_gemma4", False):
+                    candidate_content = profile.candidate_content(message, current_prefill)
                 if "<answer>" not in candidate_content:
+                    return current_response, current_prefill, False
+                if first_candidate_seen_turn is None:
+                    first_candidate_seen_turn = tool_iteration + 1
+                candidate_answer_turns.append(tool_iteration + 1)
+                if getattr(self, "always_retry_answers", False):
+                    # Same controller as the saved step-200 ablation: discard each
+                    # candidate, force a zoom with persist prefill, never query a critic.
+                    skipped_reason = _retry_skip_reason()
+                    if skipped_reason is None:
+                        retry_depth += 1
+                    record = {
+                        "candidate_turn": tool_iteration + 1,
+                        "candidate_content": candidate_content,
+                        "controller": "always_retry_answer",
+                        "critic_used": False,
+                        "retry_feasible": skipped_reason is None,
+                        "controller_action": "retry" if skipped_reason is None else "forced_accept",
+                        "retry_depth": retry_depth,
+                        "skip_or_error_reason": skipped_reason,
+                    }
+                    answer_retry_records.append(record)
+                    eval_logger.info(f"Unconditional answer retry: request={idx} task={task} record={json.dumps(record, sort_keys=True)}")
+                    if skipped_reason is not None:
+                        return current_response, current_prefill, False
+                    retry_response, persisted_prefill = await self._obtain_retry_tool_call(payload)
+                    _add_usage(retry_response, source="model")
+                    return retry_response, persisted_prefill, True
+                if not self.critic_guided_answer_retry:
                     return current_response, current_prefill, False
                 critic_candidate = candidate_content
                 if restore_assistant_forced_prefill:
@@ -1275,11 +1501,24 @@ class AsyncOpenAIChat(lmms):
                     if functions:
                         critic_payload["tools"] = functions
                         critic_payload["tool_choice"] = "auto"
-                    critic_response, record = await self._obtain_retry_critic_decision(
-                        critic_payload,
-                        critic_candidate,
-                        task=task,
-                    )
+                    if getattr(self, "critic_guided_answer_retry_source", "policy") == "ground_truth":
+                        from lmms_eval.models.model_utils.ground_truth_critic import grade_visual_probe_candidate
+
+                        # Serialize wake/grade/sleep cycles across concurrent
+                        # trajectories; leave policy generation asynchronous.
+                        async with self._ground_truth_critic_lock:
+                            record = await asyncio.to_thread(
+                                grade_visual_probe_candidate,
+                                self.task_dict[task][split][doc_id],
+                                critic_candidate,
+                                task,
+                            )
+                    else:
+                        critic_response, record = await self._obtain_retry_critic_decision(
+                            critic_payload,
+                            critic_candidate,
+                            task=task,
+                        )
                     _add_usage(critic_response, source="retry_critic")
                     skipped_reason = _retry_skip_reason()
                     retry_feasible = skipped_reason is None
@@ -1300,6 +1539,10 @@ class AsyncOpenAIChat(lmms):
                         }
                     )
                 except Exception as exc:  # Critic failures retain the candidate.
+                    if getattr(self, "critic_guided_answer_retry_source", "policy") == "ground_truth":
+                        # An unavailable GT grader must not silently become an
+                        # accept-all critic and produce a mislabeled evaluation.
+                        raise RuntimeError("ground_truth critic grading failed") from exc
                     if critic_response is None:
                         critic_response = getattr(exc, "retry_critic_response", None)
                     if critic_response is not None:
@@ -1317,7 +1560,10 @@ class AsyncOpenAIChat(lmms):
                         "retry_depth": retry_depth,
                         "skip_or_error_reason": f"{type(exc).__name__}: {exc}",
                     }
+                    record.update(getattr(exc, "retry_critic_details", {}))
 
+                if getattr(self, "record_answer_candidates", False):
+                    record["candidate_content"] = critic_candidate
                 retry_critic_records.append(record)
                 self._record_retry_critic_stats(record, usage_response=critic_response)
                 eval_logger.info(
@@ -1372,6 +1618,9 @@ class AsyncOpenAIChat(lmms):
                 if restore_assistant_forced_prefill:
                     assistant_content = _restore_assistant_forced_prefill(assistant_content)
                 assistant_dict = {"role": "assistant", "content": assistant_content}
+                _preserve_assistant_reasoning(assistant_message, assistant_dict)
+                if getattr(profile, "native_gemma4", False):
+                    assistant_dict = profile.assistant_message(assistant_message, response_prefill)
                 if assistant_message.tool_calls:
                     assistant_dict["tool_calls"] = [
                         {
@@ -1399,6 +1648,13 @@ class AsyncOpenAIChat(lmms):
                     try:
                         tool_args = json.loads(call.function.arguments) if call.function.arguments else {}
                         call_args = tool_args  # what the tool actually runs (may be remapped below)
+                        if call.function.name == "image_zoom_in_tool" and "bbox_2d" in tool_args:
+                            # Keep model-visible calls/responses in the model's coordinate order.
+                            # Convert before native-resolution crop compositing, exactly once.
+                            call_args = dict(tool_args)
+                            call_args["bbox_2d"] = _zoom_bbox_to_xyxy(
+                                tool_args["bbox_2d"], task_metadata.get("zoom_bbox_coordinate_order", "xyxy")
+                            )
                         zoom_provenance = None   # (orig_idx, native_subregion) of the crop this call yields
                         if "img_idx" in tool_args:
                             _idx = int(tool_args["img_idx"])
@@ -1410,11 +1666,11 @@ class AsyncOpenAIChat(lmms):
                             # tool_args is kept as-is for the model-visible tool_response wording; only
                             # the executed call_args is remapped.
                             if call.function.name == "image_zoom_in_tool" and isinstance(tool_args.get("bbox_2d"), (list, tuple)) and len(tool_args["bbox_2d"]) >= 4:
-                                composited = _composite_zoom_to_original(image_provenance, _idx, [float(v) for v in tool_args["bbox_2d"][:4]])
+                                composited = _composite_zoom_to_original(image_provenance, _idx, call_args["bbox_2d"])
                                 if composited is not None:
                                     orig_idx, nsub, bbox_prime = composited
                                     zoom_provenance = (orig_idx, nsub)
-                                    call_args = dict(tool_args)
+                                    call_args = dict(call_args)
                                     call_args["img_idx"] = orig_idx
                                     call_args["bbox_2d"] = bbox_prime
                         # Snapshot the registry into the tool subprocess so it can map img_idx -> path.
@@ -1499,6 +1755,18 @@ class AsyncOpenAIChat(lmms):
                 )
                 force_final_answer_now = final_turn_due and not terminal_tools
                 force_terminal_answer_now = final_turn_due and bool(terminal_tools)
+                first_deadline = getattr(self, "first_candidate_answer_turn", 0)
+                followup_deadline = getattr(self, "followup_candidate_answer_turn", 0)
+                force_first_candidate_now = bool(
+                    first_deadline and tool_iteration + 1 >= first_deadline
+                    and first_candidate_forced_turn is None
+                    and (followup_deadline or first_candidate_seen_turn is None)
+                    and not final_turn_due
+                )
+                force_followup_candidate_now = bool(
+                    followup_deadline and followup_deadline not in candidate_forced_turns
+                    and tool_iteration + 1 >= followup_deadline and not final_turn_due
+                )
 
                 # Once the image budget is spent, stop offering image-producing tools
                 # so the model answers. Terminal (answer-protocol) tools stay offered:
@@ -1536,6 +1804,19 @@ class AsyncOpenAIChat(lmms):
                         idx,
                     )
                     forced_final_answer_valid = self._forced_final_answer_failure(response) is None
+                elif force_first_candidate_now or force_followup_candidate_now:
+                    # Match training's candidate deadline: constrain the action to
+                    # <answer>, without the final-turn prefill or changing the cap.
+                    if force_first_candidate_now:
+                        first_candidate_forced_turn = tool_iteration + 1
+                    candidate_forced_turns.append(tool_iteration + 1)
+                    request_payload = self._with_forced_action_extra_body(payload, "<answer>")
+                    request_payload["tool_choice"] = "none"
+                    response = await self._create_training_completion(request_payload)
+                    responses_for_usage.append(("primary", response))
+                    failure = self._forced_final_answer_failure(response)
+                    if failure is not None:
+                        response.choices[0].message.content = f"[LMMS_EVAL_FORCED_FINAL_ANSWER_FAILED: early_candidate_{failure}]"
                 else:
                     if self.force_tool_calls_until_final_turn:
                         request_payload = self._with_forced_action_extra_body(payload, "<tool_call>")
@@ -1583,7 +1864,7 @@ class AsyncOpenAIChat(lmms):
                             terminal_tool_called = True
                             break
 
-            if tool_iteration >= self.max_tool_iterations and not terminal_tool_called:
+            if self.mcp_client is not None and tool_iteration >= self.max_tool_iterations and not terminal_tool_called:
                 if forced_final_answer_requested and forced_final_answer_valid:
                     eval_logger.info(f"Final answer was forced on max tool turn for request {idx}")
                 else:
@@ -1606,6 +1887,10 @@ class AsyncOpenAIChat(lmms):
         results = []
 
         async def run():
+            if getattr(self, "critic_guided_answer_retry_source", "policy") == "ground_truth":
+                # Each task calls asyncio.run anew. Locks with concurrent
+                # waiters bind to a loop and cannot be reused by the next task.
+                self._ground_truth_critic_lock = asyncio.Lock()
             res: List[Tuple[GenerationResult, int]] = []
             pbar = tqdm(total=len(requests), disable=(self.rank != 0), desc="Model Responding")
             current_concurrency = (

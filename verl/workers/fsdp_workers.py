@@ -597,6 +597,41 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 }
                 actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
 
+        if fsdp_config.get("gemma4_large_head_sdpa", False):
+            from verl.models.gemma4.attention import enable_large_head_sdpa
+
+            enable_large_head_sdpa(actor_module)
+        if fsdp_config.get("gemma4_trim_padding", False):
+            if not fsdp_config.get("gemma4_policy_chunk_size", 0) or use_remove_padding:
+                raise ValueError("Gemma trimming requires the chunked policy and use_remove_padding=False")
+        if fsdp_config.get("gemma4_policy_chunk_size", 0):
+            from verl.models.gemma4.chunked_policy import enable_chunked_policy
+
+            enable_chunked_policy(
+                actor_module,
+                fsdp_config.gemma4_policy_chunk_size,
+                trim_padding=fsdp_config.get("gemma4_trim_padding", False),
+                trim_alignment=fsdp_config.get("gemma4_trim_alignment", 512),
+            )
+            if fsdp_config.get("gemma4_profile_actor", False):
+                from verl.models.gemma4.profiling import install_module_ranges
+
+                install_module_ranges(actor_module)
+            if self.rank == 0:
+                print(f"[Gemma4 {role}] Chunked policy projection: {fsdp_config.gemma4_policy_chunk_size} tokens.")
+
+        if fsdp_config.get("gemma4_position_embedding_lookup", False):
+            from verl.models.gemma4.position_embeddings import enable_position_embedding_lookup
+
+            patched = enable_position_embedding_lookup(actor_module)
+            if self.rank == 0:
+                print(f"[Gemma4 {role}] Enabled upstream position embedding lookup on {patched} vision embedder(s).")
+
+        if fsdp_config.get("freeze_audio_tower", False):
+            for name, module in actor_module.named_modules():
+                if name.rsplit(".", 1)[-1] in {"audio_tower", "embed_audio"}:
+                    module.requires_grad_(False)
+
         self.use_orig_params = fsdp_config.get("use_orig_params", False)
         if self.config.actor.get("freeze_vision_tower", False):
             vision_tower = get_vl_model_vision_tower(actor_module)
@@ -679,7 +714,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         elif fsdp_strategy == "fsdp2":
             assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
             mp_policy = MixedPrecisionPolicy(
-                param_dtype=param_dtype, reduce_dtype=reduce_dtype, cast_forward_inputs=True
+                param_dtype=param_dtype,
+                reduce_dtype=reduce_dtype,
+                cast_forward_inputs=fsdp_config.get("cast_forward_inputs", True),
             )
             if role == "actor" and fsdp_config.offload_policy:
                 cpu_offload = CPUOffloadPolicy(pin_memory=True)
@@ -697,7 +734,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             }
             full_state = actor_module.state_dict()
             apply_fsdp2(actor_module, fsdp_kwargs, fsdp_config)
-            fsdp2_load_full_state_dict(actor_module, full_state, fsdp_mesh, cpu_offload)
+            fsdp2_load_full_state_dict(
+                actor_module,
+                full_state,
+                fsdp_mesh,
+                cpu_offload,
+                sync_buffers_by_name=fsdp_config.get("sync_buffers_by_name", False),
+            )
             actor_module_fsdp = actor_module
         else:
             raise NotImplementedError(f"not implement {fsdp_strategy}")
@@ -844,6 +887,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
         else:
             params = self.actor_module_fsdp.state_dict()
+
+        if getattr(peft_model.config, "model_type", None) == "gemma4":
+            from verl.models.gemma4.weight_transfer import verify_replicated_buffers
+
+            logger.info("Gemma replicated buffer transfer: %s", verify_replicated_buffers(params))
 
         params = convert_weight_keys(
             params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
@@ -1226,7 +1274,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             data.meta_info["temperature"] = self.config.rollout.temperature
             data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
             # perform recompute log_prob
-            calculate_entropy = not is_lora
+            calculate_entropy = not is_lora and not self.config.actor.fsdp_config.get(
+                "gemma4_skip_log_prob_entropy", False
+            )
             with self.ulysses_sharding_manager:
                 with adapter_ctx:
                     with _worker_gpu_stage(self.config, "actor_compute_log_prob_forward", data, role="actor"):

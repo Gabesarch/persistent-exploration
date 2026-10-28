@@ -14,7 +14,8 @@
 # Env: VLLM_JUDGE_MODEL_PATH (default Qwen3-32B), VLLM_JUDGE_MODEL_NAME (=qwen_vllm),
 #      VLLM_JUDGE_PORT (=8003), VLLM_JUDGE_API_KEY (=qwen), VLLM_JUDGE_TENSOR_PARALLEL_SIZE,
 #      VLLM_JUDGE_CUDA_VISIBLE_DEVICES (empty=share GPU), VLLM_JUDGE_CHAT_TEMPLATE,
-#      VLLM_JUDGE_GPU_MEMORY_UTILIZATION, VLLM_JUDGE_MAX_MODEL_LEN.
+#      VLLM_JUDGE_GPU_MEMORY_UTILIZATION, VLLM_JUDGE_MAX_MODEL_LEN,
+#      VLLM_JUDGE_GDN_PREFILL_BACKEND (default triton on vLLM >= 0.22).
 
 # Disable FlashInfer sampling to avoid JIT compilation issues with missing curand.h
 # on cluster nodes. Uses PyTorch-native sampler instead (minimal performance impact).
@@ -50,24 +51,33 @@ echo "=== Launching dedicated vLLM judge: $_JUDGE_MODEL_PATH on :$_JUDGE_PORT (C
 _cvd=()
 [[ -n "${VLLM_JUDGE_CUDA_VISIBLE_DEVICES:-}" ]] && _cvd=(CUDA_VISIBLE_DEVICES="$VLLM_JUDGE_CUDA_VISIBLE_DEVICES")
 _ATTN_ARGS=()
+_GDN_ARGS=()
 if python - <<'PY' 2>/dev/null
 from importlib.metadata import version
 from packaging.version import Version
 raise SystemExit(0 if Version(version("vllm")) >= Version("0.22") else 1)
 PY
-then _ATTN_ARGS=(--attention-config.flash_attn_version 2)
+then
+  _ATTN_ARGS=(--attention-config.flash_attn_version 2)
+  # Qwen3.5 auto-selects FlashInfer GDN prefill on H100. Its shared JIT
+  # build.ninja can contain CUDA/Python include paths from another environment.
+  # Disabling the FlashInfer sampler does not disable this attention kernel.
+  _GDN_CONFIG="$(python -c 'import json, os; print(json.dumps({"gdn_prefill_backend": os.environ.get("VLLM_JUDGE_GDN_PREFILL_BACKEND", "triton")}))')"
+  _GDN_ARGS=(--additional-config "$_GDN_CONFIG")
 else echo "vLLM < 0.22 -> judge omitting --attention-config.flash_attn_version (unsupported)"; fi
 nohup env "${_cvd[@]}" VLLM_SERVER_DEV_MODE=1 vllm serve "$_JUDGE_MODEL_PATH" \
   --port "$_JUDGE_PORT" \
   --served-model-name "$_JUDGE_MODEL_NAME" \
   --gpu-memory-utilization "$_JUDGE_MEM" \
   "${_ATTN_ARGS[@]}" \
+  "${_GDN_ARGS[@]}" \
   --tensor-parallel-size "$_JUDGE_TP" \
   --max-model-len "$_JUDGE_MAXLEN" \
   --max-num-seqs "$_JUDGE_MAX_NUM_SEQS" \
   --enable-sleep-mode \
   --chat-template "$_JUDGE_TEMPLATE" \
   --api-key "$_JUDGE_API_KEY" \
+  --enforce-eager \
   > "$_JUDGE_LOG" 2>&1 &
 VLLM_JUDGE_SERVER_PID=$!
 echo "$VLLM_JUDGE_SERVER_PID" > "$VERO_EVAL_DIR/logs/judge_server.pid"
@@ -89,6 +99,15 @@ if [[ "$_ok" != 1 ]]; then
   return 1 2>/dev/null || exit 1
 fi
 echo "Judge server up at :$_JUDGE_PORT (pid $VLLM_JUDGE_SERVER_PID)"
+# /v1/models can succeed even when the first real prefill will crash. Exercise
+# grading and the same sleep/wake cycle used for candidate feedback before eval.
+if ! python "$VERO_EVAL_DIR/scripts/probe_judge_vllm.py" \
+  --base-url "http://localhost:${_JUDGE_PORT}/v1" \
+  --api-key "$_JUDGE_API_KEY" --model "$_JUDGE_MODEL_NAME"; then
+  echo "ERROR: judge generation canary failed; see $_JUDGE_LOG" >&2
+  kill "$VLLM_JUDGE_SERVER_PID" 2>/dev/null || true
+  return 1 2>/dev/null || exit 1
+fi
 # Free VRAM until the judge is actually called; VLLMServerJudge wakes/sleeps per batch.
 curl --max-time 10 -s -X POST "http://localhost:${_JUDGE_PORT}/sleep?level=1" -o /dev/null || true
 

@@ -402,9 +402,10 @@ class vLLMHttpServer:
 
         # Don't keep the dummy data in memory
         await engine_client.reset_mm_cache()
-        await engine_client.collective_rpc(
-            method="monkey_patch_model", kwargs={"vocab_size": len(self.model_config.tokenizer)}
-        )
+        patch_kwargs = {"vocab_size": len(self.model_config.tokenizer)}
+        if self.config.get("gemma4_preserve_constant_norm_weights", False):
+            patch_kwargs["gemma4_preserve_constant_norm_weights"] = True
+        await engine_client.collective_rpc(method="monkey_patch_model", kwargs=patch_kwargs)
 
         build_app_sig = inspect.signature(build_app)
         supported_tasks: tuple[Any, ...] = ()
@@ -494,7 +495,11 @@ class vLLMHttpServer:
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
-        prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
+        if getattr(self.model_config.processor, "__class__", type(None)).__name__ == "Gemma4Processor":
+            from verl.models.gemma4.processing import collapse_image_tokens
+            prompt_ids = collapse_image_tokens(prompt_ids, self.model_config.processor)
+        else:
+            prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
         multi_modal_data = {}
         if image_data is not None:
             multi_modal_data["image"] = image_data

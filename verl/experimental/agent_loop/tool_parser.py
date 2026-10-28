@@ -339,3 +339,23 @@ class Qwen3XMLToolParser(ToolParser):
         except Exception as e:
             logger.exception(f"Error in extracting tool call from response: {e}")
             return text, []
+
+
+@ToolParser.register("gemma4")
+class Gemma4ToolParser(ToolParser):
+    async def extract_tool_calls(self, responses_ids, tools=None):
+        from verl.models.gemma4.protocol import parse_calls, split_thought
+        text = self.tokenizer.decode(responses_ids, skip_special_tokens=False)
+        # Prefilled thought channels may be outside responses_ids.
+        action = split_thought(text)['answer']
+        # vLLM removes one trailing EOS while splitting reasoning. Restore it
+        # for shared call validation so duplicate/misplaced EOS cannot become
+        # valid here while being rejected by the trajectory reward parser.
+        parse_action = action
+        if text.rstrip().removesuffix("<turn|>").rstrip().endswith("<eos>"):
+            parse_action += "<eos>"
+        try:
+            calls = parse_calls(parse_action)
+        except (TypeError, ValueError):
+            calls = []
+        return action, [FunctionCall(name=c['name'], arguments=json.dumps(c['arguments'])) for c in calls]

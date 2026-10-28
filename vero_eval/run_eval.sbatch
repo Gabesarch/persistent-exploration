@@ -57,10 +57,15 @@ export FORCE_TOOL_CALLS_UNTIL_FINAL_TURN="${FORCE_TOOL_CALLS_UNTIL_FINAL_TURN:-f
 export FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS="${FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS:-false}"
 export FORCE_FINAL_ANSWER_PREFIX="${FORCE_FINAL_ANSWER_PREFIX:-}"
 export CRITIC_GUIDED_ANSWER_RETRY="${CRITIC_GUIDED_ANSWER_RETRY:-false}"
+export CRITIC_GUIDED_ANSWER_RETRY_SOURCE="${CRITIC_GUIDED_ANSWER_RETRY_SOURCE:-policy}"
+export CRITIC_GUIDED_ANSWER_RETRY_MODE="${CRITIC_GUIDED_ANSWER_RETRY_MODE:-token}"
+export REPLAY_CRITIC_TEMPERATURE="${REPLAY_CRITIC_TEMPERATURE:-0}"
+export REPLAY_CRITIC_TOP_K="${REPLAY_CRITIC_TOP_K:--1}"
+export REPLAY_CRITIC_TOP_P="${REPLAY_CRITIC_TOP_P:-1}"
 export CRITIC_GUIDED_ANSWER_RETRY_THRESHOLD="${CRITIC_GUIDED_ANSWER_RETRY_THRESHOLD:-0.5}"
 export CRITIC_GUIDED_ANSWER_RETRY_PREFILL_PROFILE="${CRITIC_GUIDED_ANSWER_RETRY_PREFILL_PROFILE:-persist}"
 DEFAULT_FORCE_FINAL_ANSWER_THINK_PREFILL="This is the final turn, so I need to answer from the evidence gathered so far."
-export FORCE_FINAL_ANSWER_THINK_PREFILL="${FORCE_FINAL_ANSWER_THINK_PREFILL:-$DEFAULT_FORCE_FINAL_ANSWER_THINK_PREFILL}"
+export FORCE_FINAL_ANSWER_THINK_PREFILL="${FORCE_FINAL_ANSWER_THINK_PREFILL-$DEFAULT_FORCE_FINAL_ANSWER_THINK_PREFILL}"
 
 # The selected training recipe is authoritative, including the served template.
 if [[ -n "${VERO_TRAINING_CONFIG:-}" ]]; then
@@ -214,9 +219,26 @@ echo "TASKS=$TASKS  SUFFIX=$SUFFIX  TOOLS=$TOOLS  OUTPUT_ROOT=$OUTPUT_ROOT"
 echo "FORCE_TOOL_CALLS_UNTIL_FINAL_TURN=$FORCE_TOOL_CALLS_UNTIL_FINAL_TURN"
 echo "FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS=$FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS"
 echo "CRITIC_GUIDED_ANSWER_RETRY=$CRITIC_GUIDED_ANSWER_RETRY threshold=$CRITIC_GUIDED_ANSWER_RETRY_THRESHOLD prefill_profile=$CRITIC_GUIDED_ANSWER_RETRY_PREFILL_PROFILE"
+if [[ "$CRITIC_GUIDED_ANSWER_RETRY_MODE" == reasoning ]]; then
+  echo "Replay critic sampling: temperature=$REPLAY_CRITIC_TEMPERATURE top_k=$REPLAY_CRITIC_TOP_K top_p=$REPLAY_CRITIC_TOP_P"
+fi
 
 # ── 3) serve the policy (GPU0) ──
-bash scripts/serve_qwen_vllm.sh
+if [[ "$CRITIC_GUIDED_ANSWER_RETRY_SOURCE" == ground_truth ]]; then
+  # Preserve Slurm's allocated device IDs (which need not be physical 0/1).
+  IFS=',' read -r -a gt_allocated_gpus <<< "${CUDA_VISIBLE_DEVICES:-0,1}"
+  if [[ ${#gt_allocated_gpus[@]} -lt 2 || "${JUDGE_BACKEND:-}" != server ]]; then
+    echo "ERROR: GT critic needs two allocated GPUs and JUDGE_BACKEND=server." >&2
+    exit 1
+  fi
+  export VLLM_POLICY_CUDA_VISIBLE_DEVICES="${gt_allocated_gpus[0]}"
+  export VLLM_JUDGE_CUDA_VISIBLE_DEVICES="${gt_allocated_gpus[1]}"
+fi
+if [[ -n "${VLLM_POLICY_CUDA_VISIBLE_DEVICES:-}" ]]; then
+  env CUDA_VISIBLE_DEVICES="$VLLM_POLICY_CUDA_VISIBLE_DEVICES" bash scripts/serve_qwen_vllm.sh
+else
+  bash scripts/serve_qwen_vllm.sh
+fi
 curl --max-time 5 -s -o /dev/null -H "Authorization: Bearer ${API_KEY}" "http://localhost:${PORT}/v1/models" \
   || { echo "ERROR: vLLM policy not up on :$PORT"; exit 1; }
 

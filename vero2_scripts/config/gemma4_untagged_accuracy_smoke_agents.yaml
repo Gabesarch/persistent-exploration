@@ -1,0 +1,2 @@
+- name: gemma4_untagged_accuracy_smoke
+  _target_: verl.experimental.agent_loop.gemma4_untagged_accuracy_smoke.Gemma4UntaggedAccuracySmokeAgent

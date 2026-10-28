@@ -144,6 +144,8 @@ def hf_processor(name_or_path, **kwargs):
                 from transformers.models.glm4v import Glm4vModel
 
                 model_class = Glm4vModel
+            case "Gemma4Processor":
+                processor.validate_inputs = lambda *args, **kwargs: None
             case "MllamaProcessor":
                 pass  # MllamaProcessor and MllamaModel doesn't have get_rope_index property
             case _:

@@ -1314,6 +1314,13 @@ def evaluate(
         dist.barrier()  # Ensure all processes are synced before proceeding
 
     if RANK == 0:
+        if log_samples and os.getenv("LMMS_EVAL_SAVE_PREJUDGE_SAMPLES", "").lower() in {"1", "true", "yes", "on"}:
+            from lmms_eval.models.model_utils.prejudge_samples import save_prejudge_samples
+
+            snapshot = save_prejudge_samples(
+                eval_tasks, getattr(cli_args, "output_path", None), serializer=handle_non_serializable
+            )
+            eval_logger.info(f"Saved generated samples before judging: {snapshot}")
         if eval_server_launcher is not None:
             eval_server_launcher.clean()
         ### Aggregate results over all datapoints ###

@@ -33,13 +33,20 @@ API_KEY="${API_KEY:-qwen}"; NUM_GPUS="${NUM_GPUS:-1}"
 CUSTOM_CHAT_TEMPLATE="${CUSTOM_CHAT_TEMPLATE:-}"
 FORCE_TOOL_CALLS_UNTIL_FINAL_TURN="${FORCE_TOOL_CALLS_UNTIL_FINAL_TURN:-false}"
 FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS="${FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS:-false}"
+TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-hermes}"
 
+# These reruns write their policy-server logs beside the scratch results;
+# home is at its hard quota. Already-queued batches invoke this shared script.
+if [[ "${CHECKPOINT_PATH:-}" == *branchstrata20_fresh_lr1e5_critic_maxcalls* && -n "${OUTPUT_ROOT:-}" ]]; then
+  LOG_DIR="${LOG_DIR:-${OUTPUT_ROOT%/}/runtime_logs}"
+fi
 LOG_DIR="${LOG_DIR:-$VERO_EVAL_DIR/logs/vllm}"
 mkdir -p "$LOG_DIR"
 LOGFILE="$LOG_DIR/vllm_$(date '+%Y-%m-%d_%H-%M-%S')_port${PORT}.txt"
 
 echo "CHECKPOINT_PATH: $CHECKPOINT_PATH"
 echo "PORT: $PORT   NUM_GPUS: $NUM_GPUS   served-model-name: $MODEL_NAME"
+echo "Tool-call parser: $TOOL_CALL_PARSER"
 
 # Only kill a server on OUR port: on shared nodes a blanket `pkill -f "vllm serve"`
 # would murder a sibling job's policy server mid-eval (give concurrent jobs unique
@@ -61,12 +68,26 @@ CHAT_TEMPLATE_ARGS=()
 # old 12.96MP within noise and slightly cheaper). Override per run via MM_MAX_PIXELS.
 MM_MAX_PIXELS="${MM_MAX_PIXELS:-10000000}"
 MM_MIN_PIXELS="${MM_MIN_PIXELS-4096}"
-MM_PROCESSOR_KWARGS="{\"max_pixels\":${MM_MAX_PIXELS}}"
-if [[ -n "$MM_MIN_PIXELS" ]]; then
-  MM_PROCESSOR_KWARGS="{\"max_pixels\":${MM_MAX_PIXELS},\"min_pixels\":${MM_MIN_PIXELS}}"
+if [[ -z "${MM_PROCESSOR_KWARGS+x}" ]]; then
+  MM_PROCESSOR_KWARGS="{\"max_pixels\":${MM_MAX_PIXELS}}"
+  if [[ -n "$MM_MIN_PIXELS" ]]; then
+    MM_PROCESSOR_KWARGS="{\"max_pixels\":${MM_MAX_PIXELS},\"min_pixels\":${MM_MIN_PIXELS}}"
+  fi
 fi
 
+# Model-specific options are opt-in; the existing Qwen launch stays unchanged.
+MODEL_SERVE_ARGS=()
+[[ -z "${VLLM_ADDITIONAL_CONFIG:-}" ]] || MODEL_SERVE_ARGS+=(--additional-config "$VLLM_ADDITIONAL_CONFIG")
+[[ -z "${DEFAULT_CHAT_TEMPLATE_KWARGS:-}" ]] || MODEL_SERVE_ARGS+=(--default-chat-template-kwargs "$DEFAULT_CHAT_TEMPLATE_KWARGS")
+[[ -z "${LIMIT_MM_PER_PROMPT:-}" ]] || MODEL_SERVE_ARGS+=(--limit-mm-per-prompt "$LIMIT_MM_PER_PROMPT")
+[[ -z "${VLLM_MAX_NUM_SEQS:-}" ]] || MODEL_SERVE_ARGS+=(--max-num-seqs "$VLLM_MAX_NUM_SEQS")
+[[ -z "${REASONING_PARSER:-}" ]] || MODEL_SERVE_ARGS+=(--reasoning-parser "$REASONING_PARSER")
+
 LOGITS_PROCESSOR_ARGS=()
+TOOL_SERVE_ARGS=()
+if [[ "${TOOLS:-on}" != off ]]; then
+  TOOL_SERVE_ARGS=(--enable-auto-tool-choice --tool-call-parser "$TOOL_CALL_PARSER")
+fi
 FORCED_ACTION_PROCESSOR_ENABLED=false
 FORCED_TOOL_CALLS_ENABLED=false
 case "${FORCE_TOOL_CALLS_UNTIL_FINAL_TURN,,}" in
@@ -114,8 +135,8 @@ nohup vllm serve "$CHECKPOINT_PATH" \
   --mm-processor-kwargs "$MM_PROCESSOR_KWARGS" \
   --api-key "$API_KEY" \
   --enable-sleep-mode \
-  --enable-auto-tool-choice \
-  --tool-call-parser hermes \
+  "${TOOL_SERVE_ARGS[@]}" \
+  "${MODEL_SERVE_ARGS[@]}" \
   "${CHAT_TEMPLATE_ARGS[@]}" \
   "${LOGITS_PROCESSOR_ARGS[@]}" \
   --enforce-eager \
@@ -130,7 +151,10 @@ echo "Waiting for vLLM to be ready (up to ${VLLM_WAIT_MIN} min)..."
 for _ in $(seq 1 $(( VLLM_WAIT_MIN * 12 ))); do
   if curl --max-time 2 -s -o /dev/null "http://localhost:${PORT}/v1/models"; then
     echo "vLLM is up at http://localhost:${PORT}"
-    if [[ "$FORCED_ACTION_PROCESSOR_ENABLED" == true ]]; then
+    if [[ "$FORCED_ACTION_PROCESSOR_ENABLED" == true && -n "${GEMMA_TRAINING_CONFIG:-}" ]]; then
+      "${PYTHON:-python}" "$VERO_EVAL_DIR/scripts/prepare_gemma4_training_eval.py" \
+        --probe-url "http://localhost:${PORT}/v1"
+    elif [[ "$FORCED_ACTION_PROCESSOR_ENABLED" == true ]]; then
       "${PYTHON:-python}" "$VERO_EVAL_DIR/scripts/probe_forced_final_answer.py" \
         --base-url "http://localhost:${PORT}/v1" \
         --api-key "$API_KEY" \

@@ -316,12 +316,15 @@ def acc_reward(
     extra_info=None,
     allow_unboxed_answer_for_accuracy: bool = True,
     counting_reward_kwargs: dict[str, Any] | None = None,
+    parsed_output=None,
 ) -> float:
     reward_type = _extract_reward_type(extra_info)
     if reward_type is None:
         return 0.0
 
-    is_valid, final_answer_text, _, _ = _parse_multiturn_tool_calling_output(predict_str)
+    is_valid, final_answer_text, _, _ = (
+        parsed_output if parsed_output is not None else _parse_multiturn_tool_calling_output(predict_str)
+    )
     if not is_valid or not final_answer_text:
         return 0.0
 
@@ -811,6 +814,7 @@ def compute_score(
     point_box_precision_weight: float = 0.5,
     point_box_tolerance_px: float = 0.0,
     extra_info=None,
+    parsed_output=None,
 ) -> dict[str, Any]:
     predict_str = str(predict_str)
     ground_truth = str(ground_truth)
@@ -824,7 +828,9 @@ def compute_score(
         graded=counting_graded,
     )
 
-    is_valid, final_answer_text, tool_call_count, tool_calls = _parse_multiturn_tool_calling_output(predict_str)
+    is_valid, final_answer_text, tool_call_count, tool_calls = (
+        parsed_output if parsed_output is not None else _parse_multiturn_tool_calling_output(predict_str)
+    )
     reward_type = _extract_reward_type(extra_info)
     answer_info = extract_answer_for_accuracy(
         final_answer_text or "",
@@ -847,6 +853,7 @@ def compute_score(
             extra_info=extra_info,
             allow_unboxed_answer_for_accuracy=allow_unboxed_answer_for_accuracy,
             counting_reward_kwargs=counting_reward_kwargs,
+            parsed_output=parsed_output,
         )
 
     tool_call_bonus_score = 0.0
@@ -865,7 +872,9 @@ def compute_score(
         concave_k=tool_efficiency_concave_k,
         concave_q=tool_efficiency_concave_q,
     )
-    penalty_tool_calls = tool_calls if is_valid else _extract_executed_tool_calls_best_effort(predict_str)
+    penalty_tool_calls = (
+        tool_calls if is_valid or parsed_output is not None else _extract_executed_tool_calls_best_effort(predict_str)
+    )
     tool_repeat_overlap_score = tool_repeat_overlap_reward(
         penalty_tool_calls,
         iou_threshold=tool_repeat_overlap_iou_threshold,

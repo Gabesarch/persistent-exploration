@@ -159,6 +159,8 @@ class FSDPModelMerger(BaseModelMerger):
         # Merge state dicts from all shards
         state_dict = {}
         param_placements: dict[str, list] = {}
+        gemma_buffers = {"layer_scalar", "std_bias", "std_scale", "input_min", "input_max", "output_min", "output_max"}
+        is_gemma4 = getattr(self.model_config, "model_type", None) == "gemma4"
 
         for key in set(model_state_dict_lst[0].keys()):
             state_dict[key] = []
@@ -178,7 +180,10 @@ class FSDPModelMerger(BaseModelMerger):
                     else:
                         assert param_placements[key] == placements
                 else:
-                    state_dict[key].append(tensor.bfloat16())
+                    # Compare Gemma replicas before any lossy dtype conversion.
+                    state_dict[key].append(
+                        tensor if is_gemma4 and key.rsplit(".", 1)[-1] in gemma_buffers else tensor.bfloat16()
+                    )
 
         del model_state_dict_lst
 
@@ -198,6 +203,11 @@ class FSDPModelMerger(BaseModelMerger):
                 else:
                     # 2-D list, FSDP + TP
                     raise NotImplementedError("FSDP + TP is not supported yet")
+            elif is_gemma4 and key.rsplit(".", 1)[-1] in gemma_buffers:
+                replicas = state_dict[key]
+                if not all(torch.equal(replicas[0], replica) for replica in replicas[1:]):
+                    raise ValueError(f"Gemma replicated buffer differs across ranks: {key}")
+                state_dict[key] = replicas[0]
             else:
                 state_dict[key] = torch.cat(state_dict[key], dim=0)
 

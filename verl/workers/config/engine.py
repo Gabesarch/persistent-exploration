@@ -237,6 +237,19 @@ class FSDPEngineConfig(EngineConfig):
     _mutable_fields = EngineConfig._mutable_fields | {"ulysses_sequence_parallel_size"}
 
     # fsdp specific flags
+    cast_forward_inputs: bool = True
+    sync_buffers_by_name: bool = False
+    gemma4_group_text_layers: bool = False
+    gemma4_position_embedding_lookup: bool = False
+    gemma4_policy_chunk_size: int = 0
+    gemma4_skip_log_prob_entropy: bool = False
+    gemma4_trim_padding: bool = False
+    gemma4_trim_alignment: int = 512
+    gemma4_large_head_sdpa: bool = False
+    gemma4_profile_actor: bool = False
+    gemma4_benchmark_padding: bool = False
+    freeze_audio_tower: bool = False
+    gemma4_smoke_diagnostics: bool = False
     wrap_policy: dict[str, Any] = field(default_factory=dict)
     offload_policy: bool = False
     reshard_after_forward: bool = True
