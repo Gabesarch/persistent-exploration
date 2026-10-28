@@ -1,0 +1,5 @@
+# Mini-o3 step-200 schema from its saved validation inputs; same benchmark/scorer.
+include:
+  - ../_tool_templates/_toolset_zoom_minio3_step200_yaml
+  - vstar_bench_selected200_zoom.yaml
+task: vstar_bench_selected200_minio3_step200_zoom

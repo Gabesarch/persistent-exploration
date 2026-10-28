@@ -1,0 +1,11 @@
+include: pinpoint_bench.yaml
+task: "pinpoint_bench_reasoning"
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 0.6
+  do_sample: true
+
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: ""
+    post_prompt: ""

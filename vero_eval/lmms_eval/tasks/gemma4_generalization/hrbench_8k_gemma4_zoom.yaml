@@ -1,0 +1,5 @@
+# Use the selected200 benchmark/scorer with the established Gemma zoom protocol.
+include:
+  - ../_tool_templates/_toolset_zoom_gemma_yaml
+  - ../selected200_generalization/hrbench_8k_selected200_zoom.yaml
+task: hrbench_8k_gemma4_zoom

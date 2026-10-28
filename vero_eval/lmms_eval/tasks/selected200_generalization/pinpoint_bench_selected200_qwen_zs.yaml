@@ -1,0 +1,15 @@
+# Frozen Visual Probe protocol for the selected step-200 generalization suite.
+include: ../pinpoint_bench/pinpoint_bench_reasoning_zoom.yaml
+task: pinpoint_bench_selected200_qwen_zs
+generation_kwargs: {"max_new_tokens": 16384, "temperature": 1.0, "top_p": 1.0, "top_k": 40, "presence_penalty": 2.0, "do_sample": true}
+metadata:
+  allowed_tools: []
+  system_prompt_files: []
+  tool_schema_overrides: {}
+  image_indexing: null
+  show_initial_image_index_hint: false
+  restore_assistant_forced_prefill: false
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: "You are given an image. Search the picture to answer the question. Respond with a short, specific phrase only. "
+    post_prompt: ""

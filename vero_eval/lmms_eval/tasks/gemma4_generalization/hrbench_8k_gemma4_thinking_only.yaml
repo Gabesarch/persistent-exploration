@@ -1,0 +1,20 @@
+# Same selected200 population/scorer; Qwen3-VL thinking-only sampling.
+include: ../selected200_generalization/hrbench_8k_selected200_qwen_zs.yaml
+task: hrbench_8k_gemma4_thinking_only
+generation_kwargs:
+  max_new_tokens: 16384
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 20
+  presence_penalty: 1.5
+  repetition_penalty: 1.0
+  do_sample: true
+metadata:
+  allowed_tools: []
+  system_prompt_files: []
+  tool_schema_overrides: {}
+  extra_tools: []
+  terminal_tools: []
+  image_indexing: null
+  show_initial_image_index_hint: false
+  restore_assistant_forced_prefill: false
