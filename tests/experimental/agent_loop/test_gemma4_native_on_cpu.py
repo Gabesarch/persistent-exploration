@@ -204,6 +204,100 @@ def test_strict_native_reward_and_reasoning_actions(processor):
     assert reward(full)["accuracy"] == 1
 
 
+@pytest.mark.parametrize("suffix", ["", "<eos>", " \n<eos>\n", "<eos><|tool_response>"])
+def test_tool_call_eos_rollout_reward_parity(processor, suffix):
+    from verl.experimental.agent_loop.tool_parser import ToolParser
+    from verl.utils.reward_score.gemma4_native import compute_score_from_data_source as score
+
+    parser = ToolParser.get_tool_parser("gemma4", processor.tokenizer)
+    generated = p.THOUGHT + "Inspect the region." + p.END_THOUGHT + CALL + suffix
+    token_ids = processor.tokenizer.encode(generated, add_special_tokens=False)
+    snapshot = list(token_ids)
+    _, calls = asyncio.run(parser.extract_tool_calls(token_ids))
+    assert len(calls) == 1
+    assert json.loads(calls[0].arguments)["bbox_2d"] == [100, 200, 700, 800]
+    assert token_ids == snapshot
+
+    feedback = (
+        'response:image_zoom_in_tool{value:<|"|>feedback <answer>dog</answer><|"|>}<tool_response|><turn|>\n'
+        + p.USER
+        + "Image 1. Above are the tool-returned image(s).<turn|>\n"
+        + p.MODEL
+    )
+    first = generated.rstrip()
+    if not first.endswith(p.TOOL_RESPONSE):
+        first += p.TOOL_RESPONSE
+    nested = CALL.replace("img_idx:0", "img_idx:1")
+    full = (
+        first
+        + feedback
+        + p.THOUGHT
+        + "Inspect the crop."
+        + p.END_THOUGHT
+        + nested
+        + "<eos>"
+        + p.TOOL_RESPONSE
+        + feedback
+        + p.THOUGHT
+        + "Visible evidence."
+        + p.END_THOUGHT
+        + "<answer>cat</answer><turn|>"
+    )
+    parsed = p.parse_trajectory(full)
+    assert parsed[:3] == (True, "cat", 2)
+    assert parsed[3][0]["arguments"]["bbox_2d"] == [200, 100, 800, 700]
+    assert parsed[3][1]["arguments"]["img_idx"] == 1
+    for label in ("A", "R"):
+        sidecar = p.USER + "critic<turn|>\n" + p.MODEL + p.THOUGHT + "classify" + p.END_THOUGHT
+        reward = score(
+            "test", full + sidecar + f"<answer>{label}</answer><turn|>", "cat", extra_info={"reward_type": "search"}
+        )
+        assert reward["accuracy"] == reward["format"] == 1
+    bad_final = full.replace("<answer>cat</answer>", "cat")
+    reward = score("test", bad_final, "cat", extra_info={"reward_type": "search"})
+    assert reward["accuracy"] == reward["format"] == 0
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "<eos>" + CALL,
+        CALL + "<eos><eos>",
+        CALL + "<eos>extra prose",
+        CALL + "extra prose<eos>",
+        CALL + p.TOOL_RESPONSE + "<eos>",
+        CALL + "<eos>" + CALL,
+        CALL.replace("<tool_call|>", "<eos>"),
+        CALL.replace("[100,200,700,800]", "[700,200,100,800]") + "<eos>",
+    ],
+)
+def test_tool_call_eos_rejects_malformed_boundaries(processor, action):
+    from verl.experimental.agent_loop.tool_parser import ToolParser
+
+    parser = ToolParser.get_tool_parser("gemma4", processor.tokenizer)
+    text = p.THOUGHT + "Inspect." + p.END_THOUGHT + action
+    ids = processor.tokenizer.encode(text, add_special_tokens=False)
+    assert not asyncio.run(parser.extract_tool_calls(ids))[1]
+    # In a full trajectory, content after TOOL_RESPONSE belongs to the
+    # environment; malformed model suffixes are checked before that boundary.
+    if p.TOOL_RESPONSE not in action:
+        assert not p.parse_trajectory(
+            text
+            + p.TOOL_RESPONSE
+            + "feedback<turn|>\n"
+            + p.MODEL
+            + p.THOUGHT
+            + "Done."
+            + p.END_THOUGHT
+            + "<answer>cat</answer><turn|>"
+        )[0]
+
+
+def test_tool_call_eos_inside_label_is_not_removed():
+    call = CALL.replace("region", "literal <eos> label")
+    assert p.parse_calls(call + "<eos>")[0]["arguments"]["label"] == "literal <eos> label"
+
+
 def test_critic_masks_forcing_and_rollback(processor):
     from verl.experimental.agent_loop.gemma4_tool_agent_loop import Gemma4ToolAgentLoop
     from verl.experimental.agent_loop.tool_agent_loop import AgentData

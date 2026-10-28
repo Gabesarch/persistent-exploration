@@ -85,6 +85,11 @@ def benchmark_padding(actor, data):
             errors.append(f"{name}: gradient relative L2 error {relative} >= 0.05")
         comparisons[name] = dict(relative_l2_error=relative, max_abs_error=float((actual - reference).abs().max()))
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    from .trimming import trim_inputs
+
+    compact, _, _ = trim_inputs(
+        inputs, inputs["responses"], alignment=actor.actor_module._gemma4_trim_alignment
+    )
     report = dict(
         parity_passed=not errors,
         parity_errors=errors,
@@ -93,7 +98,9 @@ def benchmark_padding(actor, data):
         valid_logprob_max_abs_error=float((outputs["trimmed"] - outputs["padded"]).abs().max()) if valid.any() else 0,
         allocated_tokens=inputs["input_ids"].numel(),
         actual_tokens=int(inputs["attention_mask"].sum()),
+        trimmed_allocated_tokens=compact["input_ids"].numel(),
         actual_response_tokens=int(valid.sum()),
+        trim_alignment=actor.actor_module._gemma4_trim_alignment,
         note="One paired probe per rank, padded first; includes FSDP communication and image reconstruction. "
         "No optimizer step; probe gradients cleared and RNG restored. Not a warmed throughput benchmark.",
     )

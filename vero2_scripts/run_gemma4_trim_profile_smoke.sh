@@ -17,6 +17,7 @@ CONFIG_NAME=gemma4_trim_profile_smoke
 source "$REPO_ROOT/vero2_scripts/gemma4_training_runtime.sh"
 python -m pytest -q -p no:cacheprovider \
   tests/experimental/agent_loop/test_gemma4_trimming_on_cpu.py \
+  tests/experimental/agent_loop/test_gemma4_attention_on_cpu.py \
   tests/experimental/agent_loop/test_gemma4_chunked_policy_on_cpu.py \
   --junitxml="$GEMMA4_ARTIFACT_DIR/trimming.xml" 2>&1 | tee "$GEMMA4_ARTIFACT_DIR/trimming.log"
 python "$REPO_ROOT/vero2_scripts/validate_gemma4_training.py" --fixtures --output "$GEMMA4_ARTIFACT_DIR"

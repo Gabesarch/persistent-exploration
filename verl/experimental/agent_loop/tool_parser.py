@@ -348,8 +348,14 @@ class Gemma4ToolParser(ToolParser):
         text = self.tokenizer.decode(responses_ids, skip_special_tokens=False)
         # Prefilled thought channels may be outside responses_ids.
         action = split_thought(text)['answer']
+        # vLLM removes one trailing EOS while splitting reasoning. Restore it
+        # for shared call validation so duplicate/misplaced EOS cannot become
+        # valid here while being rejected by the trajectory reward parser.
+        parse_action = action
+        if text.rstrip().removesuffix("<turn|>").rstrip().endswith("<eos>"):
+            parse_action += "<eos>"
         try:
-            calls = parse_calls(action)
+            calls = parse_calls(parse_action)
         except (TypeError, ValueError):
             calls = []
         return action, [FunctionCall(name=c['name'], arguments=json.dumps(c['arguments'])) for c in calls]

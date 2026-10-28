@@ -16,7 +16,7 @@ set +u
 set -u
 source "$VERO_EVAL_DIR/examples/_domain_map.sh"
 
-TRAIN_DIR=""; DOMAIN=""; SUFFIX="reasoning"; RUN_ID=""; MAX_CKPTS=0; EVERY=0
+TRAIN_DIR=""; DOMAIN=""; SUFFIX="reasoning"; RUN_ID=""; MAX_CKPTS=0; EVERY=100
 NUM_GPUS="${NUM_GPUS:-1}"; JUDGE_BACKEND="${JUDGE_BACKEND:-engine}"; LIMIT="${LIMIT:-}"
 ARRAY_CHUNK=""; DRYRUN=0; SBATCH_OPTS=()
 while [[ $# -gt 0 ]]; do case "$1" in
@@ -45,7 +45,7 @@ submit_one() {
   # filter --every (step % X == 0)
   if [[ "$EVERY" -gt 0 ]]; then
     local keep=(); for c in "${CKPTS[@]}"; do
-      local s="${c##*_}"; (( s % EVERY == 0 )) && keep+=("$c"); done
+      local s="${c##*_}"; (( s > 0 && s % EVERY == 0 )) && keep+=("$c"); done
     CKPTS=("${keep[@]}")
   fi
   # filter --max-checkpoints (most recent N)

@@ -74,7 +74,7 @@ fi
 #    Hosted API_TYPE=openai|azure judges do not manage the local policy lifecycle. The old
 #    dedicated judge server remains available explicitly with JUDGE_BACKEND=server
 #    and needs two GPUs unless policy self-judging is deliberately requested. ─────
-_JUDGE_STEMS="visual_probe pinpoint_bench simplevqa mathvista mathvision charxiv mmvetv2 mia_bench mm_mt_bench mmifeval fvqa chartmuseum"
+_JUDGE_STEMS="visual_probe pinpoint_bench o3_bench zoom_bench simplevqa mathvista mathvision charxiv mmvetv2 mia_bench mm_mt_bench mmifeval fvqa chartmuseum"
 RUN_HAS_JUDGE=0
 MANAGE_VLLM_SERVER_LIFECYCLE=false
 for _t in ${TASKS//,/ }; do
@@ -136,6 +136,9 @@ MODEL_ARGS="model_version=${MODEL_VERSION},base_url=http://localhost:${PORT}/v1,
 [[ "$MANAGE_VLLM_SERVER_LIFECYCLE" == true ]] && MODEL_ARGS="${MODEL_ARGS},manage_vllm_server_lifecycle=true"
 [[ -n "$MCP_SERVER_PATH" ]] && MODEL_ARGS="${MODEL_ARGS},mcp_server_path=${MCP_SERVER_PATH}"
 [[ -n "$SYSTEM_PROMPT"   ]] && MODEL_ARGS="${MODEL_ARGS},system_prompt=${SYSTEM_PROMPT}"
+case "${TOOL_IMAGE_AS_USER_TURN:-false}" in
+  1|true|yes|on) MODEL_ARGS="${MODEL_ARGS},tool_image_as_user_turn=true" ;;
+esac
 FORCED_ACTION_ENABLED=false
 case "${FORCE_TOOL_CALLS_UNTIL_FINAL_TURN,,}" in
   1|true|yes|on)

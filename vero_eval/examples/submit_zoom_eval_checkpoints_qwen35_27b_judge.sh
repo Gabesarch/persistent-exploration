@@ -12,16 +12,18 @@
 #   EVAL_NAME=branch_comparison EVAL_PROFILE=full bash ...
 #   TRAIN_DIR=/path/to/run TASKS=task1,task2 MAX_CHECKPOINTS=5 bash ...
 #   MAX_STEPS_EVAL=200 bash ...   # only evaluate checkpoints with step <= 200
-#   ONLY_EVAL_EVERY_X=40 ONLY_EVAL_GLOBAL_STEPS=80,120 bash ...
+#   ONLY_EVAL_EVERY_X=100 ONLY_EVAL_GLOBAL_STEPS=100,200 bash ...
 #   EVAL_PROFILE=debug bash ...   # default GPU test queue/gpu80, 1h, limit=100, 1 GPU
 #   EVAL_PROFILE=full bash ...    # default pli-c/h100 config
 #   EVAL_PROFILE=vlmrl bash ...   # pli partition with vlmrl account
 #   EVAL_PROFILE=ailab bash ...   # ailab partition with no account
+#   maxcalls20 and prefixremoved_gspo_lr1e5_critic default to 24h outside debug;
+#   TIME_OVERRIDE, DEFAULT_TIME, or SBATCH_OPTS=--time=... can override this.
 #   MERGE_BACKEND=fsdp bash ...   # convert FSDP shards to HF if actor/huggingface lacks weights
 #   PORT_OFFSET=200 bash ...      # optional stable offset added to all per-job ports
 #   FORCE_ANSWER_AFTER_MAX_TOOL_ITERATIONS=true bash ...  # force one final <answer> call at tool cap
 #   EVAL_NAME=branchstrata20_fresh_lr1e5_critic \
-#     CRITIC_GUIDED_ANSWER_RETRY_THRESHOLD=0.5 ONLY_EVAL_GLOBAL_STEPS=10,20 bash ...
+#     CRITIC_GUIDED_ANSWER_RETRY_THRESHOLD=0.5 ONLY_EVAL_GLOBAL_STEPS=100,200 bash ...
 #   Candidate schedule v1 defaults to first candidate by turn 5, global critic
 #   threshold 0.5, and recorded candidate answers. FIRST_CANDIDATE_ANSWER_TURN=0
 #   restores natural timing; an explicit critic threshold overrides 0.5.
@@ -56,7 +58,7 @@ TASKS_EXPLICIT="${TASKS+x}"
 OUTPUT_ROOT_EXPLICIT="${OUTPUT_ROOT+x}"
 LIMIT="${LIMIT:-}"
 STRICT_TASKS="${STRICT_TASKS:-1}"
-EVAL_PROFILE="${EVAL_PROFILE:-full}"
+EVAL_PROFILE="${EVAL_PROFILE:-ailab}"
 RUN_SYSTEM_PROMPT_MODE_EXPLICIT="${RUN_SYSTEM_PROMPT_MODE+x}"
 RUN_SYSTEM_PROMPT_MODE="${RUN_SYSTEM_PROMPT_MODE:-task_metadata}"  # task_metadata|run_env|none
 
@@ -68,7 +70,7 @@ PORT_OFFSET="${PORT_OFFSET:-}"
 MAX_CHECKPOINTS="${MAX_CHECKPOINTS:-}"
 MAX_STEPS_EVAL="${MAX_STEPS_EVAL:-}"
 USE_MOST_RECENT_MAX_CHECKPOINTS="${USE_MOST_RECENT_MAX_CHECKPOINTS:-false}"
-ONLY_EVAL_EVERY_X="${ONLY_EVAL_EVERY_X:-10}"
+ONLY_EVAL_EVERY_X="${ONLY_EVAL_EVERY_X:-100}"
 ONLY_EVAL_GLOBAL_STEPS="${ONLY_EVAL_GLOBAL_STEPS:-}"
 OVERRIDE_EXISTING="${OVERRIDE_EXISTING:-true}"
 SKIP_IF_EXISTS="${SKIP_IF_EXISTS:-true}"
@@ -110,6 +112,8 @@ declare -A TRAIN_DIR_BY_EVAL_NAME=(
   # Continuation arrays 14444045 and 14446126; tasks 1-10 share each root.
   [gdpo_fresh_lr1e5_noexplore]="/scratch/gpfs/ZHUANGL/gs1693/vero2/checkpoints/vero2_verl/gdpo_fresh_lr1e5_noexplore_20260925"
   [gdpo_fresh_lr1e5_noexplore_accformat]="/scratch/gpfs/ZHUANGL/gs1693/vero2/checkpoints/vero2_verl/gdpo_fresh_lr1e5_noexplore_accformat_20260925"
+  # Active vero2_ngu array 15945498; all continuation tasks resume this root.
+  [gdpo_ngu_visual_probe_15945498]="/scratch/gpfs/ZHUANGL/gs1693/vero2/checkpoints/vero2_verl/gdpo_ngu_qwen3vl_visual_probe_cropzoom_8h100_full_p05_15945498"
   [answer_retry_branch_donly_llmjudge_forcedprefill]="/scratch/gpfs/ZHUANGL/gs1693/vero2/checkpoints/vero2_verl/GDPO_HDPOtool_GSPO_fp16_math_verify_qwen3vl_visual_probe_cropzoom_gdpo_hdpotool_hardonly_answer_retry_branch_donly_llmjudge_forcedprefill_20260524_160610"
   [branchstrata20]="/scratch/gpfs/ZHUANGL/gs1693/vero2/checkpoints/vero2_verl/GDPO_HDPOtool_GSPO_fp16_math_verify_qwen3vl_visual_probe_cropzoom_gdpo_hdpotool_hardonly_answer_retry_branch_donly_llmjudge_forcedprefill_branchstrata20_20260524_160610"
   [branchstrata20_unmaskedprefill]="/scratch/gpfs/ZHUANGL/gs1693/vero2/checkpoints/vero2_verl/GDPO_HDPOtool_GSPO_fp16_math_verify_qwen3vl_visual_probe_cropzoom_gdpo_hdpotool_hardonly_answer_retry_branch_donly_llmjudge_forcedprefill_branchstrata20_unmaskedprefill_20260524_160610"
@@ -171,6 +175,9 @@ declare -A SYSTEM_PROMPT_BY_EVAL_NAME=(
   [minio3_vero2_step200]="$TRAINING_SYSTEM_PROMPT_CHATTING_TOOL_CALLING"
   [gdpo_fresh_lr1e5_noexplore]="$TRAINING_SYSTEM_PROMPT_CHATTING_TOOL_CALLING"
   [gdpo_fresh_lr1e5_noexplore_accformat]="$TRAINING_SYSTEM_PROMPT_CHATTING_TOOL_CALLING"
+  # Verified across all 2042/515 records: no dataset system overrides; 2980 bytes,
+  # SHA-256 c86c158cbbbc751309b1f20671c457dd59a3d887a69d9eb552d2394a544431c6.
+  [gdpo_ngu_visual_probe_15945498]="/home/gs1693/repo/vero2_ngu/vero2_scripts/prompts/system_prompt_chatting_tool_calling.txt"
   [answer_retry_branch_donly_llmjudge_forcedprefill]="$TRAINING_SYSTEM_PROMPT_CHATTING_TOOL_CALLING"
   [branchstrata20]="$TRAINING_SYSTEM_PROMPT_CHATTING_TOOL_CALLING"
   [branchstrata20_unmaskedprefill]="$TRAINING_SYSTEM_PROMPT_CHATTING_TOOL_CALLING"
@@ -204,6 +211,7 @@ declare -A EVAL_NAMES_BY_GROUP=(
 EVAL_NAMES_BY_GROUP[branch_comparison]+=" branchstrata20_fresh_lr1e5_critic_maxcalls5 branchstrata20_fresh_lr1e5_critic_maxcalls20"
 EVAL_NAMES_BY_GROUP[branch_comparison]+=" branchstrata20_fresh_lr1e5_critic_replay_schedule_v1"
 EVAL_NAMES_BY_GROUP[branch_comparison]+=" fixjson_vero2_step200 minio3_vero2_step200"
+EVAL_NAMES_BY_GROUP[branch_comparison]+=" gdpo_ngu_visual_probe_15945498"
 
 # Single model directories get numbered output identities for filters, dedup and plots.
 declare -A SINGLE_CHECKPOINT_STEP_BY_EVAL_NAME=(
@@ -213,6 +221,9 @@ declare -A SINGLE_CHECKPOINT_STEP_BY_EVAL_NAME=(
   [minio3_vero2_step200]=200
 )
 declare -A RUN_SYSTEM_PROMPT_MODE_BY_EVAL_NAME=(
+  # NGU changes training resampling only: exact solver prompt, natural tools,
+  # ten tool rounds plus forced final answer, with no inference retry critic.
+  [gdpo_ngu_visual_probe_15945498]=run_env
   # Replace the task's JSON prompt, rather than appending an incompatible fragment.
   [qwen35_vero2_step200]=run_env
   # Exact JSON training prompt, including its trailing newline; no task fragments.
@@ -449,6 +460,9 @@ case "$CRITIC_GUIDED_ANSWER_RETRY_MODE" in
 esac
 
 declare -A TASKS_BY_TASK_GROUP=(
+  [zoom_bench]="zoom_bench_reasoning_zoom"
+  [visualoverload_hard]="visualoverload_hard_reasoning_zoom"
+  [o3_bench]="o3_bench_reasoning_zoom"
   [visual_probe]="visual_probe_easy_reasoning_zoom,visual_probe_medium_reasoning_zoom,visual_probe_hard_reasoning_zoom"
   [visual_probe_hstar_pinpoint]="visual_probe_easy_reasoning_zoom,visual_probe_medium_reasoning_zoom,visual_probe_hard_reasoning_zoom,hstarbench_mixed_reasoning_zoom,pinpoint_bench_reasoning_zoom,screenspotpro_point_in_box_reasoning_zoom"
   [visual_probe_vstar]="visual_probe_easy_reasoning_zoom,visual_probe_medium_reasoning_zoom,visual_probe_hard_reasoning_zoom,vstar_bench_reasoning_zoom"
@@ -525,6 +539,17 @@ if [[ "$FOLLOWUP_CANDIDATE_ANSWER_TURN" != 0 ]]; then
   LEGACY_CANDIDATE_JOB_TAG=""
 fi
 
+# These conditions were still generating when their six-hour jobs timed out.
+# Apply the longer default per condition, including grouped/future checkpoints,
+# while preserving explicit time requests and the one-hour debug profile.
+if [[ "${EVAL_PROFILE,,}" != debug ]]; then
+  case "$EVAL_NAME" in
+    branchstrata20_fresh_lr1e5_critic_maxcalls20|branchstrata20_fresh_prefixremoved_gspo_lr1e5_critic)
+      DEFAULT_TIME="${DEFAULT_TIME:-24:00:00}"
+      ;;
+  esac
+fi
+
 case "${EVAL_PROFILE,,}" in
   full)
     PARTITION="${PARTITION:-pli-c}"
@@ -546,8 +571,8 @@ case "${EVAL_PROFILE,,}" in
     ;;
   ailab)
     PARTITION="${PARTITION:-ailab}"
-    ACCOUNT="${ACCOUNT:-}"
-    CONSTRAINT="${CONSTRAINT:-}"
+    ACCOUNT="${ACCOUNT:-zhuangl}"
+    CONSTRAINT="${CONSTRAINT:-h200}"
     GPU_TYPE="${GPU_TYPE:-}"
     NUM_GPUS="${NUM_GPUS:-1}"
     CPUS_PER_TASK="${CPUS_PER_TASK:-8}"
@@ -823,18 +848,24 @@ if [[ "${SKIP_IF_EXISTS,,}" == "true" ]]; then
 fi
 
 declare -A QUEUED_JOB_SET=()
+declare -A QUEUED_OUTPUT_SET=()
 if [[ "${SKIP_IF_QUEUED,,}" == "true" ]]; then
   if command -v squeue >/dev/null 2>&1; then
-    QUEUE_USER="${USER:-$(whoami)}"
-    while IFS= read -r job_name; do
-      [[ -n "$job_name" ]] && QUEUED_JOB_SET["$job_name"]=1
-    done < <(squeue -u "$QUEUE_USER" -h -r -o "%j" -t PD,R)
+    # A renamed/resource-variant wrapper can have the same canonical output.
+    # Capture errors before parsing, so a failed controller query cannot submit duplicates.
+    QUEUE_SNAPSHOT="$(python "$VERO_EVAL_DIR/examples/queued_eval_outputs.py")"
+    while IFS=$'\t' read -r kind value; do
+      [[ -n "$value" ]] || continue
+      if [[ "$kind" == NAME ]]; then QUEUED_JOB_SET["$value"]=1; fi
+      if [[ "$kind" == OUTPUT ]]; then QUEUED_OUTPUT_SET["$value"]=1; fi
+    done <<< "$QUEUE_SNAPSHOT"
   else
-    echo "[WARN] SKIP_IF_QUEUED enabled but squeue not found; skipping queued check."
+    echo "[ERROR] squeue is required to exclude queued evaluations." >&2
+    exit 1
   fi
 fi
 
-if [[ "${SKIP_IF_QUEUED,,}" == "true" && ${#QUEUED_JOB_SET[@]} -gt 0 ]]; then
+if [[ "${SKIP_IF_QUEUED,,}" == "true" && ( ${#QUEUED_JOB_SET[@]} -gt 0 || ${#QUEUED_OUTPUT_SET[@]} -gt 0 ) ]]; then
   FILTERED_CHECKPOINTS=()
   for ckpt in "${CHECKPOINTS[@]}"; do
     ckpt_name="$(checkpoint_eval_name "$ckpt")"
@@ -845,7 +876,10 @@ if [[ "${SKIP_IF_QUEUED,,}" == "true" && ${#QUEUED_JOB_SET[@]} -gt 0 ]]; then
     fi
     legacy_job_name="zoom-eval-$(sanitize_job_token "$ckpt_name")"
     queued_match=""
-    if [[ -n "${QUEUED_JOB_SET[$job_name]:-}" ]]; then
+    canonical_output="$(realpath -m -- "$OUTPUT_ROOT/$ckpt_name")"
+    if [[ -n "${QUEUED_OUTPUT_SET[$canonical_output]:-}" ]]; then
+      queued_match="$canonical_output"
+    elif [[ -n "${QUEUED_JOB_SET[$job_name]:-}" ]]; then
       queued_match="$job_name"
     elif [[ -z "$CRITIC_RETRY_JOB_TAG" && -n "${QUEUED_JOB_SET[$legacy_job_name]:-}" ]]; then
       queued_match="$legacy_job_name"
@@ -875,7 +909,7 @@ if [[ -n "$ONLY_EVAL_EVERY_X" ]]; then
   for ckpt in "${CHECKPOINTS[@]}"; do
     ckpt_name="$(checkpoint_eval_name "$ckpt")"
     step="$(extract_checkpoint_step "$ckpt_name" || true)"
-    if [[ -n "$step" && $((step % ONLY_EVAL_EVERY_X)) -eq 0 ]]; then
+    if [[ -n "$step" && "$step" -gt 0 && $((step % ONLY_EVAL_EVERY_X)) -eq 0 ]]; then
       FILTERED_CHECKPOINTS+=("$ckpt")
     else
       SKIPPED_INTERVAL+=1
@@ -893,6 +927,39 @@ if [[ ${#ONLY_EVAL_GLOBAL_STEP_SET[@]} -gt 0 ]]; then
       FILTERED_CHECKPOINTS+=("$ckpt")
     else
       SKIPPED_EXPLICIT+=1
+    fi
+  done
+  CHECKPOINTS=("${FILTERED_CHECKPOINTS[@]}")
+fi
+
+# NGU saves into a visible directory before all ranks and its tracker commit.
+# Leave other conditions' existing selection behavior unchanged.
+if [[ "$EVAL_NAME" == gdpo_ngu_visual_probe_15945498 ]]; then
+  FILTERED_CHECKPOINTS=()
+  for ckpt in "${CHECKPOINTS[@]}"; do
+    if python - "$ckpt" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+step = Path(sys.argv[1])
+try:
+    latest = int((step.parent / 'latest_checkpointed_iteration.txt').read_text())
+    actor = step / 'actor'
+    world = int(json.loads((actor / 'fsdp_config.json').read_text())['world_size'])
+    files = [actor / f'model_world_size_{world}_rank_{rank}.pt' for rank in range(world)]
+    files += [actor / 'huggingface' / name for name in
+              ('config.json', 'tokenizer_config.json', 'tokenizer.json', 'processor_config.json')]
+    ready = (latest >= int(step.name.removeprefix('global_step_')) and world > 0
+             and all(p.is_file() and p.stat().st_size > 0 for p in files))
+except (OSError, ValueError, KeyError, TypeError):
+    ready = False
+sys.exit(0 if ready else 1)
+PY
+    then
+      FILTERED_CHECKPOINTS+=("$ckpt")
+    else
+      echo "[INFO] Skipping $(basename "$ckpt") (NGU tracker/model shards are not complete)."
     fi
   done
   CHECKPOINTS=("${FILTERED_CHECKPOINTS[@]}")

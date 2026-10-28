@@ -78,7 +78,9 @@ def _policy_forward(
         from .trimming import trim_inputs
 
         with stage("trim_inputs"):
-            kwargs, gemma4_response_labels, original_width = trim_inputs(kwargs, gemma4_response_labels)
+            kwargs, gemma4_response_labels, original_width = trim_inputs(
+                kwargs, gemma4_response_labels, alignment=self._gemma4_trim_alignment
+            )
     with stage("model_forward"):
         output = self.model(**kwargs, return_dict=True)
     response_length = gemma4_response_labels.shape[-1]
@@ -97,19 +99,27 @@ def _policy_forward(
         softcap=self.config.get_text_config().final_logit_softcapping,
         calculate_entropy=gemma4_calculate_entropy,
     )
+    if self._gemma4_trim_padding:
+        # Alignment may retain masked response tokens. They remain unsupervised
+        # and, like removed padding, have zero externally visible statistics.
+        valid = kwargs["attention_mask"][:, -response_length:].bool()
+        statistics = {key: value.masked_fill(~valid, 0) for key, value in statistics.items()}
     # FSDP2 must traverse the output pytree to install its backward hooks.
     if original_width == response_length:
         return statistics
     return {key: F.pad(value, (0, original_width - response_length)) for key, value in statistics.items()}
 
 
-def enable_chunked_policy(model, chunk_size, *, trim_padding=False):
+def enable_chunked_policy(model, chunk_size, *, trim_padding=False, trim_alignment=1):
     from transformers.models.gemma4.modeling_gemma4 import Gemma4ForConditionalGeneration
 
     if not isinstance(model, Gemma4ForConditionalGeneration) or chunk_size <= 0:
         raise ValueError("Chunked Gemma policy requires Gemma4ForConditionalGeneration and positive chunk size")
+    if not isinstance(trim_alignment, int) or trim_alignment < 1:
+        raise ValueError("Gemma trim alignment must be a positive integer")
     if not hasattr(model, "_gemma4_original_forward"):
         model._gemma4_original_forward = model.forward
         model.forward = MethodType(_policy_forward, model)
     model._gemma4_policy_chunk_size = int(chunk_size)
     model._gemma4_trim_padding = bool(trim_padding)
+    model._gemma4_trim_alignment = trim_alignment

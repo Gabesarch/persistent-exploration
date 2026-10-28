@@ -79,6 +79,34 @@ def tiny_model():
     return Gemma4ForConditionalGeneration(config).to(torch.bfloat16)
 
 
+def test_dense_model_chunked_head_fp32_gradients():
+    """Independent native dense reference for projection/temperature/loss math.
+
+    FSDP tests use identical heads to avoid conflating sharding with reduced-
+    precision reduction order; this test retains the independent dense oracle.
+    """
+    torch.manual_seed(42)
+    reference = tiny_model().float()
+    model = copy.deepcopy(reference)
+    enable_chunked_policy(model, 2)
+    ids = torch.tensor([[0, 2, 4, 6, 8, 9, 10, 0]])
+    mask = torch.tensor([[0, 1, 1, 1, 1, 1, 1, 0]])
+    labels = ids[:, -4:]
+    actual = model(
+        input_ids=ids, attention_mask=mask, use_cache=False, gemma4_response_labels=labels, gemma4_temperature=0.7
+    )["log_probs"]
+    logits = reference(input_ids=ids, attention_mask=mask, use_cache=False).logits[:, -5:-1, :] / 0.7
+    expected = F.log_softmax(logits.float(), -1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+    torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
+    weights = torch.tensor([[0.2, -0.3, 0.01, 0.0]])
+    (actual * weights).sum().backward()
+    (expected * weights).sum().backward()
+    for name, param in model.named_parameters():
+        ref_grad = dict(reference.named_parameters())[name].grad
+        delta = (param.grad - ref_grad).norm()
+        assert delta <= 3e-4 * ref_grad.norm() + 1e-7, (name, float(delta), float(ref_grad.norm()))
+
+
 def fsdp_worker(rank, directory, trim=False):
     import torch.distributed as dist
     from torch.distributed.device_mesh import init_device_mesh
@@ -91,10 +119,10 @@ def fsdp_worker(rank, directory, trim=False):
     reference = tiny_model()
     patched = copy.deepcopy(reference)
     enable_chunked_policy(patched, 2, trim_padding=trim)
+    # Compare identical numerical programs to isolate sharding/checkpointing.
+    # Dense-vs-chunked and padded-vs-trimmed math have separate oracle tests.
+    enable_chunked_policy(reference, 2, trim_padding=trim)
     if trim:
-        # Isolate distributed/checkpoint correctness from BF16 shape-dependent
-        # rounding. Padded-vs-trimmed math is checked separately in FP32 and CUDA.
-        enable_chunked_policy(reference, 2, trim_padding=True)
         from verl.models.gemma4.profiling import install_module_ranges
 
         install_module_ranges(patched)
@@ -138,17 +166,13 @@ def fsdp_worker(rank, directory, trim=False):
                 gemma4_temperature=0.7,
                 gemma4_calculate_entropy=False,
             )
-            if trim:
-                expected = reference(
-                    input_ids=ids,
-                    attention_mask=mask,
-                    use_cache=False,
-                    gemma4_response_labels=labels,
-                    gemma4_temperature=0.7,
-                )["log_probs"]
-            else:
-                logits = reference(input_ids=ids, attention_mask=mask, use_cache=False).logits[:, -5:-1, :] / 0.7
-                expected = F.log_softmax(logits.float(), -1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+            expected = reference(
+                input_ids=ids,
+                attention_mask=mask,
+                use_cache=False,
+                gemma4_response_labels=labels,
+                gemma4_temperature=0.7,
+            )["log_probs"]
             torch.testing.assert_close(actual["log_probs"][:, :3], expected[:, :3], atol=0.02, rtol=0.01)
             # Includes response padding with zero loss mask, and a single-token sidecar-like label.
             weights = torch.tensor([[0.2, -0.3, 0.01, 0.0]])
@@ -158,15 +182,7 @@ def fsdp_worker(rank, directory, trim=False):
                 grad = param.grad.full_tensor()
                 assert torch.isfinite(grad).all(), name
                 ref_grad = dict(reference.named_parameters())[name].grad
-                if trim:
-                    delta = (grad.float() - ref_grad.float()).norm()
-                    assert delta <= 0.05 * ref_grad.float().norm() + 1e-6, (
-                        name,
-                        float(delta),
-                        float(ref_grad.float().norm()),
-                    )
-                else:
-                    torch.testing.assert_close(grad, ref_grad, atol=0.004, rtol=0.05, msg=name)
+                torch.testing.assert_close(grad, ref_grad, atol=0, rtol=0, msg=name)
             optim.step()
             ref_optim.step()
         assert patched.lm_head.weight is patched.model.language_model.embed_tokens.weight

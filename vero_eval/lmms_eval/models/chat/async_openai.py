@@ -149,6 +149,22 @@ def _composite_zoom_to_original(image_provenance, img_idx, bbox):
     return orig_idx, nsub, bbox_prime
 
 
+def _zoom_bbox_to_xyxy(bbox, coordinate_order="xyxy"):
+    """Convert a model's normalized box into the crop tool's x/y order."""
+    if len(bbox) != 4:
+        raise ValueError("Zoom bbox must contain exactly four coordinates")
+    values = [float(value) for value in bbox]
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("Zoom bbox coordinates must be finite")
+    if coordinate_order == "yxyx":
+        values = [values[1], values[0], values[3], values[2]]
+    elif coordinate_order != "xyxy":
+        raise ValueError(f"Unknown zoom coordinate order: {coordinate_order}")
+    if not (values[0] < values[2] and values[1] < values[3]):
+        raise ValueError("Zoom bbox must have positive width and height")
+    return values
+
+
 def _restore_assistant_forced_prefill(content: str, prefix: str = _ASSISTANT_THINK_PREFIX) -> str:
     """Restore forced assistant prefill that is present in the prompt but omitted from completions."""
     if not content or not prefix:
@@ -160,6 +176,15 @@ def _restore_assistant_forced_prefill(content: str, prefix: str = _ASSISTANT_THI
         return content
     leading_ws_len = len(content) - len(stripped)
     return content[:leading_ws_len] + prefix + stripped
+
+
+def _preserve_assistant_reasoning(message, assistant_dict):
+    """Replay the separately parsed thought channel for opt-in thinking runs."""
+    if os.getenv("LMMS_EVAL_PRESERVE_REASONING", "false").lower() in {"1", "true", "yes", "on"}:
+        reasoning = getattr(message, "reasoning", None) or getattr(message, "reasoning_content", None)
+        if reasoning:
+            assistant_dict["reasoning"] = reasoning
+    return assistant_dict
 
 
 load_dotenv(verbose=True)
@@ -319,7 +344,12 @@ class AsyncOpenAIChat(lmms):
         self.critic_domain_thresholds = parse_domain_thresholds(os.getenv("VERO_EVAL_CRITIC_DOMAIN_THRESHOLDS", ""))
         self.critic_guided_answer_retry_prefill_profile = str(critic_guided_answer_retry_prefill_profile)
         self.training_alignment = None
-        if os.getenv("VERO_TRAINING_CONFIG"):
+        if os.getenv("GEMMA_TRAINING_CONFIG"):
+            from lmms_eval.models.model_utils.gemma4_training_alignment import Gemma4TrainingAlignment
+
+            self.training_alignment = Gemma4TrainingAlignment(os.environ["GEMMA_TRAINING_CONFIG"], os.getenv("CHECKPOINT_PATH"))
+            self.training_alignment.configure(self)
+        elif os.getenv("VERO_TRAINING_CONFIG"):
             from lmms_eval.models.model_utils.training_alignment import TrainingAlignment
 
             self.training_alignment = TrainingAlignment(os.environ["VERO_TRAINING_CONFIG"], os.getenv("CHECKPOINT_PATH"))
@@ -533,6 +563,10 @@ class AsyncOpenAIChat(lmms):
         if self._forced_action_tokenizer is None:
             self._forced_action_tokenizer = _get_forced_action_tokenizer(tokenizer_name)
 
+        profile = getattr(self, "training_alignment", None)
+        if getattr(profile, "native_gemma4", False):
+            return profile.forced_action_extra_body(self._forced_action_tokenizer, required_tag, self.force_final_answer_prefix)
+
         return build_forced_action_openai_extra_body(
             self._forced_action_tokenizer,
             required_tag,
@@ -549,6 +583,13 @@ class AsyncOpenAIChat(lmms):
     def _with_final_answer_think_prefill(self, payload: dict, *, close_think: bool = False) -> tuple[dict, str]:
         if not self.force_final_answer_think_prefill:
             return payload, ""
+
+        profile = getattr(self, "training_alignment", None)
+        if getattr(profile, "native_gemma4", False):
+            from lmms_eval.models.model_utils.gemma4_training_alignment import THOUGHT
+
+            prefill = THOUGHT + self.force_final_answer_think_prefill
+            return profile.continuation_request(payload, prefill), prefill
 
         payload = dict(payload)
         messages = list(payload.get("messages") or [])
@@ -572,6 +613,8 @@ class AsyncOpenAIChat(lmms):
 
     def _retry_critic_request(self, payload: dict, candidate_content: str) -> dict:
         request_payload = dict(payload)
+        profile = getattr(self, "training_alignment", None)
+        native = getattr(profile, "native_gemma4", False)
         messages = list(payload.get("messages") or [])
         messages.extend(
             [
@@ -607,6 +650,13 @@ class AsyncOpenAIChat(lmms):
             }
         )
         request_payload["extra_body"] = extra_body
+        if native:
+            # Replace Qwen's partial-assistant block with the literal native
+            # Gemma critic prefix from the saved validation configuration.
+            native_payload = profile.critic_request(payload, candidate_content)
+            request_payload["messages"] = native_payload["messages"]
+            request_payload["extra_body"].update(native_payload["extra_body"])
+            request_payload["extra_body"]["top_k"] = -1
         return request_payload
 
     @staticmethod
@@ -722,6 +772,14 @@ class AsyncOpenAIChat(lmms):
         return profile.multi[key] if profile else default
 
     def _retry_tool_call_request(self, payload: dict) -> tuple[dict, str]:
+        profile = getattr(self, "training_alignment", None)
+        if getattr(profile, "native_gemma4", False):
+            from lmms_eval.models.model_utils.gemma4_training_alignment import THOUGHT
+
+            prefill = THOUGHT + profile.multi["conditional_answer_retry_assistant_prefill"]
+            request_payload = profile.continuation_request(payload, prefill)
+            request_payload["tool_choice"] = "auto"
+            return self._with_forced_action_extra_body(request_payload, "<tool_call>"), prefill
         request_payload = dict(payload)
         request_payload["tool_choice"] = "auto"
         messages = list(payload.get("messages") or [])
@@ -774,7 +832,7 @@ class AsyncOpenAIChat(lmms):
         if getattr(message, "tool_calls", None):
             return "unexpected_message_tool_calls"
         content = message.content or ""
-        if "<tool_call>" in content or "</tool_call>" in content:
+        if "<tool_call>" in content or "</tool_call>" in content or "<|tool_call>" in content:
             return "textual_tool_call"
         if content.count("<answer>") == 0:
             return "missing_answer_tag"
@@ -798,7 +856,9 @@ class AsyncOpenAIChat(lmms):
         content = message.content or ""
         if "<answer>" in content or "</answer>" in content:
             return "early_answer_tag"
-        if "</think>" not in content:
+        if "</think>" not in content and not (
+            getattr(message, "reasoning", None) or getattr(message, "reasoning_content", None)
+        ):
             return "missing_think_close"
         if choice.finish_reason != "tool_calls":
             return f"finish_reason_{choice.finish_reason or 'missing'}"
@@ -896,7 +956,7 @@ class AsyncOpenAIChat(lmms):
         # budget, just as tool-response tokens do in training's response_mask.
         body = {key: payload[key] for key in ("model", "messages", "tools") if key in payload}
         extra = payload.get("extra_body") or {}
-        for key in ("continue_final_message", "add_generation_prompt"):
+        for key in ("continue_final_message", "add_generation_prompt", "chat_template_kwargs"):
             if key in extra:
                 body[key] = extra[key]
 
@@ -913,6 +973,7 @@ class AsyncOpenAIChat(lmms):
 
     async def _create_training_completion(self, payload, *, critic=False):
         request = dict(payload)
+        trace_id = request.pop("_eval_trace_id", None)
         initial_tokens = request.pop("_training_initial_tokens", None)
         profile = getattr(self, "training_alignment", None)
         if profile and not critic and initial_tokens is not None:
@@ -921,7 +982,16 @@ class AsyncOpenAIChat(lmms):
             if remaining <= 0:
                 raise RuntimeError("Training response budget exhausted before generation")
             request["max_tokens"] = min(request["max_tokens"], remaining)
-        return await self.client.chat.completions.create(**request)
+        response = await self.client.chat.completions.create(**request)
+        # Opt-in debug artifacts retain exact requests, images and parsed tool calls.
+        # The internal trace key is never sent to the OpenAI-compatible server.
+        trace_dir = os.getenv("LMMS_EVAL_REQUEST_TRACE_DIR")
+        if trace_dir and trace_id:
+            path = os.path.join(trace_dir, trace_id)
+            os.makedirs(path, exist_ok=True)
+            with open(os.path.join(path, f"{time.time_ns()}_{uuid.uuid4().hex}.json"), "w", encoding="utf-8") as stream:
+                json.dump({"request": request, "response": response.model_dump(mode="json")}, stream, ensure_ascii=False)
+        return response
 
     def _rewrite_tool_schemas_for_model(self, tool_list):
         rewritten = []
@@ -1088,7 +1158,10 @@ class AsyncOpenAIChat(lmms):
             bbox = (tool_args or {}).get("bbox_2d")
             label = (tool_args or {}).get("label")
             if isinstance(bbox, (list, tuple)):
-                bbox_str = "[" + ", ".join(str(int(v)) for v in bbox) + "]"
+                if getattr(getattr(self, "training_alignment", None), "native_gemma4", False):
+                    bbox_str = str(list(bbox))
+                else:
+                    bbox_str = "[" + ", ".join(str(int(v)) for v in bbox) + "]"
             else:
                 bbox_str = str(bbox)
             wording = f"Zoomed in on the image to the region {bbox_str} with label {label}."
@@ -1167,7 +1240,8 @@ class AsyncOpenAIChat(lmms):
         profile = getattr(self, "training_alignment", None)
         if profile:
             task_metadata = dict(task_metadata, show_initial_image_index_hint=False,
-                                 restore_assistant_forced_prefill=True, image_indexing=profile.image_indexing)
+                                 restore_assistant_forced_prefill=not getattr(profile, "native_gemma4", False),
+                                 image_indexing=profile.image_indexing)
             gen_kwargs = {**gen_kwargs, **profile.generation_kwargs()}
         show_initial_image_index_hint = parse_bool(task_metadata.get("show_initial_image_index_hint", True))
 
@@ -1198,6 +1272,9 @@ class AsyncOpenAIChat(lmms):
 
         try:
             payload = {"messages": messages}
+            if os.getenv("LMMS_EVAL_REQUEST_TRACE_DIR"):
+                safe_task = re.sub(r"[^A-Za-z0-9_.-]", "_", str(task))
+                payload["_eval_trace_id"] = f"{safe_task}_{doc_id}_{idx}_{uuid.uuid4().hex}"
             payload["model"] = self.model_version
             all_response = ""
             total_input_tokens = 0
@@ -1382,6 +1459,8 @@ class AsyncOpenAIChat(lmms):
                 if getattr(message, "tool_calls", None):
                     return current_response, current_prefill, False
                 candidate_content = f"{current_prefill}{message.content or ''}"
+                if getattr(profile, "native_gemma4", False):
+                    candidate_content = profile.candidate_content(message, current_prefill)
                 if "<answer>" not in candidate_content:
                     return current_response, current_prefill, False
                 if first_candidate_seen_turn is None:
@@ -1539,6 +1618,9 @@ class AsyncOpenAIChat(lmms):
                 if restore_assistant_forced_prefill:
                     assistant_content = _restore_assistant_forced_prefill(assistant_content)
                 assistant_dict = {"role": "assistant", "content": assistant_content}
+                _preserve_assistant_reasoning(assistant_message, assistant_dict)
+                if getattr(profile, "native_gemma4", False):
+                    assistant_dict = profile.assistant_message(assistant_message, response_prefill)
                 if assistant_message.tool_calls:
                     assistant_dict["tool_calls"] = [
                         {
@@ -1566,6 +1648,13 @@ class AsyncOpenAIChat(lmms):
                     try:
                         tool_args = json.loads(call.function.arguments) if call.function.arguments else {}
                         call_args = tool_args  # what the tool actually runs (may be remapped below)
+                        if call.function.name == "image_zoom_in_tool" and "bbox_2d" in tool_args:
+                            # Keep model-visible calls/responses in the model's coordinate order.
+                            # Convert before native-resolution crop compositing, exactly once.
+                            call_args = dict(tool_args)
+                            call_args["bbox_2d"] = _zoom_bbox_to_xyxy(
+                                tool_args["bbox_2d"], task_metadata.get("zoom_bbox_coordinate_order", "xyxy")
+                            )
                         zoom_provenance = None   # (orig_idx, native_subregion) of the crop this call yields
                         if "img_idx" in tool_args:
                             _idx = int(tool_args["img_idx"])
@@ -1577,11 +1666,11 @@ class AsyncOpenAIChat(lmms):
                             # tool_args is kept as-is for the model-visible tool_response wording; only
                             # the executed call_args is remapped.
                             if call.function.name == "image_zoom_in_tool" and isinstance(tool_args.get("bbox_2d"), (list, tuple)) and len(tool_args["bbox_2d"]) >= 4:
-                                composited = _composite_zoom_to_original(image_provenance, _idx, [float(v) for v in tool_args["bbox_2d"][:4]])
+                                composited = _composite_zoom_to_original(image_provenance, _idx, call_args["bbox_2d"])
                                 if composited is not None:
                                     orig_idx, nsub, bbox_prime = composited
                                     zoom_provenance = (orig_idx, nsub)
-                                    call_args = dict(tool_args)
+                                    call_args = dict(call_args)
                                     call_args["img_idx"] = orig_idx
                                     call_args["bbox_2d"] = bbox_prime
                         # Snapshot the registry into the tool subprocess so it can map img_idx -> path.
@@ -1775,7 +1864,7 @@ class AsyncOpenAIChat(lmms):
                             terminal_tool_called = True
                             break
 
-            if tool_iteration >= self.max_tool_iterations and not terminal_tool_called:
+            if self.mcp_client is not None and tool_iteration >= self.max_tool_iterations and not terminal_tool_called:
                 if forced_final_answer_requested and forced_final_answer_valid:
                     eval_logger.info(f"Final answer was forced on max tool turn for request {idx}")
                 else:

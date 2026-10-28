@@ -9,6 +9,7 @@ MODEL = "<|turn>model\n"
 USER = "<|turn>user\n"
 TOOL_RESPONSE = "<|tool_response>"
 MAX_SOFT_TOKENS = 1120
+TOOL_CALL_EOS_POLICY = "optional_single_eos_after_complete_call_v1"
 
 
 def split_thought(text):
@@ -34,7 +35,10 @@ def parse_calls(action):
 
     calls = []
     # The one-call training contract deliberately disallows nested braces in strings.
-    pattern = r"<\|tool_call>call:(\w+)\{(.*?)\}<tool_call\|>"
+    # A generated EOS may end a complete call before the environment appends
+    # tool feedback. Consume it only at that boundary, never inside arguments
+    # or by stripping special tokens from the sampled training sequence.
+    pattern = r"<\|tool_call>call:(\w+)\{(.*?)\}<tool_call\|>(?:\s*<eos>)?"
     matches = list(re.finditer(pattern, action, re.S))
     remaining = re.sub(pattern, "", action, flags=re.S).replace(TOOL_RESPONSE, "").strip()
     if remaining or len(matches) != 1:

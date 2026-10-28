@@ -112,6 +112,12 @@ actor_rollout_ref:
       gemma4_position_embedding_lookup: true
       gemma4_policy_chunk_size: 128
       gemma4_skip_log_prob_entropy: true
+      # Aligned trimming and SDPA fix validated by smoke 16034048.
+      gemma4_trim_padding: true
+      gemma4_trim_alignment: 512
+      gemma4_large_head_sdpa: true
+      gemma4_profile_actor: false
+      gemma4_benchmark_padding: false
       freeze_audio_tower: true
       wrap_policy:
         transformer_layer_cls_to_wrap:
@@ -223,6 +229,11 @@ actor_rollout_ref:
       gemma4_group_text_layers: true
       gemma4_position_embedding_lookup: true
       gemma4_policy_chunk_size: 128
+      gemma4_trim_padding: true
+      gemma4_trim_alignment: 512
+      gemma4_large_head_sdpa: true
+      gemma4_profile_actor: false
+      gemma4_benchmark_padding: false
       freeze_audio_tower: true
       wrap_policy:
         transformer_layer_cls_to_wrap:

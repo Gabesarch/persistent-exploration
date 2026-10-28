@@ -25,6 +25,8 @@ actor_rollout_ref:
       lr_warmup_steps: 0
     fsdp_config:
       gemma4_trim_padding: true
+      gemma4_trim_alignment: 512
+      gemma4_large_head_sdpa: true
       gemma4_profile_actor: true
       gemma4_benchmark_padding: true
       fsdp_size: 2
@@ -54,6 +56,8 @@ actor_rollout_ref:
   ref:
     fsdp_config:
       gemma4_trim_padding: true
+      gemma4_trim_alignment: 512
+      gemma4_large_head_sdpa: true
       fsdp_size: 2
       param_offload: true
     log_prob_max_token_len_per_gpu: 49296

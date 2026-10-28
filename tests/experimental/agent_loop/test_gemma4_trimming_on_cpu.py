@@ -2,6 +2,8 @@
 
 import copy
 import json
+import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -85,7 +87,8 @@ def test_alignment_and_rejections():
             validate_loss_masks({**inputs, "responses": labels, key: torch.ones_like(labels)})
 
 
-def test_sliding_window_boundary_and_actor_masks():
+@pytest.mark.parametrize("alignment", [1, 4, 512])
+def test_sliding_window_boundary_and_actor_masks(alignment):
     """Exercise a window crossing without changing position IDs or loss layout."""
     from omegaconf import OmegaConf
 
@@ -100,7 +103,7 @@ def test_sliding_window_boundary_and_actor_masks():
             layer.self_attn.sliding_window = 4
     model = copy.deepcopy(reference)
     enable_chunked_policy(reference, 2)
-    enable_chunked_policy(model, 2, trim_padding=True)
+    enable_chunked_policy(model, 2, trim_padding=True, trim_alignment=alignment)
     actor = object.__new__(DataParallelPPOActor)
     actor.actor_module = model
     actor.config = OmegaConf.create({"fsdp_config": {"gemma4_policy_chunk_size": 2, "gemma4_trim_padding": True}})
@@ -156,10 +159,7 @@ def test_real_processor_and_lazy_crop_alignment():
         assert torch.equal(trimmed[key], expected[key]), key
 
 
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_real_vision_original_and_crop_gradients(device):
-    if device == "cuda" and not torch.cuda.is_available():
-        pytest.skip("GPU parity in smoke")
+def vision_fixture(device, dtype):
     from transformers import AutoConfig
     from transformers.models.gemma4.modeling_gemma4 import Gemma4ForConditionalGeneration
 
@@ -181,7 +181,6 @@ def test_real_vision_original_and_crop_gradients(device):
     config.vision_config._attn_implementation = "sdpa"
     config.image_token_id = 63
     torch.manual_seed(6)
-    dtype = torch.bfloat16 if device == "cuda" else torch.float32
     reference = Gemma4ForConditionalGeneration(config).to(device=device, dtype=dtype).train()
     model = copy.deepcopy(reference)
     enable_chunked_policy(reference, 3)
@@ -204,26 +203,86 @@ def test_real_vision_original_and_crop_gradients(device):
         mm_token_type_ids=(ids == 63).long(),
         use_cache=False,
     )
-    expected = reference(**inputs, gemma4_response_labels=labels)["log_probs"]
-    actual = model(**inputs, gemma4_response_labels=labels)["log_probs"]
-    tolerance = dict(atol=0.04, rtol=0.01) if device == "cuda" else dict(atol=3e-5, rtol=3e-4)
-    torch.testing.assert_close(actual[:, :4], expected[:, :4], **tolerance)
-    weights = torch.tensor([[0.2, 0, -0.3, 0.01, 0, 0]], device=device)
-    (actual * weights).sum().backward()
-    (expected * weights).sum().backward()
+    return reference, model, inputs, labels
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_real_vision_original_and_crop_gradients(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("GPU parity in smoke")
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    reference, model, inputs, labels = vision_fixture(device, torch.float32)
+    # FP32 math attention is the independent numerical oracle. BF16 agreement
+    # across different shapes is not an appropriate per-parameter oracle.
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        with sdpa_kernel(SDPBackend.MATH):
+            expected = reference(**inputs, gemma4_response_labels=labels)["log_probs"]
+            actual = model(**inputs, gemma4_response_labels=labels)["log_probs"]
+            torch.testing.assert_close(actual[:, :4], expected[:, :4], atol=3e-5, rtol=3e-4)
+            weights = torch.tensor([[0.2, 0, -0.3, 0.01, 0, 0]], device=device)
+            (actual * weights).sum().backward()
+            (expected * weights).sum().backward()
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
     for name, param in model.named_parameters():
         ref = dict(reference.named_parameters())[name]
         if param.grad is None:
             assert ref.grad is None, name
         else:
-            relative_tolerance = 0.05 if device == "cuda" else 3e-4
-            delta = (param.grad.float() - ref.grad.float()).norm()
-            assert delta <= relative_tolerance * ref.grad.float().norm() + 1e-7, (
-                name,
-                float(delta),
-                float(ref.grad.float().norm()),
-            )
+            delta = (param.grad - ref.grad).norm()
+            assert delta <= 3e-4 * ref.grad.norm() + 1e-7, (name, float(delta), float(ref.grad.norm()))
     assert model.model.vision_tower.patch_embedder.input_proj.weight.grad.abs().sum() > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="BF16 CUDA shape/rounding validation")
+def test_bf16_trimming_against_independent_compact_input():
+    padded, model, inputs, labels = vision_fixture("cuda", torch.bfloat16)
+    compact = copy.deepcopy(padded)
+    # Independent, explicit fixture layout: retain original image plus crop and
+    # all four real response tokens. Never call trim_inputs for the reference.
+    compact_inputs = dict(inputs)
+    for key in ("input_ids", "attention_mask", "position_ids", "mm_token_type_ids"):
+        compact_inputs[key] = inputs[key][:, 2:9]
+    expected = compact(**compact_inputs, gemma4_response_labels=labels[:, :4])["log_probs"]
+    actual = model(**inputs, gemma4_response_labels=labels)["log_probs"]
+    padded_lp = padded(**inputs, gemma4_response_labels=labels)["log_probs"]
+    torch.testing.assert_close(actual[:, :4], expected, atol=0, rtol=0)
+    torch.testing.assert_close(actual[:, :4], padded_lp[:, :4], atol=0.04, rtol=0.01)
+    weights = torch.tensor([[0.2, 0, -0.3, 0.01, 0, 0]], device="cuda")
+    (actual * weights).sum().backward()
+    (expected * weights[:, :4]).sum().backward()
+    (padded_lp * weights).sum().backward()
+    rows, delta_squared, reference_squared = [], 0.0, 0.0
+    for name, param in model.named_parameters():
+        ref = dict(compact.named_parameters())[name]
+        base = dict(padded.named_parameters())[name]
+        if param.grad is None:
+            assert ref.grad is None and base.grad is None, name
+            continue
+        # Exact BF16 gradient equivalence to the independent compact layout,
+        # including gradient checkpointing; no relaxed implementation tolerance.
+        torch.testing.assert_close(param.grad, ref.grad, atol=0, rtol=0, msg=name)
+        assert torch.isfinite(param.grad).all() and torch.isfinite(base.grad).all()
+        delta = float((param.grad.float() - base.grad.float()).norm())
+        norm = float(base.grad.float().norm())
+        delta_squared += delta**2
+        reference_squared += norm**2
+        rows.append(dict(name=name, relative_l2=delta / max(norm, 1e-12), absolute_l2=delta))
+    global_relative = (delta_squared / max(reference_squared, 1e-30)) ** 0.5
+    report = dict(
+        device=torch.cuda.get_device_name(),
+        independent_compact_gradients_exact=True,
+        padded_vs_trimmed_global_relative_l2=global_relative,
+        padded_vs_trimmed_parameters=sorted(rows, key=lambda r: r["relative_l2"], reverse=True),
+        note="Per-parameter BF16 differences across shapes are diagnostic; mathematical parity "
+        "is gated separately in FP32 and implementation parity is exact against compact BF16.",
+    )
+    if directory := os.environ.get("GEMMA4_ARTIFACT_DIR"):
+        (Path(directory) / "trimming_precision.json").write_text(json.dumps(report, indent=2) + "\n")
+    assert global_relative < 0.05, report
 
 
 def test_profiler_is_opt_in_and_exports(tmp_path, monkeypatch):
@@ -256,3 +315,27 @@ def test_profiler_is_opt_in_and_exports(tmp_path, monkeypatch):
     assert "gemma4/model_forward" in names and "gemma4/head/projection" in names
     assert list(tmp_path.glob("actor_profiles/*.trace.json.gz"))
     assert list(tmp_path.glob("actor_profiles/*.pstats"))
+
+
+@pytest.mark.parametrize("alignment", [1, 32, 128, 512])
+@pytest.mark.parametrize("response_count", [0, 1775])
+def test_aligned_trim_preserves_valid_ids_positions_and_loss_layout(alignment, response_count):
+    ids = torch.arange(4096).reshape(1, -1)
+    mask = torch.zeros_like(ids)
+    mask[:, 1701 : 2048 + response_count] = 1
+    inputs = dict(input_ids=ids, attention_mask=mask, position_ids=ids + 9, mm_token_type_ids=(ids == 1800).long())
+    labels = ids[:, 2048:]
+    trimmed, short_labels, width = trim_inputs(inputs, labels, alignment=alignment)
+    start = 1701 // alignment * alignment
+    end = min(4096, (2048 + response_count + alignment - 1) // alignment * alignment)
+    assert trimmed["input_ids"].shape[1] == end - start
+    assert start % alignment == 0
+    assert (4096 - end) % alignment == 0
+    assert width == 2048
+    assert torch.equal(short_labels, labels[:, : end - 2048])
+    for key in inputs:
+        assert torch.equal(trimmed[key], inputs[key][:, start:end])
+    assert torch.equal(trimmed["input_ids"][trimmed["attention_mask"].bool()], ids[mask.bool()])
+    for invalid in [0, -1, 1.5]:
+        with pytest.raises(ValueError, match="alignment"):
+            trim_inputs(inputs, labels, alignment=invalid)

@@ -1,6 +1,23 @@
 defaults:
 - branchstrata20_fresh_lr1e5_critic_gemma4_e4b_recipe
 - _self_
+# Production-only opt-in, validated by smoke 16034048. Keep the shared
+# recipe unchanged so other launchers retain their existing behavior.
+actor_rollout_ref:
+  actor:
+    fsdp_config:
+      gemma4_trim_padding: true
+      gemma4_trim_alignment: 512
+      gemma4_large_head_sdpa: true
+      gemma4_profile_actor: false
+      gemma4_benchmark_padding: false
+  ref:
+    fsdp_config:
+      gemma4_trim_padding: true
+      gemma4_trim_alignment: 512
+      gemma4_large_head_sdpa: true
+      gemma4_profile_actor: false
+      gemma4_benchmark_padding: false
 hydra:
   searchpath:
   - file://${oc.env:VERL_ROOT}/verl/trainer/config

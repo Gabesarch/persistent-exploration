@@ -8,6 +8,9 @@
 # Requires $VERO_EVAL_DIR to be set (the package root) before sourcing.
 
 declare -gA DOMAIN_TASK_BASES=(
+  [zoom_bench]="zoom_bench"
+  [visualoverload_hard]="visualoverload_hard"
+  [o3_bench]="o3_bench"
   [chart_ocr]="chartqa chartqa_pro infovqa_val charxiv chartmuseum evochart"
   [stem]="mmmu_pro mathvision_test mathvista_testmini"
   [spatial_action]="cv_bench embspatial erqa game_qa_lite blink"

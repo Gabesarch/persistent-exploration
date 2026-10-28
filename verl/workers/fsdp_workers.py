@@ -597,6 +597,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 }
                 actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
 
+        if fsdp_config.get("gemma4_large_head_sdpa", False):
+            from verl.models.gemma4.attention import enable_large_head_sdpa
+
+            enable_large_head_sdpa(actor_module)
         if fsdp_config.get("gemma4_trim_padding", False):
             if not fsdp_config.get("gemma4_policy_chunk_size", 0) or use_remove_padding:
                 raise ValueError("Gemma trimming requires the chunked policy and use_remove_padding=False")
@@ -607,6 +611,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 actor_module,
                 fsdp_config.gemma4_policy_chunk_size,
                 trim_padding=fsdp_config.get("gemma4_trim_padding", False),
+                trim_alignment=fsdp_config.get("gemma4_trim_alignment", 512),
             )
             if fsdp_config.get("gemma4_profile_actor", False):
                 from verl.models.gemma4.profiling import install_module_ranges

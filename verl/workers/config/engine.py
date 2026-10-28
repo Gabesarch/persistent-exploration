@@ -244,6 +244,8 @@ class FSDPEngineConfig(EngineConfig):
     gemma4_policy_chunk_size: int = 0
     gemma4_skip_log_prob_entropy: bool = False
     gemma4_trim_padding: bool = False
+    gemma4_trim_alignment: int = 512
+    gemma4_large_head_sdpa: bool = False
     gemma4_profile_actor: bool = False
     gemma4_benchmark_padding: bool = False
     freeze_audio_tower: bool = False

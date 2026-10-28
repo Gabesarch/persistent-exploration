@@ -91,6 +91,10 @@ def preflight(out):
     }
     shared_changes = subprocess.check_output(["git", "diff", "--name-only", "--", "verl"], cwd=ROOT, text=True)
     implementation_files.update(ROOT / name for name in shared_changes.splitlines())
+    implementation_files.add(ROOT / "verl/experimental/agent_loop/tool_parser.py")
+    from verl.models.gemma4.protocol import TOOL_CALL_EOS_POLICY
+
+    manifest["tool_call_eos_policy"] = TOOL_CALL_EOS_POLICY
     manifest["implementation_hashes"] = {str(p.relative_to(ROOT)): sha(p) for p in sorted(implementation_files)}
     vllm_root = Path(vllm.__file__).parent
     manifest["vllm_gemma_source_hashes"] = {
