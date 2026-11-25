@@ -6,11 +6,11 @@ Run [`train.sh`](train.sh) directly from the repository root with Bash on a mach
 
 The inherited recipe sets Qwen3-VL-8B-Instruct, GDPO advantages, GSPO policy loss, a zoom tool, and conditional answer retry. It scores a candidate answer, trains a learned A/R critic, and rolls out a forced zoom retry for rejected candidates. Branch subsampling keeps at most two retry branches per parent; branch loss weights have a maximum 20% share across the policy minibatch. Auxiliary mass bounds cap branch advantage mass at 25% and weighted critic loss at 5% of canonical advantage mass. The critic loss fraction is 0.01. The Qwen recipe uses learning rate `1e-5` and 200 updates.
 
-Required environment variables are `TRAIN_FILES`, `VAL_FILES`, and `MODEL_PATH`. `IMAGE_ROOT` is required when image paths in the JSONL need a root. `ROOT_PATH`, `SAVE_PATH`, and `VERO2_CONDA_ENV` are optional. See the root [README](../README.md) for setup and commands.
+Required environment variables are `TRAIN_FILES`, `VAL_FILES`, and `MODEL_PATH`. `IMAGE_ROOT` is required when image paths in the JSONL need a root. `ROOT_PATH`, `SAVE_PATH`, and `VERO2_CONDA_ENV` are optional. Prepare the data as shown below, then run `bash persistent-exploration-rl/train.sh` from the repository root. First install and activate the Qwen environment with [`scripts/setup_env.sh`](../scripts/setup_env.sh); the training profile requires a CUDA toolkit with `nvcc` to build FlashAttention.
 
 ## Gemma 4 E4B
 
-Run [`train_gemma.sh`](train_gemma.sh) with the same training and validation JSONL. It uses the Gemma-native agent, dataset, reward, and zoom tool with [`gemma4_e4b.yaml`](config/gemma4_e4b.yaml). This is the mass-bounded training variant associated with the [published Gemma checkpoint](https://huggingface.co/gsarch/Persistent-Exploration-Gemma4-E4B), which its model card identifies as step 60. The source training configuration allows 200 updates; the linked weights are from step 60. The recipe keeps the 20% maximum branch loss-weight share, two branches per parent, and 25%/5% auxiliary mass bounds. The Gemma launcher writes to a separate checkpoint directory.
+Run [`train_gemma.sh`](train_gemma.sh) with the same training and validation JSONL. It uses the Gemma agent, dataset, reward, and zoom tool with [`gemma4_e4b.yaml`](config/gemma4_e4b.yaml). The recipe keeps the 20% maximum branch loss-weight share, two branches per parent, and 25%/5% auxiliary mass bounds. The [trained Gemma checkpoint](https://huggingface.co/gsarch/Persistent-Exploration-Gemma4-E4B) is available on Hugging Face.
 
 ```bash
 export TRAIN_FILES=/path/to/visual_probe_train.verl.jsonl
@@ -20,16 +20,27 @@ export GEMMA4_MODEL_PATH=/path/to/gemma-4-E4B-it
 bash persistent-exploration-rl/train_gemma.sh
 ```
 
-Gemma 4 training needs a Python environment with Gemma 4 support in Transformers and vLLM. The source run used PyTorch 2.11.0+cu129, vLLM 0.23.0, and a Transformers 5.8.0.dev0 source overlay. The repository's existing package dependency constraints are unchanged; when using a separately prepared Gemma environment, install this checkout with `python -m pip install -e . --no-deps`. Set `GEMMA4_TRAIN_OVERLAY` only if the compatible Transformers package lives in a separate directory. The launcher checks local data and model paths before starting training.
+Install and activate the Gemma environment with [`scripts/setup_env.sh`](../scripts/setup_env.sh) before training. Set `GEMMA4_TRAIN_OVERLAY` only if using a separate Transformers build.
 
 ## Training data
 
 The mass bounds recipe's 2,042 training rows and images are published in
 [`gsarch/Persistent-Exploration-RL-Data`](https://huggingface.co/datasets/gsarch/Persistent-Exploration-RL-Data),
 derived from [Mini-o3/VisualProbe_train](https://huggingface.co/datasets/Mini-o3/VisualProbe_train).
-The dataset's `export_verl.py` restores the original training JSONL with local
-JPEG paths. Its release commit is `07fcdb7be28759fe278507aca49d1a38382456d4`.
-See the [root README](../README.md#train) for download and export commands.
+Download and export it to a writable directory:
+
+```bash
+export ROOT_PATH=/path/to/runtime
+hf download gsarch/Persistent-Exploration-RL-Data --repo-type dataset \
+  --revision 07fcdb7be28759fe278507aca49d1a38382456d4 \
+  --local-dir "$ROOT_PATH/datasets/persistent-exploration-release"
+python "$ROOT_PATH/datasets/persistent-exploration-release/export_verl.py" \
+  "$ROOT_PATH/datasets/persistent-exploration-train"
+export TRAIN_FILES="$ROOT_PATH/datasets/persistent-exploration-train/chart_search_counting_visual_probe_train_rollout_score_leq05_all.verl.jsonl"
+export IMAGE_ROOT="$ROOT_PATH/datasets/persistent-exploration-train"
+```
+
+The exporter writes a training JSONL with paths to the released JPEGs.
 
 The 515 validation rows are a separate set from the Mini-o3 VisualProbe
 [Easy](https://huggingface.co/datasets/Mini-o3/VisualProbe_Easy),
@@ -41,12 +52,9 @@ chosen output directory and writes `visual_probe_validation.verl.jsonl` for
 `VAL_FILES`. For example:
 
 ```bash
-python persistent-exploration-rl/prepare_validation.py /path/to/validation
-export VAL_FILES=/path/to/validation/visual_probe_validation.verl.jsonl
+python persistent-exploration-rl/prepare_validation.py "$ROOT_PATH/datasets/visual-probe-validation"
+export VAL_FILES="$ROOT_PATH/datasets/visual-probe-validation/visual_probe_validation.verl.jsonl"
 ```
-
-The source training filename mentions
-chart, search, and counting, but its 2,042 rows are VisualProbe examples.
 
 The published Persistent Exploration dataset is licensed CC BY-NC 4.0 and is
 separate from Vero-600k and Vero-1.6M.

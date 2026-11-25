@@ -11,7 +11,6 @@ set +u
 if [[ -f "$VERO_EVAL_DIR/set_paths.sh" ]]; then
   source "$VERO_EVAL_DIR/set_paths.sh"
 else
-  echo "WARN: $VERO_EVAL_DIR/set_paths.sh not found; using set_paths.sh.example (copy & edit it)." >&2
   source "$VERO_EVAL_DIR/set_paths.sh.example"
 fi
 set -u

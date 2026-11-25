@@ -8,6 +8,8 @@ fi
 if [[ -n "${VERO2_CONDA_ENV:-}" ]]; then
   if ! command -v conda >/dev/null 2>&1; then
     source "${CONDA_BASE:-$HOME/miniconda3}/etc/profile.d/conda.sh"
+  elif [[ "$(type -t conda)" != function ]]; then
+    eval "$(conda shell.bash hook)"
   fi
   conda activate "$VERO2_CONDA_ENV"
 fi
