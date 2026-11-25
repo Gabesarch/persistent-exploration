@@ -1,0 +1,5 @@
+# Preserve the benchmark prompts and scoring, with Gemma's native zoom tool.
+include:
+  - ../_tool_templates/_toolset_zoom_gemma_yaml
+  - vstar_bench_reasoning_zoom.yaml
+task: vstar_bench_gemma4_zoom

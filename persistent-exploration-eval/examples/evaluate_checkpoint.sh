@@ -190,13 +190,8 @@ fi
 gemma_profile=0
 if ((gemma_release)) || [[ -f "$checkpoint/eval/gemma4_visual_probe.json" ]]; then
   gemma_profile=1
-  case "$task" in
-    visual_probe) tasks=visual_probe_easy_gemma4_zoom,visual_probe_medium_gemma4_zoom,visual_probe_hard_gemma4_zoom;;
-    visual_probe_easy) tasks=visual_probe_easy_gemma4_zoom;;
-    visual_probe_medium) tasks=visual_probe_medium_gemma4_zoom;;
-    visual_probe_hard) tasks=visual_probe_hard_gemma4_zoom;;
-    *) echo "The published Gemma profile supports VisualProbe tasks only" >&2; exit 2;;
-  esac
+  # Keep the selected benchmarks and use Gemma's native tool interface.
+  tasks="${tasks//_reasoning_zoom/_gemma4_zoom}"
 fi
 
 if ((!dry_run)); then

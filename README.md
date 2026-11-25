@@ -1,10 +1,22 @@
 # Learning Persistent Exploration for Visual Search
 
-This repository releases the training and evaluation code for Persistent Exploration, a method that teaches vision-language models to continue visual search when an answer is premature.
+Persistent Exploration is a reinforcement learning method that teaches vision-language models to continue searching after unsuccessful attempts. Models learn from failed and recovered searches, and learn to decide when further exploration is needed.
+
+---
+
+## Highlights
+
+- Visual search with image zoom tools and continued exploration after failure.
+- Training recipes and checkpoints for Qwen3-VL-8B and Gemma 4 E4B.
+- Evaluation on VisualProbe, V*, PinpointBench, and O3Bench.
+
+---
 
 ## Installation
 
-Set up the environment for your model:
+### Environment Setup
+
+Run the setup script from the repository root for your model.
 
 **Qwen3-VL-8B**
 
@@ -20,40 +32,41 @@ bash scripts/setup_env.sh gemma
 conda activate persistent-exploration-gemma
 ```
 
-## Evaluation
+The script installs the training and evaluation dependencies. See [scripts/setup_env.sh](scripts/setup_env.sh) for the setup flow.
 
-### Qwen3-VL-8B
+---
 
-Evaluate the [Qwen3-VL-8B checkpoint](https://huggingface.co/gsarch/Persistent-Exploration-Qwen3VLi):
+## Quick Start: Evaluation
+
+Evaluate the released Qwen checkpoint on VisualProbe:
 
 ```bash
+conda activate persistent-exploration-qwen
 export ROOT_PATH=/path/to/runtime
+
+hf download Qwen/Qwen3.5-27B \
+  --local-dir "$ROOT_PATH/models/Qwen3.5-27B"
+
 bash persistent-exploration-eval/examples/evaluate_checkpoint.sh \
-  --task visual_probe --judge /path/to/Qwen3.5-27B --judge-tp 2 \
+  --task visual_probe \
+  --judge "$ROOT_PATH/models/Qwen3.5-27B" --judge-tp 2 \
   --output "$ROOT_PATH/eval/qwen_visual_probe"
 ```
 
-### Gemma 4 E4B
+The runner downloads the checkpoint and evaluates the Easy, Medium, and Hard splits. Evaluation does not require training data.
 
-Evaluate the [Gemma 4 E4B checkpoint](https://huggingface.co/gsarch/Persistent-Exploration-Gemma4-E4B):
+See the [evaluation guide](persistent-exploration-eval/README.md) for Gemma, individual benchmarks, and the full evaluation suite.
 
-```bash
-export ROOT_PATH=/path/to/runtime
-bash persistent-exploration-eval/examples/evaluate_checkpoint.sh \
-  --task visual_probe --checkpoint gsarch/Persistent-Exploration-Gemma4-E4B \
-  --judge /path/to/Qwen3.5-27B --judge-tp 2 \
-  --output "$ROOT_PATH/eval/gemma_visual_probe"
-```
+---
 
-See the [evaluation guide](persistent-exploration-eval/README.md) for benchmarks and options.
+## Quick Start: Training
 
-## Training
-
-Prepare the [training dataset](https://huggingface.co/datasets/gsarch/Persistent-Exploration-RL-Data) as described in the [training guide](persistent-exploration-rl/README.md).
+Prepare the [released training dataset](https://huggingface.co/datasets/gsarch/Persistent-Exploration-RL-Data) using the [data setup instructions](persistent-exploration-rl/README.md#data-setup), then launch training for your model.
 
 **Qwen3-VL-8B**
 
 ```bash
+conda activate persistent-exploration-qwen
 export MODEL_PATH=/path/to/Qwen3-VL-8B-Instruct
 bash persistent-exploration-rl/train.sh
 ```
@@ -61,10 +74,49 @@ bash persistent-exploration-rl/train.sh
 **Gemma 4 E4B**
 
 ```bash
+conda activate persistent-exploration-gemma
 export GEMMA4_MODEL_PATH=/path/to/gemma-4-E4B-it
 bash persistent-exploration-rl/train_gemma.sh
 ```
 
+See the [training guide](persistent-exploration-rl/README.md) for data preparation, model downloads, and configuration.
+
+---
+
+## Model Checkpoints
+
+| Model | Base Model | Checkpoint |
+| --- | --- | --- |
+| Persistent Exploration Qwen | [Qwen3-VL-8B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct) | [Hugging Face](https://huggingface.co/gsarch/Persistent-Exploration-Qwen3VLi) |
+| Persistent Exploration Gemma | [Gemma 4 E4B IT](https://huggingface.co/google/gemma-4-E4B-it) | [Hugging Face](https://huggingface.co/gsarch/Persistent-Exploration-Gemma4-E4B) |
+
+---
+
+## Evaluation Benchmarks
+
+| Benchmark | Task | Supported Models |
+| --- | --- | --- |
+| VisualProbe Easy, Medium, Hard | `visual_probe` | Qwen, Gemma |
+| V* | `vstar` | Qwen, Gemma |
+| PinpointBench | `pinpoint` | Qwen, Gemma |
+| O3Bench | `o3_bench` | Qwen, Gemma |
+
+See the [evaluation guide](persistent-exploration-eval/README.md#benchmarks) for dataset links and commands.
+
+---
+
+## Documentation
+
+- [Evaluation guide](persistent-exploration-eval/README.md)
+- [Training guide](persistent-exploration-rl/README.md)
+- [Training data setup](persistent-exploration-rl/README.md#data-setup)
+
+---
+
+## Acknowledgements
+
+This project builds on [Vero](https://github.com/zlab-princeton/vero), [verl](https://github.com/volcengine/verl), and [lmms-eval](https://github.com/EvolvingLMMs-Lab/lmms-eval).
+
 ## License
 
-This code builds on [Vero](https://github.com/zlab-princeton/vero), [verl](https://github.com/volcengine/verl), and [lmms-eval](https://github.com/EvolvingLMMs-Lab/lmms-eval). Copyright and license notices are in [`LICENSE`](LICENSE), [`Notice.txt`](Notice.txt), and the [lmms-eval license notice](persistent-exploration-eval/LICENSE).
+The code is licensed under [Apache 2.0](LICENSE). Third-party notices are preserved in [Notice.txt](Notice.txt) and the [evaluation harness license](persistent-exploration-eval/LICENSE). Model and dataset licenses are provided on their Hugging Face pages.
