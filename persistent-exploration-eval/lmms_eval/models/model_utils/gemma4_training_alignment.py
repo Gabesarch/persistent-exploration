@@ -18,6 +18,13 @@ CONTINUATION = "{{- gemma4_continuation | default('') -}}"
 class Gemma4TrainingAlignment(TrainingAlignment):
     native_gemma4 = True
 
+    @classmethod
+    def for_inference(cls, path, checkpoint):
+        """A published actor carries the inference profile, not the training run."""
+        if Path(path).name == "gemma4_visual_probe.json":
+            return ReleasedGemma4Alignment(path, checkpoint)
+        return cls(path, checkpoint)
+
     def __init__(self, path, checkpoint_path=None, *, eval_critic=None):
         if eval_critic is None and 'GEMMA_EVAL_CRITIC' in os.environ:
             value = os.environ['GEMMA_EVAL_CRITIC'].lower()
@@ -188,3 +195,23 @@ class Gemma4TrainingAlignment(TrainingAlignment):
                 "tool_schema": self.tool_schema, "multi_turn": self.multi,
                 "validation_evidence": self.validation_evidence,
                 "generation_kwargs": self.generation_kwargs(), "eval_critic_enabled": self.eval_critic_enabled}
+
+
+class ReleasedGemma4Alignment(Gemma4TrainingAlignment):
+    """Use the published request settings without local training artifacts."""
+
+    def __init__(self, path, checkpoint):
+        self.path = Path(path).resolve()
+        self.checkpoint = Path(checkpoint)
+        settings = json.loads(self.path.read_text())
+        if settings["format"] != "vero-gemma4-visual-probe-v1":
+            raise ValueError("Unknown Gemma4 inference profile")
+        self.template = (self.checkpoint / "chat_template.jinja").read_text()
+        if hashlib.sha256(self.template.encode()).hexdigest() != settings["chat_template_sha256"]:
+            raise ValueError("Gemma4 checkpoint and inference profile have different chat templates")
+        self.system_prompt = settings["system_prompt"]
+        self.tool_schema = settings["tool_schema"]
+        self.image_indexing = settings["image_indexing"]
+        self.data = settings["data"]
+        self.multi = settings["multi_turn"]
+        self._eval_critic_override = True

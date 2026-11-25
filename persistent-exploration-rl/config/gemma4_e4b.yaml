@@ -1,0 +1,33 @@
+defaults:
+- gemma4_e4b_recipe
+- _self_
+# Gemma 4 E4B mass-bounded training variant with SDPA.
+actor_rollout_ref:
+  rollout:
+    val_kwargs:
+      top_p: 0.8
+      top_k: 20
+    multi_turn:
+      validation_accuracy_binary: true
+      validation_final_answer_extraction: external
+      conditional_answer_retry_critic_enable_validation: false
+  actor:
+    policy_loss:
+      loss_diagnostics:
+        gradient_enabled: false
+    fsdp_config:
+      gemma4_trim_padding: true
+      gemma4_trim_alignment: 512
+      gemma4_large_head_sdpa: true
+      gemma4_profile_actor: false
+      gemma4_benchmark_padding: false
+  ref:
+    fsdp_config:
+      gemma4_trim_padding: true
+      gemma4_trim_alignment: 512
+      gemma4_large_head_sdpa: true
+      gemma4_profile_actor: false
+      gemma4_benchmark_padding: false
+hydra:
+  searchpath:
+  - file://${oc.env:VERL_ROOT}/verl/trainer/config

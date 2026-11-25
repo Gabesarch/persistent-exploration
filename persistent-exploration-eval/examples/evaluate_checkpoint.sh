@@ -26,7 +26,9 @@ Options:
   -h, --help         Show this help
 
 The default checkpoint is gsarch/Persistent-Exploration-Qwen3VLi at its
-pinned revision. It downloads to ROOT_PATH/models when needed.
+pinned revision. The published Gemma checkpoint can be selected with
+--checkpoint gsarch/Persistent-Exploration-Gemma4-E4B. Both download to
+ROOT_PATH/models when needed.
 Optionally set VERO2_EVAL_CONDA_ENV for a separate eval environment and
 HF_HOME for the benchmark cache. Run on a GPU machine.
 EOF
@@ -88,6 +90,7 @@ if ((!dry_run)) && [[ -n "${VERO2_EVAL_CONDA_ENV:-}" ]]; then
   unset VERO2_EVAL_CONDA_ENV
 fi
 release_model=0
+gemma_release=0
 download_pending=0
 case "$checkpoint" in
   https://huggingface.co/gsarch/Persistent-Exploration-Qwen3VLi|gsarch/Persistent-Exploration-Qwen3VLi)
@@ -115,6 +118,31 @@ snapshot_download(
 PY
     fi
     checkpoint="$model_dir";;
+  https://huggingface.co/gsarch/Persistent-Exploration-Gemma4-E4B|gsarch/Persistent-Exploration-Gemma4-E4B)
+    gemma_release=1
+    model_dir="$root_path/models/Persistent-Exploration-Gemma4-E4B"
+    if [[ -s "$model_dir/model-00001-of-00002.safetensors" && -r "$model_dir/model-00001-of-00002.safetensors" \
+          && -f "$model_dir/eval/gemma4_visual_probe.json" \
+          && -f "$model_dir/eval/judge_no_think.jinja" \
+          && -f "$model_dir/chat_template.jinja" ]]; then
+      echo "Using downloaded model: $model_dir"
+    elif ((dry_run)); then
+      echo "Would download gsarch/Persistent-Exploration-Gemma4-E4B to $model_dir"
+      download_pending=1
+    else
+      mkdir -p "$model_dir"
+      HF_HOME="$hf_home" HF_HUB_OFFLINE=0 python - "$model_dir" <<'PY'
+import sys
+from huggingface_hub import snapshot_download
+
+snapshot_download(
+    repo_id="gsarch/Persistent-Exploration-Gemma4-E4B",
+    revision="be123b6120d41dec15bf02437b001bb1235406f8",
+    local_dir=sys.argv[1],
+)
+PY
+    fi
+    checkpoint="$model_dir";;
 esac
 if ((download_pending == 0)); then
   [[ -d "$checkpoint" ]] || { echo "Missing checkpoint: $checkpoint" >&2; exit 2; }
@@ -127,7 +155,7 @@ fi
 # FSDP shards. Merge the shards into a directory owned by the caller.
 has_readable_weights() {
   local file
-  for file in "$1"/model.safetensors "$1"/model.safetensors-* "$1"/pytorch_model.bin; do
+  for file in "$1"/model.safetensors "$1"/model-*.safetensors "$1"/model.safetensors-* "$1"/pytorch_model.bin; do
     [[ -f "$file" && -s "$file" && -r "$file" ]] && return 0
   done
   return 1
@@ -159,6 +187,18 @@ if ((download_pending == 0)) && ! has_readable_weights "$checkpoint"; then
   fi
 fi
 
+gemma_profile=0
+if ((gemma_release)) || [[ -f "$checkpoint/eval/gemma4_visual_probe.json" ]]; then
+  gemma_profile=1
+  case "$task" in
+    visual_probe) tasks=visual_probe_easy_gemma4_zoom,visual_probe_medium_gemma4_zoom,visual_probe_hard_gemma4_zoom;;
+    visual_probe_easy) tasks=visual_probe_easy_gemma4_zoom;;
+    visual_probe_medium) tasks=visual_probe_medium_gemma4_zoom;;
+    visual_probe_hard) tasks=visual_probe_hard_gemma4_zoom;;
+    *) echo "The published Gemma profile supports VisualProbe tasks only" >&2; exit 2;;
+  esac
+fi
+
 if ((!dry_run)); then
   [[ -f "$checkpoint/config.json" && -f "$checkpoint/tokenizer_config.json" ]] || {
     echo "Missing checkpoint model metadata: $checkpoint" >&2; exit 2;
@@ -185,28 +225,45 @@ export CRITIC_GUIDED_ANSWER_RETRY_PREFILL_PROFILE=persist
 export MAX_TOOL_ITERATIONS=10 MAX_TOOL_IMAGES=10
 export VLLM_JUDGE_ENFORCE_EAGER=true VLLM_JUDGE_GDN_PREFILL_BACKEND=triton
 unset LIMIT
-if ((release_model)) || [[ -f "$checkpoint/eval/run_visual_probe.sh" ]]; then
+if ((release_model || gemma_profile)) || [[ -f "$checkpoint/eval/run_visual_probe.sh" ]]; then
   # Match the published checkpoint's packaged evaluation profile.
   export CHAT_TEMPLATE="$checkpoint/chat_template.jinja"
   export LMMS_EVAL_HF_TOKENIZER="$checkpoint"
   export VLLM_JUDGE_CHAT_TEMPLATE="$checkpoint/eval/judge_no_think.jinja"
   export RUN_SYSTEM_PROMPT_MODE=task_metadata
   export VLLM_JUDGE_ENFORCE_EAGER=false VLLM_JUDGE_GDN_PREFILL_BACKEND=auto
-  export MODEL_NAME=qwen_vllm MODEL_VERSION=qwen_vllm WORKERS=10
-  export MM_PROCESSOR_KWARGS='{"max_pixels":10000000}'
-  export TOOL_IMAGE_AS_USER_TURN=false LMMS_EVAL_PRESERVE_REASONING=false
   export VLLM_USE_FLASHINFER_SAMPLER=0 BATCH_SIZE=1 ALWAYS_RETRY_ANSWERS=false
   export FORCE_TOOL_CALLS_UNTIL_FINAL_TURN=false
   export FORCE_FINAL_ANSWER_PREFIX='' FIRST_CANDIDATE_ANSWER_TURN=0 FOLLOWUP_CANDIDATE_ANSWER_TURN=0
-  unset SYSTEM_PROMPT VERO_TRAINING_CONFIG GEMMA_TRAINING_CONFIG CUSTOM_CHAT_TEMPLATE
-  unset DEFAULT_CHAT_TEMPLATE_KWARGS REASONING_PARSER LIMIT_MM_PER_PROMPT VLLM_MAX_NUM_SEQS
+  unset SYSTEM_PROMPT VERO_TRAINING_CONFIG CUSTOM_CHAT_TEMPLATE
   unset VERO_EVAL_CRITIC_DOMAIN_THRESHOLDS VERO_EVAL_DISABLE_CRITIC VERO_EVAL_CRITIC_THRESHOLD
+  if ((gemma_profile)); then
+    export GEMMA_TRAINING_CONFIG="$checkpoint/eval/gemma4_visual_probe.json"
+    export MODEL_NAME=gemma4_e4b_thinking MODEL_VERSION=gemma4_e4b_thinking WORKERS=2
+    export TOOL_CALL_PARSER=gemma4 REASONING_PARSER=gemma4
+    export DEFAULT_CHAT_TEMPLATE_KWARGS='{"enable_thinking":true,"preserve_thinking":true}'
+    export MM_PROCESSOR_KWARGS='{"max_soft_tokens":1120}' LIMIT_MM_PER_PROMPT='{"image":11,"audio":0,"video":0}'
+    export TOOL_IMAGE_AS_USER_TURN=true LMMS_EVAL_PRESERVE_REASONING=true VLLM_MAX_NUM_SEQS=4
+    export VLLM_JUDGE_ENFORCE_EAGER=true VLLM_JUDGE_GDN_PREFILL_BACKEND=triton
+    export FORCE_FINAL_ANSWER_THINK_PREFILL="This is the final turn, so I need to answer from the evidence gathered so far."
+    if [[ -n "${GEMMA_TRANSFORMERS_OVERLAY:-}" ]]; then
+      [[ -d "$GEMMA_TRANSFORMERS_OVERLAY/transformers" ]] || {
+        echo "GEMMA_TRANSFORMERS_OVERLAY must contain a Transformers package" >&2; exit 2;
+      }
+      export PYTHONPATH="$GEMMA_TRANSFORMERS_OVERLAY:$PYTHONPATH"
+    fi
+  else
+    export MODEL_NAME=qwen_vllm MODEL_VERSION=qwen_vllm WORKERS=10
+    export MM_PROCESSOR_KWARGS='{"max_pixels":10000000}'
+    export TOOL_IMAGE_AS_USER_TURN=false LMMS_EVAL_PRESERVE_REASONING=false
+    unset GEMMA_TRAINING_CONFIG DEFAULT_CHAT_TEMPLATE_KWARGS REASONING_PARSER LIMIT_MM_PER_PROMPT VLLM_MAX_NUM_SEQS
+  fi
 fi
 [[ -z "$limit" ]] || export LIMIT="$limit"
 export OFFSET="$offset"
 
 if ((dry_run)); then
-  if ((release_model)) || [[ -f "$checkpoint/eval/run_visual_probe.sh" ]]; then
+  if ((release_model || gemma_profile)) || [[ -f "$checkpoint/eval/run_visual_probe.sh" ]]; then
     echo "Profile: published checkpoint eval settings"
   fi
   printf 'TASKS=%q CHECKPOINT_PATH=%q JUDGE_MODEL_PATH=%q JUDGE_TP=%q OUTPUT_ROOT=%q' \

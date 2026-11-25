@@ -1,10 +1,26 @@
-# Persistent Exploration training recipe
+# Persistent Exploration training recipes
+
+## Qwen3-VL-8B
 
 Run [`train.sh`](train.sh) directly from the repository root with Bash on a machine with eight GPUs. The launcher sources `set_paths.sh`, then starts `python -m verl.trainer.main_ppo` with [`branchstrata20_fresh_lr1e5_critic_massbounds.yaml`](config/branchstrata20_fresh_lr1e5_critic_massbounds.yaml).
 
 The inherited recipe sets Qwen3-VL-8B-Instruct, GDPO advantages, GSPO policy loss, a zoom tool, and conditional answer retry. It scores a candidate answer, trains a learned A/R critic, and rolls out a forced zoom retry for rejected candidates. Branch subsampling keeps at most two retry branches per parent; branch loss weights have a maximum 20% share across the policy minibatch. Auxiliary mass bounds cap branch advantage mass at 25% and weighted critic loss at 5% of canonical advantage mass. The critic loss fraction is 0.01. The Qwen recipe uses learning rate `1e-5` and 200 updates.
 
 Required environment variables are `TRAIN_FILES`, `VAL_FILES`, and `MODEL_PATH`. `IMAGE_ROOT` is required when image paths in the JSONL need a root. `ROOT_PATH`, `SAVE_PATH`, and `VERO2_CONDA_ENV` are optional. See the root [README](../README.md) for setup and commands.
+
+## Gemma 4 E4B
+
+Run [`train_gemma.sh`](train_gemma.sh) with the same training and validation JSONL. It uses the Gemma-native agent, dataset, reward, and zoom tool with [`gemma4_e4b.yaml`](config/gemma4_e4b.yaml). This is the mass-bounded training variant associated with the [published Gemma checkpoint](https://huggingface.co/gsarch/Persistent-Exploration-Gemma4-E4B), which its model card identifies as step 60. The source training configuration allows 200 updates; the linked weights are from step 60. The recipe keeps the 20% maximum branch loss-weight share, two branches per parent, and 25%/5% auxiliary mass bounds. The Gemma launcher writes to a separate checkpoint directory.
+
+```bash
+export TRAIN_FILES=/path/to/visual_probe_train.verl.jsonl
+export VAL_FILES=/path/to/visual_probe_validation.verl.jsonl
+export IMAGE_ROOT=/path/to/training/images
+export GEMMA4_MODEL_PATH=/path/to/gemma-4-E4B-it
+bash persistent-exploration-rl/train_gemma.sh
+```
+
+Gemma 4 training needs a Python environment with Gemma 4 support in Transformers and vLLM. The source run used PyTorch 2.11.0+cu129, vLLM 0.23.0, and a Transformers 5.8.0.dev0 source overlay. The repository's existing package dependency constraints are unchanged; when using a separately prepared Gemma environment, install this checkout with `python -m pip install -e . --no-deps`. Set `GEMMA4_TRAIN_OVERLAY` only if the compatible Transformers package lives in a separate directory. The launcher checks local data and model paths before starting training.
 
 ## Training data
 
@@ -35,4 +51,4 @@ chart, search, and counting, but its 2,042 rows are VisualProbe examples.
 The published Persistent Exploration dataset is licensed CC BY-NC 4.0 and is
 separate from Vero-600k and Vero-1.6M.
 
-The config stores checkpoints under `${SAVE_PATH}/checkpoints/<experiment_name>`. Change `trainer.experiment_name` to avoid resuming or overwriting an earlier experiment. The launcher uses offline Hugging Face mode by default; set the three `*_OFFLINE` variables to `0` if model or dataset downloads are needed.
+Both configs store checkpoints under `${SAVE_PATH}/checkpoints/<experiment_name>`. Change `trainer.experiment_name` to avoid resuming or overwriting an earlier experiment. The launchers use offline Hugging Face mode by default; set the three `*_OFFLINE` variables to `0` if model or dataset downloads are needed.

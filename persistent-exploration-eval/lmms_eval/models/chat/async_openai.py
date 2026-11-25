@@ -357,7 +357,7 @@ class AsyncOpenAIChat(lmms):
         if os.getenv("GEMMA_TRAINING_CONFIG"):
             from lmms_eval.models.model_utils.gemma4_training_alignment import Gemma4TrainingAlignment
 
-            self.training_alignment = Gemma4TrainingAlignment(os.environ["GEMMA_TRAINING_CONFIG"], os.getenv("CHECKPOINT_PATH"))
+            self.training_alignment = Gemma4TrainingAlignment.for_inference(os.environ["GEMMA_TRAINING_CONFIG"], os.getenv("CHECKPOINT_PATH"))
             self.training_alignment.configure(self)
         elif os.getenv("VERO_TRAINING_CONFIG"):
             from lmms_eval.models.model_utils.training_alignment import TrainingAlignment
