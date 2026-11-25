@@ -1,2 +1,0 @@
-- name: gemma4_tool_agent
-  _target_: verl.experimental.agent_loop.gemma4_tool_agent_loop.Gemma4ToolAgentLoop

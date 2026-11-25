@@ -135,7 +135,14 @@ log
 outputs
 .history
 
-vero_eval/results/*
-vero_eval/results/.*
+persistent-exploration-eval/results/*
+persistent-exploration-eval/results/.*
 
 set_paths.local.sh
+
+# Local runtime inputs and generated evaluation files
+/runtime/
+/persistent-exploration-eval/set_paths.sh
+/Learning_Persistent_Exploration.pdf
+/slurm_*.out
+/slurm_*.err

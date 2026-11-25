@@ -1,2 +1,0 @@
-include: mia_bench_qwen3_zs.yaml
-task: "mia_bench_gpt5nano_zs"

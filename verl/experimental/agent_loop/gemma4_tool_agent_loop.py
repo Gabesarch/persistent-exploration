@@ -36,6 +36,15 @@ class Gemma4ToolAgentLoop(ToolAgentLoop):
     def _parse_solver_output(self, text):
         return native.parse_trajectory(text)
 
+    def _extract_llm_judge_answer(self, solution_str, *, validation=False):
+        if validation and getattr(self, "validation_final_answer_extraction", "strict") == "external":
+            from verl.utils.reward_score.validation_accuracy import extract_gemma4_validation_answer
+
+            return extract_gemma4_validation_answer(
+                solution_str, critic_question=getattr(self, "conditional_answer_retry_critic_question", "")
+            )
+        return super()._extract_llm_judge_answer(solution_str, validation=validation)
+
     async def apply_chat_template(self, messages, tools=None, images=None, videos=None, remove_system_prompt=False):
         if videos:
             raise ValueError("Gemma critic recipe supports images only")

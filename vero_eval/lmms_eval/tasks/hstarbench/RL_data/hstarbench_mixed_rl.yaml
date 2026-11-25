@@ -1,7 +1,0 @@
-include: ../hstarbench_mixed.yaml
-dataset_kwargs:
-  data_files:
-    test: /scratch/gpfs/ZHUANGL/shared/Hstarbench/data/hstarbench_mixed_rl.jsonl
-task: "hstarbench_mixed_rl"
-metadata:
-  description: "Hstar RL train split (5760 eps) — monitor training distribution"

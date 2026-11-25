@@ -1,6 +1,0 @@
-include:
-- ../vlms_are_biased.yaml
-- ../../_tool_templates/_thinking/_toolset_draw_thinking_yaml
-task: "vlms_are_biased_drawing_thinking"
-generation_kwargs:
-  max_new_tokens: 16384

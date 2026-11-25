@@ -1,0 +1,57 @@
+# Training-faithful ZOOM toolset for the Vero RL checkpoint (visual_probe cropzoom).
+#
+# Reproduces the RL training INPUT word-by-word for image_zoom_in_tool. The served
+# Vero chat_template.jinja renders the PASSED system message, then appends "\n\n" +
+# a fixed "# Tools" block (the tool schema is injected via `tool | tojson`). So to
+# match training byte-for-byte we must control three things from the eval side:
+#
+#   system_prompt_files                      -> the EXACT training Layer-A authored
+#       rules: a verbatim copy of
+#       persistent-exploration-rl/prompts/system_prompt_chatting_tool_calling.txt
+#       (frozen here so the eval matches what THIS checkpoint was trained with).
+#   system_prompt_preserve_trailing_newline  -> keep the fragment's trailing "\n" so
+#       the Layer-A / "# Tools" seam is 3 newlines (training), not 2 (default .strip()).
+#   tool_schema_overrides                    -> pin the rendered <tools> JSON to the
+#       EXACT training schema. The FastMCP-introspected schema differs (property order
+#       img_idx,bbox_2d,label vs training bbox_2d,label,img_idx; img_idx type integer
+#       vs number; extra title/items keys; rewritten description). This override makes
+#       `tool | tojson` byte-identical to training's 692-char tool JSON.
+#
+# Pair with a per-task `image_indexing:` knob:
+#   training_faithful  -> tool_response = "Zoomed in on the image to the region
+#                         [x1, y1, x2, y2] with label {label}." ONLY (training never
+#                         announced new indices; 581/581 training calls used img_idx 0).
+#   multi_index        -> additionally register each crop as a new img_idx and hint the
+#                         model it can zoom into it (the only divergence from training,
+#                         confined to the tool_response so turn-1 input stays identical).
+metadata:
+  allowed_tools:
+    - image_zoom_in_tool
+  show_initial_image_index_hint: false
+  restore_assistant_forced_prefill: true
+  system_prompt_files:
+    - prompts/tools/system_vero_reasoning.txt
+  system_prompt_preserve_trailing_newline: true
+  tool_schema_overrides:
+    image_zoom_in_tool:
+      description: "Zoom in on a specific region of an image by cropping it based on a bounding box (bbox) and an optional object label"
+      parameters:
+        type: object
+        properties:
+          bbox_2d:
+            type: array
+            items:
+              type: number
+            minItems: 4
+            maxItems: 4
+            description: "The bounding box of the region to zoom in, as [x1, y1, x2, y2], where (x1, y1) is the top-left corner and (x2, y2) is the bottom-right corner"
+          label:
+            type: string
+            description: "The name or label of the object in the specified bounding box"
+          img_idx:
+            type: number
+            description: "The index of the zoomed-in image (starting from 0)"
+        required:
+          - bbox_2d
+          - label
+          - img_idx

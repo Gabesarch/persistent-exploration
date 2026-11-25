@@ -2018,6 +2018,7 @@ def compute_policy_loss_gspo(
     rollout_is_weights: torch.Tensor | None = None,
     branch_policy_loss_weight: torch.Tensor | None = None,
     branch_policy_loss_is_branch: torch.Tensor | None = None,
+    loss_components: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for GSPO.
@@ -2088,7 +2089,19 @@ def compute_policy_loss_gspo(
             sequence_losses[is_canonical].mean() if is_canonical.any() else sequence_losses.new_zeros(())
         )
         branch_diagnostic = sequence_losses[is_branch].mean() if is_branch.any() else sequence_losses.new_zeros(())
+        if loss_components is not None:
+            # Partition the ACTUAL clipped, IS-corrected objective before its
+            # original sequence/row reduction. Never average each subset using
+            # its own denominator. Keep the graphs for optional diagnostics.
+            denominator = max(int(pg_losses.shape[0]), 1)
+            for stratum, rows in (("canonical", is_canonical), ("branch", is_branch)):
+                for sign, selected in (("positive", advantages > 0), ("negative", advantages < 0)):
+                    terms = torch.where(selected & rows.unsqueeze(-1), pg_losses, 0.0)
+                    per_row = (terms * response_mask).sum(-1) / token_counts.clamp_min(1)
+                    loss_components[f"{stratum}_{sign}"] = (per_row * row_weights).sum() / denominator
     else:
+        if loss_components is not None:
+            raise ValueError("GSPO component diagnostics require branch strata.")
         # for GSPO, we need to aggregate the loss at the sequence level (seq-mean-token-mean)
         pg_loss = agg_loss(
             loss_mat=pg_losses,
@@ -2111,6 +2124,16 @@ def compute_policy_loss_gspo(
         "actor/pg_loss_canonical_unweighted": canonical_diagnostic.detach().item(),
         "actor/pg_loss_branch_unweighted": branch_diagnostic.detach().item(),
     }
+    bounds = config.policy_loss.get("auxiliary_mass_bounds", {})
+    if branch_strata_enabled and bounds.get("enabled", False):
+        # The actor applies gradient-accumulation and outer-mixture scaling.
+        # Keep these separate from the historical unweighted diagnostics.
+        denominator = max(int(pg_losses.shape[0]), 1)
+        weighted_losses = sequence_losses * row_weights * active_rows
+        pg_metrics["actor/pg_loss_canonical_weighted"] = (
+            weighted_losses[is_canonical].sum().detach().item() / denominator
+        )
+        pg_metrics["actor/pg_loss_branch_weighted"] = weighted_losses[is_branch].sum().detach().item() / denominator
     return pg_loss, pg_metrics
 
 

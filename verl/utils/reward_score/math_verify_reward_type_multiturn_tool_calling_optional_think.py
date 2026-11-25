@@ -27,7 +27,6 @@ __all__ = [
     "acc_reward",
     "extract_answer_for_accuracy",
     "assistant_turn_overlong_reward",
-    "point_box_reward",
     "tool_repeat_overlap_call_diagnostics",
     "tool_repeat_overlap_reward",
     "compute_score",
@@ -414,169 +413,6 @@ def assistant_turn_overlong_reward(
     return max(-factor, min(raw_penalty, 0.0))
 
 
-def _parse_draw_points_from_output(predict_str: str) -> list[tuple[float, float]]:
-    text = _normalize_chat_template_role_markers(str(predict_str)).strip()
-    points: list[tuple[float, float]] = []
-    pos = 0
-
-    while pos < len(text):
-        start = text.find(_TOOL_CALL_OPEN, pos)
-        if start == -1:
-            break
-        payload_start = start + len(_TOOL_CALL_OPEN)
-        payload_end = text.find(_TOOL_CALL_CLOSE, payload_start)
-        if payload_end == -1:
-            break
-        pos = payload_end + len(_TOOL_CALL_CLOSE)
-
-        tool_call = _parse_tool_call_payload(text[payload_start:payload_end])
-        if tool_call is None or tool_call.get("name") != "draw_points":
-            continue
-        arguments = tool_call.get("arguments") or {}
-        points.extend(_normalize_point_arguments(arguments.get("points")))
-
-    return points
-
-
-def _normalize_point_arguments(value: Any) -> list[tuple[float, float]]:
-    if not isinstance(value, list | tuple) or len(value) == 0:
-        return []
-
-    if _is_number_pair(value):
-        return [(float(value[0]), float(value[1]))]
-
-    points = []
-    for item in value:
-        if _is_number_pair(item):
-            points.append((float(item[0]), float(item[1])))
-    return points
-
-
-def _is_number_pair(value: Any) -> bool:
-    if not isinstance(value, list | tuple) or len(value) != 2:
-        return False
-    return all(isinstance(item, int | float) and not isinstance(item, bool) and math.isfinite(float(item)) for item in value)
-
-
-def _extract_gt_boxes(extra_info: Any | None) -> tuple[list[tuple[float, float, float, float]], tuple[float, float] | None]:
-    if not isinstance(extra_info, dict):
-        return [], None
-
-    metadata = extra_info.get("metadata") or {}
-    boxes_raw = metadata.get("boxes") or extra_info.get("boxes") or []
-    processed_size = metadata.get("processed_size") or extra_info.get("processed_size")
-    if not isinstance(processed_size, list | tuple) or len(processed_size) != 2:
-        image_sizes = extra_info.get("image_sizes") or []
-        if image_sizes and isinstance(image_sizes[0], list | tuple) and len(image_sizes[0]) == 2:
-            processed_size = image_sizes[0]
-
-    if not isinstance(processed_size, list | tuple) or len(processed_size) != 2:
-        return [], None
-    width, height = float(processed_size[0]), float(processed_size[1])
-    if width <= 0.0 or height <= 0.0:
-        return [], None
-
-    boxes = []
-    for box in boxes_raw:
-        parsed = _parse_box(box)
-        if parsed is None:
-            continue
-        x1, y1, x2, y2 = parsed
-        left, right = sorted((x1, x2))
-        top, bottom = sorted((y1, y2))
-        left = max(0.0, min(width, left))
-        right = max(0.0, min(width, right))
-        top = max(0.0, min(height, top))
-        bottom = max(0.0, min(height, bottom))
-        if right > left and bottom > top:
-            boxes.append((left, top, right, bottom))
-    return boxes, (width, height)
-
-
-def _parse_box(box: Any) -> tuple[float, float, float, float] | None:
-    if isinstance(box, dict):
-        if all(key in box for key in ("x1", "y1", "x2", "y2")):
-            values = [box["x1"], box["y1"], box["x2"], box["y2"]]
-        elif all(key in box for key in ("x", "y", "width", "height")):
-            x, y, width, height = box["x"], box["y"], box["width"], box["height"]
-            values = [x, y, float(x) + float(width), float(y) + float(height)]
-        else:
-            return None
-    elif isinstance(box, list | tuple) and len(box) == 4:
-        values = list(box)
-    else:
-        return None
-
-    if any(isinstance(value, bool) or not isinstance(value, int | float) for value in values):
-        return None
-    parsed = tuple(float(value) for value in values)
-    if not all(math.isfinite(value) for value in parsed):
-        return None
-    return parsed
-
-
-def _maximum_bipartite_matches(edges_by_point: list[list[int]], num_boxes: int) -> int:
-    matched_point_for_box = [-1] * num_boxes
-
-    def augment(point_idx: int, seen_boxes: set[int]) -> bool:
-        for box_idx in edges_by_point[point_idx]:
-            if box_idx in seen_boxes:
-                continue
-            seen_boxes.add(box_idx)
-            previous_point = matched_point_for_box[box_idx]
-            if previous_point == -1 or augment(previous_point, seen_boxes):
-                matched_point_for_box[box_idx] = point_idx
-                return True
-        return False
-
-    matches = 0
-    for point_idx in range(len(edges_by_point)):
-        if augment(point_idx, set()):
-            matches += 1
-    return matches
-
-
-def point_box_reward(
-    predict_str: str,
-    extra_info: Any | None = None,
-    recall_weight: float = 0.5,
-    precision_weight: float = 0.5,
-    tolerance_px: float = 0.0,
-) -> tuple[float, float, int, int, int, int]:
-    boxes, size = _extract_gt_boxes(extra_info)
-    gt_boxes = len(boxes)
-    points = _parse_draw_points_from_output(predict_str)
-    predicted_points = len(points)
-
-    if gt_boxes == 0 or size is None:
-        return 0.0, 0.0, 0, predicted_points, 0, 0
-    if predicted_points == 0:
-        return 0.0, 1.0, gt_boxes, 0, 0, 0
-
-    width, height = size
-    tol = max(float(tolerance_px), 0.0)
-    edges_by_point: list[list[int]] = []
-    for point in points:
-        px = max(0.0, min(1000.0, point[0])) / 1000.0 * width
-        py = max(0.0, min(1000.0, point[1])) / 1000.0 * height
-        edges = []
-        for box_idx, (x1, y1, x2, y2) in enumerate(boxes):
-            if x1 - tol <= px <= x2 + tol and y1 - tol <= py <= y2 + tol:
-                edges.append(box_idx)
-        edges_by_point.append(edges)
-
-    matched = _maximum_bipartite_matches(edges_by_point, gt_boxes)
-    recall = matched / gt_boxes
-    precision = matched / predicted_points
-    recall_w = float(recall_weight)
-    precision_w = float(precision_weight)
-    denom = recall_w + precision_w
-    if denom <= 0.0:
-        return 0.0, 1.0, gt_boxes, predicted_points, matched, matched
-    score = (recall_w * recall + precision_w * precision) / denom
-    return score, 1.0, gt_boxes, predicted_points, matched, matched
-
-
 def _extract_zoom_call_box(tool_call: dict[str, Any]) -> tuple[int, tuple[float, float, float, float]] | None:
     if tool_call.get("name") != "image_zoom_in_tool":
         return None
@@ -809,10 +645,6 @@ def compute_score(
     counting_min_sigma: float | None = None,
     counting_decay_exp: float | None = None,
     counting_graded: bool = True,
-    point_box_reward_enabled: bool = False,
-    point_box_recall_weight: float = 0.5,
-    point_box_precision_weight: float = 0.5,
-    point_box_tolerance_px: float = 0.0,
     extra_info=None,
     parsed_output=None,
 ) -> dict[str, Any]:
@@ -902,28 +734,6 @@ def compute_score(
         "tool_repeat_overlap": tool_repeat_overlap_score,
         "tool_call_bonus": tool_call_bonus_score,
     }
-    if point_box_reward_enabled:
-        point_box_score, point_box_applicable, gt_boxes, predicted_points, matched_boxes, matched_points = (
-            point_box_reward(
-                predict_str,
-                extra_info=extra_info,
-                recall_weight=point_box_recall_weight,
-                precision_weight=point_box_precision_weight,
-                tolerance_px=point_box_tolerance_px,
-            )
-        )
-        if not is_valid:
-            point_box_score = 0.0
-        result.update(
-            {
-                "point_box": point_box_score,
-                "point_box_applicable": point_box_applicable,
-                "point_box_gt_boxes": float(gt_boxes),
-                "point_box_predicted_points": float(predicted_points),
-                "point_box_matched_boxes": float(matched_boxes),
-                "point_box_matched_points": float(matched_points),
-            }
-        )
     if assistant_turn_overlong_enabled:
         if not isinstance(extra_info, dict) or "assistant_turns" not in extra_info:
             raise ValueError(
@@ -985,10 +795,6 @@ def compute_score_from_data_source(
     counting_min_sigma: float | None = None,
     counting_decay_exp: float | None = None,
     counting_graded: bool = True,
-    point_box_reward_enabled: bool = False,
-    point_box_recall_weight: float = 0.5,
-    point_box_precision_weight: float = 0.5,
-    point_box_tolerance_px: float = 0.0,
     **_: dict,
 ) -> dict[str, Any]:
     """Adapter for custom_reward_function configs that expect default signature."""
@@ -1026,10 +832,6 @@ def compute_score_from_data_source(
         counting_min_sigma=counting_min_sigma,
         counting_decay_exp=counting_decay_exp,
         counting_graded=counting_graded,
-        point_box_reward_enabled=point_box_reward_enabled,
-        point_box_recall_weight=point_box_recall_weight,
-        point_box_precision_weight=point_box_precision_weight,
-        point_box_tolerance_px=point_box_tolerance_px,
         extra_info=extra_info,
     )
 
@@ -1070,10 +872,6 @@ async def async_compute_score_from_data_source(
     counting_min_sigma: float | None = None,
     counting_decay_exp: float | None = None,
     counting_graded: bool = True,
-    point_box_reward_enabled: bool = False,
-    point_box_recall_weight: float = 0.5,
-    point_box_precision_weight: float = 0.5,
-    point_box_tolerance_px: float = 0.0,
     **_: dict,
 ) -> dict[str, Any]:
     """Async adapter for reward loops."""
@@ -1112,9 +910,5 @@ async def async_compute_score_from_data_source(
         counting_min_sigma=counting_min_sigma,
         counting_decay_exp=counting_decay_exp,
         counting_graded=counting_graded,
-        point_box_reward_enabled=point_box_reward_enabled,
-        point_box_recall_weight=point_box_recall_weight,
-        point_box_precision_weight=point_box_precision_weight,
-        point_box_tolerance_px=point_box_tolerance_px,
         extra_info=extra_info,
     )

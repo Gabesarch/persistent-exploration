@@ -1,7 +1,0 @@
-# Full benchmark; retain the canonical dataset and scorer.
-include: ["../pinpoint_bench/pinpoint_bench_reasoning.yaml", "../_tool_templates/_toolset_zoom_yaml"]
-task: pinpoint_bench_qwen35_9b_zoom
-generation_kwargs: {"max_new_tokens": 16384, "temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5, "repetition_penalty": 1.0, "do_sample": true}
-metadata: {"restore_assistant_forced_prefill": false, "show_initial_image_index_hint": false}
-lmms_eval_specific_kwargs:
-  default: {"pre_prompt": "You are given an image. Search the picture to answer the question. Your final answer should be a short, specific phrase. ", "post_prompt": ""}

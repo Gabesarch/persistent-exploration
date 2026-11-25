@@ -73,6 +73,9 @@ algorithm:
   # Whether to normalize advantages by std (specific to GRPO)
   norm_adv_by_std_in_grpo: True
 
+  # Opt-in post-normalization policy weighting; 1.0 preserves existing runs exactly.
+  positive_advantage_amplification: 1.0
+
   # Optional non-tensor key selecting rows that contribute to GDPO group baseline statistics
   gdpo_baseline_weight_key: null
 

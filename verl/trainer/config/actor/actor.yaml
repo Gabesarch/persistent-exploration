@@ -60,6 +60,34 @@ policy_loss:
   # Loss function mode: vanilla / clip-cov / kl-cov /gpg from https://arxiv.org/abs/2505.22617
   loss_mode: "vanilla"
 
+  # Diagnostics are enabled explicitly by the critic recipes.
+  loss_diagnostics:
+
+    _target_: verl.workers.config.LossDiagnosticsConfig
+
+    enabled: false
+
+    # Expensive replay is separately configurable and only runs when enabled above.
+    gradient_enabled: false
+
+    gradient_every_n_steps: 10
+
+    gradient_first_update: true
+
+    # Zero measures all optimizer minibatches on a selected training step.
+    gradient_max_minibatches: 1
+
+    # Small per-minibatch scalar/Gram records; parameter gradients are never saved.
+    gradient_output_dir: ${oc.select:trainer.default_local_dir,null}/gradient_diagnostics
+
+    # Quality threshold only: a failed audit is logged and never aborts training.
+    # Independent backward passes can differ under mixed precision.
+    gradient_reconstruction_rtol: 0.02
+
+    # Disable expensive replay for this worker process after a technical error.
+    # Scalar diagnostics continue. Numerical quality failures retain their records.
+    gradient_disable_on_error: true
+
   # Ratio of tokens to be clipped for clip-cov loss
   clip_cov_ratio: 0.0002
 
@@ -153,6 +181,27 @@ policy_loss:
 
       # Non-tensor batch key whose values match data.per_batch_domain_weights.
       key: mixture_source
+
+  # Opt-in budgets; legacy runs retain their existing objective when disabled.
+  auxiliary_mass_bounds:
+
+    # Required when using verl.utils.omega_conf_to_dataclass.
+    _target_: verl.workers.config.AuxiliaryMassBoundsConfig
+
+    # Cap auxiliary terms per global optimizer minibatch.
+    enabled: false
+
+    # Maximum weighted branch absolute advantage mass / canonical mass.
+    max_branch_to_canonical: 0.25
+
+    # Maximum weighted critic CE / weighted canonical absolute advantage mass.
+    max_critic_to_canonical: 0.05
+
+    # Stabilize detached multiplier and reporting denominators.
+    epsilon: 1.0e-12
+
+    # Numerical tolerance for the actual-loss audit before optimizer.step().
+    verification_atol: 1.0e-6
 
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0

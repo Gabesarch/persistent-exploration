@@ -227,6 +227,10 @@ multi_turn:
   # shared setting for backward compatibility; true/false controls validation independently.
   force_answer_on_final_turn_validation: null
 
+  # Accuracy scoring only; training rewards and action/critic parsing stay strict.
+  validation_accuracy_binary: False
+  validation_final_answer_extraction: strict
+
   # Opt-in deterministic per-trajectory randomization of the final assistant-turn cap.
   # Disabled defaults preserve the configured max_assistant_turns for existing runs.
   randomized_max_assistant_turns_enabled: False

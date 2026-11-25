@@ -19,6 +19,7 @@ Single Process Actor
 
 import logging
 import os
+import time
 from typing import Any
 
 import torch
@@ -49,6 +50,9 @@ from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
+from verl.workers.utils.auxiliary_mass_bounds import advantage_mass_sums, detached_cap_multiplier, mass_ratio
+from verl.workers.utils.gradient_diagnostics import GradientProbe, gradient_step_selected, preserved_rng
+from verl.workers.utils.loss_diagnostics import COMPONENTS, reduce_loss_diagnostics, weighted_loss_components
 from verl.workers.utils.losses import (
     combine_retry_critic_loss,
     combine_retry_sft_loss,
@@ -498,6 +502,12 @@ class DataParallelPPOActor(BasePPOActor):
             if isinstance(grad_norm, DTensor):
                 grad_norm = grad_norm.full_tensor()
 
+        gradient_probe = getattr(self, "_active_gradient_probe", None)
+        if gradient_probe is not None:
+            probe_start = time.perf_counter()
+            gradient_probe.after_clip(grad_norm.item(), self.config.grad_clip)
+            gradient_probe.metrics["postclip_measurement_seconds"] = time.perf_counter() - probe_start
+
         # if grad_norm is not finite, skip the update
         if self.scaler is not None:
             self.scaler.step(self.actor_optimizer)
@@ -521,6 +531,136 @@ class DataParallelPPOActor(BasePPOActor):
 
             self._gemma4_smoke_metrics = after_optimizer_step(gemma_probe)
         return grad_norm
+
+    def _gradient_replay_loss(
+        self, log_prob, inputs, *, on_policy, bounded, critic_multiplier,
+        has_rl, has_critic, dp_size, critic_parent_mass, dataset_balance, stratum_parent_mass,
+    ):
+        """Local loss construction; no distributed operations or optimizer state."""
+        old = (log_prob.detach() if on_policy and not self.config.get("use_rollout_log_probs", False)
+               else inputs["old_log_probs"])
+        gspo = {}
+        get_policy_loss_fn("gspo")(
+            old_log_prob=old, log_prob=log_prob, advantages=inputs["advantages"],
+            response_mask=inputs["response_mask"], config=self.config,
+            rollout_is_weights=inputs.get("rollout_is_weights"),
+            branch_policy_loss_weight=inputs["branch_policy_loss_weight"],
+            branch_policy_loss_is_branch=inputs["branch_policy_loss_is_branch"], loss_components=gspo,
+        )
+        ce = log_prob.sum() * 0.0
+        if has_critic:
+            if dataset_balance:
+                ce, *_ = parent_balanced_retry_critic_strata_loss(
+                    log_prob, inputs["retry_critic_mask"], inputs["retry_critic_stratum_id"],
+                    inputs["retry_critic_parent_weight"],
+                    global_stratum_parent_mass=stratum_parent_mass, dp_size=dp_size,
+                )
+            else:
+                ce, *_ = parent_balanced_retry_critic_loss(
+                    log_prob, inputs["retry_critic_mask"], inputs["retry_critic_is_retry"],
+                    inputs["retry_critic_parent_weight"],
+                    global_accept_parent_mass=critic_parent_mass[0],
+                    global_retry_parent_mass=critic_parent_mass[1], dp_size=dp_size,
+                )
+        loss_scale = (inputs["response_mask"].shape[0] / self.config.ppo_mini_batch_size
+                      if self.config.use_dynamic_bsz or bounded else 1 / self.gradient_accumulation)
+        return weighted_loss_components(
+            gspo, ce, loss_scale=loss_scale,
+            critic_fraction=float(self.config.policy_loss.retry_critic.loss_fraction),
+            has_rl=has_rl, has_critic=has_critic, bounded=bounded, critic_multiplier=critic_multiplier,
+        )
+
+    def _replay_gradient_components(
+        self, micro_batches, *, temperature, pad_token_id, on_policy, bounded,
+        critic_multiplier, has_rl, has_critic, dp_size, critic_parent_mass,
+        dataset_balance, stratum_parent_mass,
+    ):
+        """Five isolated backwards; no optimizer/scaler updates or retained graphs."""
+        settings = self.config.policy_loss.loss_diagnostics
+        probe = GradientProbe(self.actor_module, get_device_id(), settings.gradient_reconstruction_rtol)
+        scale = self.scaler.get_scale() if self.scaler is not None else 1.0
+        started = time.perf_counter()
+        for name in COMPONENTS:
+            self.actor_optimizer.zero_grad(set_to_none=True)
+            local_loss = torch.zeros((), dtype=torch.float64, device=get_device_id())
+            ok = True
+            with preserved_rng(get_device_id()):
+                for micro_batch in micro_batches:
+                    micro_batch = micro_batch.to(get_device_id())
+                    inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
+                    output = self._forward_micro_batch(
+                        inputs, temperature=temperature, calculate_entropy=self.config.calculate_entropy,
+                    )
+                    log_prob = output["log_probs"]
+                    loss, ok = probe.local_call(
+                        lambda log_prob=log_prob, inputs=inputs, name=name: self._gradient_replay_loss(
+                            log_prob, inputs, on_policy=on_policy, bounded=bounded,
+                            critic_multiplier=critic_multiplier, has_rl=has_rl, has_critic=has_critic,
+                            dp_size=dp_size, critic_parent_mass=critic_parent_mass,
+                            dataset_balance=dataset_balance, stratum_parent_mass=stratum_parent_mass,
+                        )[name], f"loss_{name}",
+                    )
+                    if not ok:
+                        # Complete a zero backward to finish FSDP/checkpoint hooks
+                        # for this forward before doing the ordinary real pass.
+                        (log_prob.sum() * 0.0).backward()
+                        del output, log_prob, loss
+                        break
+                    local_loss += loss.detach().double()
+                    (self.scaler.scale(loss) if self.scaler is not None else loss).backward()
+                    del output, log_prob, loss
+            if not ok:
+                break
+            if torch.distributed.is_initialized():
+                torch.distributed.all_reduce(local_loss)
+            _, ok = probe.local_call(
+                lambda local_loss=local_loss: probe.capture(local_loss.item() / dp_size, scale=scale),
+                f"capture_{name}",
+            )
+            if not ok:
+                # All ranks stop replay together; the ordinary backward below
+                # starts from clean gradients and the restored RNG state.
+                break
+        self.actor_optimizer.zero_grad(set_to_none=True)
+        probe.metrics["replay_seconds"] = time.perf_counter() - started
+        return probe
+
+    @torch.no_grad()
+    def _measure_current_retry_critic_ce(
+        self, micro_batches, temperature, pad_token_id, dp_size,
+        global_critic_parent_mass, dataset_balance=False, global_stratum_parent_mass=None,
+    ):
+        """Current-policy CE with the same global class/parent reduction as backward.
+
+        A no-grad prepass avoids retaining all microbatch graphs. Restore RNG so
+        the ordinary forward/backward pass sees the same stochastic forwards.
+        The actual accumulated CE is independently audited before the update.
+        """
+        total = torch.zeros((), dtype=torch.float64, device=get_device_id())
+        devices = [torch.cuda.current_device()] if self.device_name == "cuda" else []
+        with torch.random.fork_rng(devices=devices):
+            for micro_batch in micro_batches:
+                micro_batch = micro_batch.to(get_device_id())
+                inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
+                outputs = self._forward_micro_batch(inputs, temperature=temperature, calculate_entropy=False)
+                if dataset_balance:
+                    ce, _, _ = parent_balanced_retry_critic_strata_loss(
+                        outputs["log_probs"], inputs["retry_critic_mask"],
+                        inputs["retry_critic_stratum_id"], inputs["retry_critic_parent_weight"],
+                        global_stratum_parent_mass=global_stratum_parent_mass, dp_size=dp_size,
+                    )
+                else:
+                    ce, *_ = parent_balanced_retry_critic_loss(
+                        outputs["log_probs"], inputs["retry_critic_mask"],
+                        inputs["retry_critic_is_retry"], inputs["retry_critic_parent_weight"],
+                        global_accept_parent_mass=global_critic_parent_mass[0],
+                        global_retry_parent_mass=global_critic_parent_mass[1], dp_size=dp_size,
+                    )
+                total += ce.double()
+                del outputs, ce
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(total)
+        return float(total.item() / dp_size)
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     @profile_actor
@@ -645,6 +785,29 @@ class DataParallelPPOActor(BasePPOActor):
         if "rollout_log_probs" in data.batch.keys():
             select_keys.append("rollout_log_probs")
         branch_strata_enabled = bool(self.config.policy_loss.branch_strata.enabled)
+        mass_bounds = self.config.policy_loss.get("auxiliary_mass_bounds", {})
+        mass_bounds_enabled = bool(mass_bounds.get("enabled", False))
+        diagnostics = self.config.policy_loss.get("loss_diagnostics", {})
+        diagnostics_enabled = bool(diagnostics.get("enabled", False))
+        gradient_step = gradient_step_selected(
+            diagnostics, data.meta_info.get("global_steps"),
+            not getattr(self, "_gradient_diagnostics_seen_update", False),
+        )
+        gradient_step = gradient_step and not getattr(self, "_gradient_diagnostics_disabled", False)
+        if gradient_step and (self.ulysses_sequence_parallel_size != 1 or isinstance(self.actor_module, FSDP)):
+            raise ValueError("Gradient diagnostics support FSDP2 with SP=1, or an unsharded actor.")
+        if diagnostics_enabled:
+            if (not branch_strata_enabled or self.config.policy_loss.loss_mode != "gspo"
+                    or self.config.policy_loss.retry_sft.enabled
+                    or self.config.entropy_coeff != 0 or self.config.use_kl_loss):
+                raise ValueError("Five-component diagnostics require branch GSPO without SFT/entropy/KL.")
+        if mass_bounds_enabled:
+            if not branch_strata_enabled or self.config.policy_loss.loss_mode != "gspo":
+                raise ValueError("Auxiliary mass bounds require branch-stratified GSPO.")
+            if not self.config.policy_loss.retry_critic.enabled or self.config.policy_loss.retry_sft.enabled:
+                raise ValueError("Auxiliary mass bounds require retry critic and no retry-SFT.")
+            if self.config.entropy_coeff != 0 or self.config.use_kl_loss or self.ulysses_sequence_parallel_size != 1:
+                raise ValueError("Auxiliary mass bounds currently require zero entropy/KL losses and SP=1.")
         if branch_strata_enabled:
             for key in ("branch_policy_loss_weight", "branch_policy_loss_is_branch"):
                 if key not in data.batch.keys():
@@ -711,8 +874,19 @@ class DataParallelPPOActor(BasePPOActor):
             "actor/retry_critic_weighted_loss": 0.0,
             "actor/combined_policy_loss": 0.0,
         }
-        for _ in range(self.config.ppo_epochs):
+        bound_ratios = {"branch": [], "critic": []}
+        if mass_bounds_enabled:
+            for term in ("canonical_gspo", "branch_gspo", "critic_ce"):
+                metrics[f"actor/mass_bounds/{term}_contribution_sum"] = 0.0
+        measured_minibatches = 0
+        for ppo_epoch in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
+                if diagnostics_enabled:
+                    diagnostic_totals = torch.zeros(7, dtype=torch.float64, device=get_device_id())
+                    scalar_diagnostic_errors = []
+                if mass_bounds_enabled:
+                    # Keep the original weights for the next PPO epoch.
+                    mini_batch = mini_batch.select(batch_keys=list(mini_batch.batch.keys()))
                 dp_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
                 global_retry_sft_tokens = 0
                 global_rl_tokens = 0
@@ -783,6 +957,45 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         global_critic_examples = [int(critic_stats[0].item()), int(critic_stats[1].item())]
                         global_critic_parent_mass = [float(critic_stats[2].item()), float(critic_stats[3].item())]
+                branch_multiplier = critic_multiplier = 1.0
+                if mass_bounds_enabled:
+                    epsilon = float(mass_bounds.epsilon)
+                    configured_critic_fraction = float(self.config.policy_loss.retry_critic.loss_fraction)
+                    policy_fraction = 1.0 - configured_critic_fraction
+                    global_normalizer = self.config.ppo_mini_batch_size * dp_size
+                    mass_args = (
+                        mini_batch.batch["advantages"], mini_batch.batch["response_mask"],
+                        mini_batch.batch["branch_policy_loss_weight"],
+                        mini_batch.batch["branch_policy_loss_is_branch"],
+                        mini_batch.batch.get("rollout_is_weights"),
+                    )
+                    mass = advantage_mass_sums(*mass_args).to(get_device_id())
+                    if torch.distributed.is_initialized():
+                        torch.distributed.all_reduce(mass)
+                    mass *= policy_fraction / global_normalizer
+                    canonical_mass = float((mass[0] + mass[1]).item())
+                    branch_mass_before = float((mass[2] + mass[3]).item())
+                    branch_multiplier = detached_cap_multiplier(
+                        canonical_mass, branch_mass_before, mass_bounds.max_branch_to_canonical, epsilon,
+                    )
+                    branch_flags = mini_batch.batch["branch_policy_loss_is_branch"].bool()
+                    original_weights = mini_batch.batch["branch_policy_loss_weight"]
+                    mini_batch.batch["branch_policy_loss_weight"] = torch.where(
+                        branch_flags, original_weights * branch_multiplier, original_weights,
+                    )
+                    mass_after = advantage_mass_sums(
+                        mini_batch.batch["advantages"], mini_batch.batch["response_mask"],
+                        mini_batch.batch["branch_policy_loss_weight"], branch_flags,
+                        mini_batch.batch.get("rollout_is_weights"),
+                    ).to(get_device_id())
+                    if torch.distributed.is_initialized():
+                        torch.distributed.all_reduce(mass_after)
+                    mass_after *= policy_fraction / global_normalizer
+                    branch_mass_after = float((mass_after[2] + mass_after[3]).item())
+                    branch_limit = mass_bounds.max_branch_to_canonical * canonical_mass
+                    if branch_mass_after > branch_limit + mass_bounds.verification_atol:
+                        raise RuntimeError("Branch absolute advantage mass exceeded its configured cap.")
+
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(
@@ -795,6 +1008,32 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
                 self.actor_optimizer.zero_grad()
+
+                if mass_bounds_enabled:
+                    has_global_critic = any(global_critic_examples)
+                    critic_ce_before = self._measure_current_retry_critic_ce(
+                        micro_batches, temperature, pad_token_id, dp_size, global_critic_parent_mass,
+                        dataset_balance=retry_critic_dataset_balance,
+                        global_stratum_parent_mass=global_critic_stratum_parent_mass
+                        if retry_critic_dataset_balance else None,
+                    ) if has_global_critic else 0.0
+                    critic_mass_before = configured_critic_fraction * critic_ce_before
+                    critic_multiplier = detached_cap_multiplier(
+                        canonical_mass, critic_mass_before, mass_bounds.max_critic_to_canonical, epsilon,
+                    )
+                    actual_bound_terms = torch.zeros(3, dtype=torch.float64, device=get_device_id())
+
+                probe = None
+                if gradient_step and (diagnostics.gradient_max_minibatches == 0
+                                      or measured_minibatches < diagnostics.gradient_max_minibatches):
+                    probe = self._replay_gradient_components(
+                        micro_batches, temperature=temperature, pad_token_id=pad_token_id,
+                        on_policy=on_policy, bounded=mass_bounds_enabled, critic_multiplier=critic_multiplier,
+                        has_rl=global_rl_tokens > 0, has_critic=any(global_critic_examples), dp_size=dp_size,
+                        critic_parent_mass=global_critic_parent_mass, dataset_balance=retry_critic_dataset_balance,
+                        stratum_parent_mass=global_critic_stratum_parent_mass,
+                    )
+                    actual_backward_start = time.perf_counter()
 
                 for micro_batch in micro_batches:
                     micro_batch = micro_batch.to(get_device_id())
@@ -821,7 +1060,9 @@ class DataParallelPPOActor(BasePPOActor):
 
                     calculate_entropy = self.config.calculate_entropy or (entropy_coeff != 0)
 
-                    if self.config.use_dynamic_bsz:
+                    if self.config.use_dynamic_bsz or mass_bounds_enabled:
+                        # The budget uses this same nominal row denominator,
+                        # including a partial final fixed-size microbatch.
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
                     else:
                         loss_scale_factor = 1 / self.gradient_accumulation
@@ -859,6 +1100,9 @@ class DataParallelPPOActor(BasePPOActor):
 
                         # Compute policy loss (any function is expected to return 2 values)
                         policy_loss_kwargs = {}
+                        gspo_components = {} if diagnostics_enabled else None
+                        if diagnostics_enabled:
+                            policy_loss_kwargs["loss_components"] = gspo_components
                         if branch_strata_enabled:
                             policy_loss_kwargs.update(
                                 branch_policy_loss_weight=branch_policy_loss_weight,
@@ -874,6 +1118,13 @@ class DataParallelPPOActor(BasePPOActor):
                             rollout_is_weights=rollout_is_weights,
                             **policy_loss_kwargs,
                         )
+                        if mass_bounds_enabled:
+                            actual_bound_terms[0] += (
+                                pg_metrics.pop("actor/pg_loss_canonical_weighted") * loss_scale_factor * policy_fraction
+                            )
+                            actual_bound_terms[1] += (
+                                pg_metrics.pop("actor/pg_loss_branch_weighted") * loss_scale_factor * policy_fraction
+                            )
                         micro_batch_metrics.update(pg_metrics)
 
                         # Skip if using bypass_mode loss (metrics already computed in pg_metrics)
@@ -985,15 +1236,40 @@ class DataParallelPPOActor(BasePPOActor):
                                     dp_size=dp_size,
                                 )
                             retry_critic_fraction = float(self.config.policy_loss.retry_critic.loss_fraction)
-                        loss = combine_retry_critic_loss(
-                            loss,
-                            retry_critic_loss,
-                            loss_fraction=float(self.config.policy_loss.retry_critic.loss_fraction)
-                            if retry_critic_enabled
-                            else 0.0,
-                            has_existing=(global_rl_tokens > 0 or global_retry_sft_tokens > 0),
-                            has_critic=retry_critic_enabled and has_critic,
-                        )
+                        if mass_bounds_enabled:
+                            # Preserve canonical scaling even in a minibatch with
+                            # no critic labels; never renormalize canonical upward.
+                            loss = (policy_fraction * loss
+                                    + configured_critic_fraction * critic_multiplier * retry_critic_loss)
+                            actual_bound_terms[2] += retry_critic_loss.detach().double()
+                        else:
+                            loss = combine_retry_critic_loss(
+                                loss,
+                                retry_critic_loss,
+                                loss_fraction=float(self.config.policy_loss.retry_critic.loss_fraction)
+                                if retry_critic_enabled
+                                else 0.0,
+                                has_existing=(global_rl_tokens > 0 or global_retry_sft_tokens > 0),
+                                has_critic=retry_critic_enabled and has_critic,
+                            )
+                        if diagnostics_enabled:
+                            diagnostic_totals[5] += loss.detach().double()
+                            try:
+                                weighted_components = weighted_loss_components(
+                                    gspo_components, retry_critic_loss, loss_scale=loss_scale_factor,
+                                    critic_fraction=float(self.config.policy_loss.retry_critic.loss_fraction),
+                                    has_rl=global_rl_tokens > 0, has_critic=has_critic,
+                                    bounded=mass_bounds_enabled, critic_multiplier=critic_multiplier,
+                                )
+                                diagnostic_totals[:5] += torch.stack(
+                                    [weighted_components[name].detach().double() for name in COMPONENTS]
+                                )
+                            except Exception as error:
+                                # Optional scalar accounting must never replace
+                                # or veto the already constructed real objective.
+                                diagnostic_totals[6] += 1
+                                scalar_diagnostic_errors.append(f"{type(error).__name__}: {error}")
+                                logger.warning("Optional loss partition failed; training continues: %s", error)
                     with stage("backward"):
                         if self.scaler is not None:
                             self.scaler.scale(loss).backward()
@@ -1007,12 +1283,124 @@ class DataParallelPPOActor(BasePPOActor):
                     metrics["actor/retry_critic_accept_nll"] += retry_critic_accept_nll.detach().item()
                     metrics["actor/retry_critic_retry_nll"] += retry_critic_retry_nll.detach().item()
                     metrics["actor/retry_critic_weighted_loss"] += (
-                        retry_critic_loss.detach().item() * retry_critic_fraction
+                        retry_critic_loss.detach().item() * retry_critic_fraction * critic_multiplier
                     )
                     metrics["actor/combined_policy_loss"] += loss.detach().item()
                     append_to_dict(metrics, micro_batch_metrics)
 
-                grad_norm = self._optimizer_step()
+                if mass_bounds_enabled:
+                    if torch.distributed.is_initialized():
+                        torch.distributed.all_reduce(actual_bound_terms)
+                    actual_bound_terms /= dp_size
+                    if not torch.isfinite(actual_bound_terms).all():
+                        self.actor_optimizer.zero_grad()
+                        raise RuntimeError("Nonfinite bounded loss contribution; no optimizer update was applied.")
+                    actual_critic_before = float(actual_bound_terms[2].item()) * configured_critic_fraction
+                    actual_critic_after = actual_critic_before * critic_multiplier
+                    critic_limit = mass_bounds.max_critic_to_canonical * canonical_mass
+                    if actual_critic_after > critic_limit + mass_bounds.verification_atol:
+                        self.actor_optimizer.zero_grad()
+                        raise RuntimeError("Actual critic CE exceeded its cap; no optimizer update was applied.")
+                    prefix = "actor/mass_bounds"
+                    bound_metrics = {
+                        f"{prefix}/enabled": 1.0,
+                        f"{prefix}/canonical_abs_mass": canonical_mass,
+                        f"{prefix}/canonical_positive_mass": float(mass[0].item()),
+                        f"{prefix}/canonical_negative_mass": float(mass[1].item()),
+                        f"{prefix}/canonical_zero": float(canonical_mass == 0),
+                        f"{prefix}/branch_abs_mass_before": branch_mass_before,
+                        f"{prefix}/branch_abs_mass_after": branch_mass_after,
+                        f"{prefix}/branch_multiplier": branch_multiplier,
+                        f"{prefix}/branch_cap_active": float(branch_multiplier < 1),
+                        f"{prefix}/branch_limit": float(mass_bounds.max_branch_to_canonical),
+                        f"{prefix}/branch_to_canonical_before": mass_ratio(branch_mass_before, canonical_mass, epsilon),
+                        f"{prefix}/branch_to_canonical_after": mass_ratio(branch_mass_after, canonical_mass, epsilon),
+                        f"{prefix}/critic_ce_prepass": critic_ce_before,
+                        f"{prefix}/critic_ce_mass_prepass": critic_mass_before,
+                        f"{prefix}/critic_ce_mass_before": actual_critic_before,
+                        f"{prefix}/critic_ce_mass_after": actual_critic_after,
+                        f"{prefix}/critic_multiplier": critic_multiplier,
+                        f"{prefix}/critic_cap_active": float(critic_multiplier < 1),
+                        f"{prefix}/critic_limit": float(mass_bounds.max_critic_to_canonical),
+                        f"{prefix}/critic_effective_coefficient": configured_critic_fraction * critic_multiplier,
+                        f"{prefix}/critic_to_canonical_before": mass_ratio(
+                            actual_critic_before, canonical_mass, epsilon
+                        ),
+                        f"{prefix}/critic_to_canonical_after": mass_ratio(actual_critic_after, canonical_mass, epsilon),
+                        f"{prefix}/critic_prepass_absolute_error": abs(actual_critic_before - critic_mass_before),
+                        f"{prefix}/canonical_gspo_contribution": float(actual_bound_terms[0].item()),
+                        f"{prefix}/branch_gspo_contribution": float(actual_bound_terms[1].item()),
+                        f"{prefix}/critic_ce_contribution": actual_critic_after,
+                    }
+                    total_mass = canonical_mass + branch_mass_after + actual_critic_after
+                    for term, value in (("canonical", canonical_mass), ("branch", branch_mass_after),
+                                        ("critic", actual_critic_after)):
+                        bound_metrics[f"{prefix}/{term}_mass_share_after"] = mass_ratio(value, total_mass, epsilon)
+                    append_to_dict(metrics, bound_metrics)
+                    for key, value in (("canonical_gspo", actual_bound_terms[0].item()),
+                                       ("branch_gspo", actual_bound_terms[1].item()),
+                                       ("critic_ce", actual_critic_after)):
+                        metrics[f"{prefix}/{key}_contribution_sum"] += float(value)
+                    bound_ratios["branch"].append(bound_metrics[f"{prefix}/branch_to_canonical_after"])
+                    bound_ratios["critic"].append(bound_metrics[f"{prefix}/critic_to_canonical_after"])
+
+                if diagnostics_enabled:
+                    loss_diagnostics = reduce_loss_diagnostics(diagnostic_totals)
+                    for name, value in loss_diagnostics.items():
+                        key = f"actor/loss_components/{name}_sum"
+                        if name == "reconstruction_abs_error":
+                            key = "actor/loss_components/reconstruction_abs_error_max"
+                            metrics[key] = max(metrics.get(key, 0.0), value)
+                        elif name in ("finite", "computation_valid", "reconstruction_valid"):
+                            key = f"actor/loss_components/{name}_min"
+                            metrics[key] = min(metrics.get(key, 1.0), value)
+                        else:
+                            metrics[key] = metrics.get(key, 0.0) + value
+
+                if probe is not None:
+                    actual_seconds = time.perf_counter() - actual_backward_start
+                    replay_seconds = probe.metrics["replay_seconds"]
+                    probe.compare_losses(loss_diagnostics)
+                    probe_start = time.perf_counter()
+                    probe.measure_before_clip(self.scaler.get_scale() if self.scaler is not None else 1.0)
+                    for term, multiplier in (("branch", branch_multiplier), ("critic_ce", critic_multiplier)):
+                        norm = probe.metrics.get(f"{term}_norm_preclip")
+                        probe.metrics[f"{term}_uncapped_norm_defined"] = float(multiplier > 0 and norm is not None)
+                        probe.metrics[f"{term}_norm_before_auxiliary_multiplier"] = (
+                            norm / multiplier if multiplier > 0 and norm is not None else 0.0
+                        )
+                    probe.metrics["gram_seconds"] = time.perf_counter() - probe_start
+                    probe.metrics["replay_seconds"] = replay_seconds
+                    probe.metrics["actual_forward_backward_seconds"] = actual_seconds
+                    self._active_gradient_probe = probe
+                try:
+                    grad_norm = self._optimizer_step()
+                finally:
+                    self._active_gradient_probe = None
+                if probe is not None:
+                    measured_minibatches += 1
+                    probe.metrics["extra_seconds"] = sum(
+                        probe.metrics.get(k, 0.0)
+                        for k in ("replay_seconds", "gram_seconds", "postclip_measurement_seconds")
+                    )
+                    probe.write_record(diagnostics.gradient_output_dir, {
+                        "global_step": data.meta_info["global_steps"], "ppo_epoch": ppo_epoch,
+                        "slurm_job_id": os.environ.get("SLURM_JOB_ID"), "process_id": os.getpid(),
+                        "recorded_at_unix": time.time(),
+                        "minibatch_index": batch_idx, "local_rows": len(mini_batch), "world_size": dp_size,
+                        "branch_multiplier": branch_multiplier, "critic_multiplier": critic_multiplier,
+                        "weighted_losses": loss_diagnostics,
+                        "replayed_weighted_losses": dict(zip(COMPONENTS, probe.losses, strict=False)),
+                        "scalar_diagnostic_errors": scalar_diagnostic_errors,
+                    })
+                    if probe.metrics.get("technical_error", 0) and diagnostics.gradient_disable_on_error:
+                        self._gradient_diagnostics_disabled = True
+                        gradient_step = False
+                    metrics["actor/gradient_components/invalid_minibatches"] = (
+                        metrics.get("actor/gradient_components/invalid_minibatches", 0)
+                        + int(not probe.metrics.get("valid", 0))
+                    )
+                    append_to_dict(metrics, {f"actor/gradient_components/{k}": v for k, v in probe.metrics.items()})
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 mini_batch_metrics.update(getattr(self, "_gemma4_smoke_metrics", {}))
                 if retry_critic_enabled:
@@ -1040,4 +1428,14 @@ class DataParallelPPOActor(BasePPOActor):
                             )
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
+        if diagnostics_enabled and diagnostics.get("gradient_enabled", False):
+            self._gradient_diagnostics_seen_update = True
+            metrics["actor/gradient_components/measured_minibatches"] = measured_minibatches
+            metrics["actor/gradient_components/every_n_steps"] = diagnostics.gradient_every_n_steps
+            metrics["actor/gradient_components/disabled_after_error"] = float(
+                getattr(self, "_gradient_diagnostics_disabled", False)
+            )
+        if mass_bounds_enabled:
+            for term, ratios in bound_ratios.items():
+                metrics[f"actor/mass_bounds/{term}_to_canonical_max"] = max(ratios, default=0.0)
         return metrics

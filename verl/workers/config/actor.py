@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -38,6 +39,8 @@ __all__ = [
     "RetrySFTLossConfig",
     "RetryCriticDatasetBalanceConfig",
     "RetryCriticLossConfig",
+    "AuxiliaryMassBoundsConfig",
+    "LossDiagnosticsConfig",
     "PolicyLossConfig",
     "RouterReplayConfig",
     "ActorConfig",
@@ -176,6 +179,45 @@ class RetryCriticLossConfig(BaseConfig):
 
 
 @dataclass
+class AuxiliaryMassBoundsConfig(BaseConfig):
+    """Opt-in auxiliary budgets relative to canonical absolute advantage mass."""
+
+    enabled: bool = False
+    max_branch_to_canonical: float = 0.25
+    max_critic_to_canonical: float = 0.05
+    epsilon: float = 1e-12
+    verification_atol: float = 1e-6
+
+    def __post_init__(self):
+        for name in ("max_branch_to_canonical", "max_critic_to_canonical", "verification_atol"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"policy_loss.auxiliary_mass_bounds.{name} must be finite and nonnegative.")
+        if not math.isfinite(float(self.epsilon)) or self.epsilon <= 0:
+            raise ValueError("policy_loss.auxiliary_mass_bounds.epsilon must be finite and positive.")
+
+
+@dataclass
+class LossDiagnosticsConfig(BaseConfig):
+    """Weighted loss partition and optional sampled full-parameter gradients."""
+
+    enabled: bool = False
+    gradient_enabled: bool = False
+    gradient_every_n_steps: int = 10
+    gradient_first_update: bool = True
+    gradient_max_minibatches: int = 1
+    gradient_output_dir: Optional[str] = None
+    gradient_reconstruction_rtol: float = 0.02
+    gradient_disable_on_error: bool = True
+
+    def __post_init__(self):
+        if self.gradient_every_n_steps < 1 or self.gradient_max_minibatches < 0:
+            raise ValueError("Gradient interval must be positive; minibatch limit must be nonnegative.")
+        if not math.isfinite(self.gradient_reconstruction_rtol) or self.gradient_reconstruction_rtol < 0:
+            raise ValueError("Gradient reconstruction tolerance must be finite and nonnegative.")
+
+
+@dataclass
 class PolicyLossConfig(BaseConfig):
     """Configuration for policy loss computation.
 
@@ -201,6 +243,20 @@ class PolicyLossConfig(BaseConfig):
     branch_strata: BranchLossStrataConfig = field(default_factory=BranchLossStrataConfig)
     retry_sft: RetrySFTLossConfig = field(default_factory=RetrySFTLossConfig)
     retry_critic: RetryCriticLossConfig = field(default_factory=RetryCriticLossConfig)
+    auxiliary_mass_bounds: AuxiliaryMassBoundsConfig = field(default_factory=AuxiliaryMassBoundsConfig)
+    loss_diagnostics: LossDiagnosticsConfig = field(default_factory=LossDiagnosticsConfig)
+
+    def __post_init__(self):
+        if self.loss_diagnostics.enabled:
+            if self.loss_mode != "gspo" or not self.branch_strata.enabled:
+                raise ValueError("Loss diagnostics require GSPO and branch strata enabled.")
+            if self.retry_sft.enabled:
+                raise ValueError("Five-component diagnostics do not include retry-SFT.")
+        if self.auxiliary_mass_bounds.enabled:
+            if self.loss_mode != "gspo" or not self.branch_strata.enabled or not self.retry_critic.enabled:
+                raise ValueError("Auxiliary mass bounds require GSPO, branch strata, and retry critic enabled.")
+            if self.retry_sft.enabled:
+                raise ValueError("Auxiliary mass bounds do not support the additional retry-SFT stratum.")
 
 
 @dataclass

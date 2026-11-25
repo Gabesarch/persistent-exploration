@@ -452,6 +452,12 @@ class ToolAgentLoop(AgentLoopBase):
         self.llm_judge_partial_credit_score = float(
             getattr(multi_turn_config, "llm_judge_partial_credit_score", 0.5)
         )
+        self.validation_accuracy_binary = bool(getattr(multi_turn_config, "validation_accuracy_binary", False))
+        self.validation_final_answer_extraction = str(
+            getattr(multi_turn_config, "validation_final_answer_extraction", "strict")
+        )
+        if self.validation_final_answer_extraction not in {"strict", "external"}:
+            raise ValueError("validation_final_answer_extraction must be 'strict' or 'external'")
         self.llm_judge_timeout_s = getattr(multi_turn_config, "llm_judge_timeout_s", None)
         self.llm_judge_fallback_to_string_reward = bool(
             getattr(multi_turn_config, "llm_judge_fallback_to_string_reward", True)
@@ -1951,11 +1957,40 @@ class ToolAgentLoop(AgentLoopBase):
             # before trainer-side reward extraction. Return the ordinary base grade
             # for non-judge domains as well so final accuracy is available there.
             return grade
+        if self._validation_accuracy_binary_active(rollout_kwargs):
+            # Retain binary fallback grades instead of letting trainer-side
+            # reward extraction recompute a fractional string-match score.
+            return grade
         if grade.get("llm_judge_used"):
             return grade
         if grade.get("llm_judge_error") and not getattr(self, "llm_judge_fallback_to_string_reward", True):
             return grade
         return None
+
+    def _validation_accuracy_binary_active(self, rollout_kwargs: dict[str, Any]) -> bool:
+        return bool(
+            (rollout_kwargs.get("_debug_trajectory") or {}).get("validate")
+            and getattr(self, "validation_accuracy_binary", False)
+        )
+
+    def _finalize_validation_accuracy(self, grade: dict[str, Any], rollout_kwargs: dict[str, Any]) -> dict[str, Any]:
+        if not self._validation_accuracy_binary_active(rollout_kwargs):
+            return grade
+        accuracy = float(float(grade.get("accuracy", 0.0) or 0.0) >= 1.0)
+        if accuracy == grade.get("accuracy"):
+            return grade
+        grade = dict(grade)
+        grade["accuracy"] = accuracy
+        grade["score"] = self._compose_score_from_grade(grade, accuracy)
+        return grade
+
+    def _extract_llm_judge_answer(self, solution_str: str, *, validation: bool = False) -> str | None:
+        if validation and getattr(self, "validation_final_answer_extraction", "strict") == "external":
+            from verl.utils.reward_score.validation_accuracy import extract_external_final_answer
+
+            return extract_external_final_answer(solution_str) or None
+        is_valid, final_answer_text, _, _ = self._parse_solver_output(solution_str)
+        return final_answer_text if is_valid and final_answer_text else None
 
     async def _score_solution_with_optional_llm_judge(
         self,
@@ -1983,19 +2018,29 @@ class ToolAgentLoop(AgentLoopBase):
             grade = {"score": float(base_result), "accuracy": float(base_result)}
 
         if not use_llm_judge or not self._llm_judge_applies(extra_info):
-            return grade
+            return self._finalize_validation_accuracy(grade, rollout_kwargs)
 
+        judge_options = {}
+        is_validation = bool((rollout_kwargs.get("_debug_trajectory") or {}).get("validate"))
+        if is_validation and (
+            getattr(self, "validation_accuracy_binary", False)
+            or getattr(self, "validation_final_answer_extraction", "strict") == "external"
+        ):
+            judge_options["validation"] = True
         judge_result = await self._run_llm_judge(
             agent_data=agent_data,
             solution_str=solution_str,
             ground_truth=ground_truth,
             extra_info=extra_info,
+            **judge_options,
         )
         if judge_result.get("llm_judge_used"):
-            return self._merge_llm_judge_accuracy(grade, judge_result)
+            return self._finalize_validation_accuracy(
+                self._merge_llm_judge_accuracy(grade, judge_result), rollout_kwargs
+            )
         if getattr(self, "llm_judge_fallback_to_string_reward", True):
             grade.update(judge_result)
-            return grade
+            return self._finalize_validation_accuracy(grade, rollout_kwargs)
 
         grade.update(judge_result)
         grade["accuracy"] = 0.0
@@ -2023,12 +2068,14 @@ class ToolAgentLoop(AgentLoopBase):
         solution_str: str,
         ground_truth: Any,
         extra_info: Any,
+        *,
+        validation: bool = False,
     ) -> dict[str, Any]:
         if not getattr(self, "llm_judge_prompt_template", None):
             return {"llm_judge_used": False, "llm_judge_error": "missing_prompt_template"}
 
-        is_valid, final_answer_text, _, _ = self._parse_solver_output(solution_str)
-        if not is_valid or not final_answer_text:
+        final_answer_text = self._extract_llm_judge_answer(solution_str, validation=validation)
+        if not final_answer_text:
             if "<answer>" in str(solution_str) and "</answer>" in str(solution_str):
                 return {"llm_judge_used": False, "llm_judge_error": "missing_final_answer"}
             return {"llm_judge_used": False, "llm_judge_error": "invalid_trajectory_format"}
@@ -2084,7 +2131,10 @@ class ToolAgentLoop(AgentLoopBase):
         if is_equivalent:
             accuracy = 1.0
         elif partial_credit:
-            accuracy = float(getattr(self, "llm_judge_partial_credit_score", 0.5))
+            if validation and getattr(self, "validation_accuracy_binary", False):
+                accuracy = 0.0
+            else:
+                accuracy = float(getattr(self, "llm_judge_partial_credit_score", 0.5))
         else:
             accuracy = 0.0
 

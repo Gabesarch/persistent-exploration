@@ -1,133 +1,91 @@
-# vero2
+# Learning Persistent Exploration for Visual Search
 
-Multi-turn **tool-use RL for vision-language models** (Qwen3-VL-8B), built on a fork of
-[verl](https://github.com/volcengine/verl). The model reasons in `<think>`, calls a visual tool —
-**zoom** (`image_zoom_in_tool` crops a bbox and feeds the crop back) or **drawing**
-(mark the image with points as a visual checklist) — and answers in `<answer>`, trained with GDPO
-advantage + GSPO loss on chart / search / counting data. Runs on Princeton Della (Slurm).
+Code for **“Learning Persistent Exploration for Visual Search.”** Persistent Exploration trains a vision-language model to inspect an image, answer a question, and keep searching with the zoom tool when its learned evaluator decides the answer needs another attempt.
 
-| Where | What |
-|---|---|
-| [`vero2_scripts/`](vero2_scripts/README.md) | **the experiments** — launchers (`drawing/`, `zoom/`), configs, prompts; start at its README |
-| `verl/` | the RL engine (trainer, async tool rollout, tools, rewards) |
-| [`vero_eval/`](vero_eval/README.md) | evaluation harness (lmms_eval + MCP tools) |
-| `dataset_filter/` | Gemini ground-truth filter for datasets |
-| [`docs/vero2/`](docs/vero2/) | detailed docs (training pipeline, environment, forced-explore) |
+This repository provides the Qwen3-VL-8B training recipe and evaluation code used for the paper. The paper also reports Gemma 4 E4B results. The data and checkpoint links are below; the direct evaluation command is configured for Qwen. The implementation builds on [Vero](https://github.com/zlab-princeton/vero), [verl](https://github.com/volcengine/verl), and [lmms-eval](https://github.com/EvolvingLMMs-Lab/lmms-eval).
 
-## Quick Start
+| Path | Purpose |
+| --- | --- |
+| [`persistent-exploration-rl/`](persistent-exploration-rl/README.md) | Qwen training launcher, configuration, and prompts |
+| [`verl/`](verl/) | Forked trainer, async tool rollout, reward and checkpoint code |
+| [`persistent-exploration-eval/`](persistent-exploration-eval/README.md) | VisualProbe and generalization evaluation |
+| [`tests/`](tests/) | Focused CPU checks for mass bounds and related loss logic |
 
-### Prerequisites
-- Linux with CUDA-capable GPUs (tested on Princeton Della cluster).
-- Python 3.12.
-- Git, Conda/Miniconda.
+## What is available
 
-### Clone Repositories
-```bash
-git clone https://github.com/gabesarch/vero2
-```
+| Item | Location |
+| --- | --- |
+| Training data: 2,042 VisualProbe image–question pairs | [Persistent Exploration RL Data](https://huggingface.co/datasets/gsarch/Persistent-Exploration-RL-Data) |
+| Trained Qwen3-VL-8B checkpoint | [Persistent Exploration Qwen](https://huggingface.co/gsarch/Persistent-Exploration-Qwen3VLi) |
+| Trained Gemma 4 E4B checkpoint | [Persistent Exploration Gemma](https://huggingface.co/gsarch/Vero2-Gemma4-E4B-Persistent-Exploration) |
+| Held-out evaluation questions | VisualProbe Easy, Medium, and Hard datasets loaded by `persistent-exploration-eval` |
 
-### Create / Update Conda Environment
-We use a single conda environment (`vero2`):
-```bash
-conda create -n vero2 python=3.12 -y
+The training dataset contains **only training examples**. The held-out VisualProbe questions are separate: 141 Easy, 268 Medium, and 106 Hard, for 515 total. The evaluation code loads those benchmark datasets from Hugging Face. The training launcher uses the same questions for validation; [`prepare_validation.py`](persistent-exploration-rl/prepare_validation.py) downloads their pinned revisions and exports a local validation JSONL and images.
 
-conda activate vero2
-pip install uv
-module load cudatoolkit/12.9
-module load gcc/11
+## Requirements
 
-python -m pip install --no-cache-dir --force-reinstall \
-  torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
-  --index-url https://download.pytorch.org/whl/cu129
+- Linux, Python 3.12, and CUDA GPUs
+- A Qwen3-VL-8B-Instruct model and a Qwen3.5-27B judge cached locally
+- The training data and validation splits exported to local JSONL files
+- A Python environment with PyTorch, vLLM, verl dependencies, and the evaluation dependencies
 
-uv pip install -e ".[verl]"
+The reference training recipe uses eight GPUs. You can launch it directly with Bash and pass Hydra overrides for a smaller smoke run.
 
-bash scripts/setup_qwen35.sh
+The data download and export commands are below. See the [training guide](persistent-exploration-rl/README.md) for the recipe settings and data format.
 
-# uv pip install "transformers>=5.0.0" accelerate datasets peft safetensors "flash-linear-attention>=0.4.0" "qwen-vl-utils==0.0.14"
+## Install
 
-uv pip install safetensors "qwen-vl-utils==0.0.14" "flash-linear-attention>=0.4.0"
-
-# pip install causal-conv1d --no-build-isolation --no-cache-dir
-python -m pip install -U packaging psutil ninja wheel
-FLASH_ATTENTION_FORCE_BUILD=TRUE \
-FLASH_ATTENTION_FORCE_CXX11_ABI=TRUE \
-MAX_JOBS=2 \
-python -m pip install --no-build-isolation flash-attn==2.8.3
-
-uv pip install pybase64 msgspec math_verify langdetect nltk latex2sympy2_extended 
-uv pip install liger-kernel
-uv pip install flash-linear-attention
-
-# Install lmms-eval dependencies for evaluation.
-# If a wheel download fails with IncompleteRead, rerun the same command with
-# --no-cache-dir so pip does not reuse the partial download.
-python -m pip install --no-cache-dir \
-    sacrebleu zss zstandard transformers-stream-generator yt-dlp \
-    timm tqdm-multiprocess evaluate sqlitedict tenacity sentence_transformers \
-    pytablewriter Levenshtein matplotlib
-
-# The bundled lmms_eval tree is not a standalone pip project. Run it from its
-# parent directory, or add that directory to PYTHONPATH before invoking it.
-export PYTHONPATH="$PWD/vero_eval:${PYTHONPATH:-}"
-cd vero_eval
-python -m lmms_eval --help
-cd ..
-```
-
-### Setup
-
-1. **Paths.** `set_paths.sh` (git-tracked) activates the conda env and exports `VERL_ROOT`,
-   `ROOT_PATH`, `HF_HOME`, `SAVE_PATH`, `IMAGE_ROOT`, …. Per-user overrides go in the git-ignored
-   `set_paths.local.sh` next to it (e.g. point `VERO2_CONDA_ENV` at your env). Every launcher
-   sources it from the repo root — **always submit jobs from the repo root**.
-
-2. Cache the model to your HF directory:
-
-Set cache directory:
-```bash
-export HF_HOME="$ROOT_PATH/hf_cache"
-export HF_DATASETS_CACHE="$HF_HOME/datasets"
-export TRANSFORMERS_CACHE="$HF_HOME/transformers"
-```
-
-Then cache the model we will train since no internet on Della:
-
-```python
-import os
-os.environ['HF_HOME'] = os.environ.get('HF_HOME')
-os.environ['TRANSFORMERS_CACHE'] = os.environ.get('TRANSFORMERS_CACHE')
-os.environ['HF_HUB_CACHE'] = os.environ.get('HF_HUB_CACHE')
-
-from transformers import AutoModelForVision2Seq, AutoProcessor, AutoTokenizer
-import torch
-
-model_id = "Qwen/Qwen3-VL-8B-Instruct"
-print(f"Downloading model: {model_id}")
-from huggingface_hub import snapshot_download
-snapshot_download(
-    repo_id=model_id,
-    local_dir=os.path.join(os.environ.get('HF_HOME'), model_id),
-    local_dir_use_symlinks=False,     # copy real files; no links back into cache
-    # revision="main",                # or pin a tag/commit for reproducibility
-    ignore_patterns=["*.gguf","*.ggml"]
-)
-
-print(f"Successfully cached to {os.environ.get('HF_HOME')}/{model_id}")
-```
-
-3. **Train.** All launchers, configs, and instructions live in
-   [`vero2_scripts/README.md`](vero2_scripts/README.md) — the folder map (`drawing/` vs `zoom/`,
-   `vanilla/` vs `force_explore/`), how to change the training data, the config-knob glossary,
-   and the smoke → full launch workflow. Typical flow:
+Create a Python 3.12 environment with a CUDA compatible PyTorch build and vLLM. Then install this checkout:
 
 ```bash
-# smoke on gpu-test first (small batch, 2 steps, <1 h):
-sbatch vero2_scripts/drawing/force_explore/run_gdpo_hdpotool_gspo_qwen3vl_visual_probe_drawonly_cpueff_hardonly_answer_retry_forcedprefill_smoke.sh
-# then the full run — partition picked at submit time (plilc default | pli | ailab):
-bash vero2_scripts/drawing/force_explore/submit.sh
+python -m pip install -e '.[vllm,geo,math]'
 ```
 
-Full training needs a whole GPU node (8× H100 / A100-80GB) and ~700–900 GB CPU RAM.
+The bundled evaluation harness also needs its lmms-eval dependencies; see [`persistent-exploration-eval/README.md`](persistent-exploration-eval/README.md). GPU package versions must match the CUDA and driver stack on the machine.
 
-4. **Evaluate.** See [`vero_eval/README.md`](vero_eval/README.md) (served-vLLM + lmms_eval + MCP visual tools).
+## Train
+
+Export paths or copy [`set_paths.local.sh.example`](set_paths.local.sh.example) to `set_paths.local.sh` and edit it. The local file is ignored by Git.
+
+Download the training dataset to scratch and run its included exporter:
+
+```bash
+export ROOT_PATH=/path/to/runtime
+hf download gsarch/Persistent-Exploration-RL-Data --repo-type dataset \
+  --revision 07fcdb7be28759fe278507aca49d1a38382456d4 \
+  --local-dir "$ROOT_PATH/datasets/persistent-exploration-release"
+python "$ROOT_PATH/datasets/persistent-exploration-release/export_verl.py" \
+  "$ROOT_PATH/datasets/persistent-exploration-train"
+export TRAIN_FILES="$ROOT_PATH/datasets/persistent-exploration-train/chart_search_counting_visual_probe_train_rollout_score_leq05_all.verl.jsonl"
+```
+
+Prepare the held-out validation data, then launch training:
+
+```bash
+export ROOT_PATH=/path/to/runtime
+python persistent-exploration-rl/prepare_validation.py "$ROOT_PATH/datasets/visual-probe-validation"
+export VAL_FILES="$ROOT_PATH/datasets/visual-probe-validation/visual_probe_validation.verl.jsonl"
+export IMAGE_ROOT="$ROOT_PATH/datasets/persistent-exploration-train"
+export MODEL_PATH=/path/to/Qwen3-VL-8B-Instruct
+bash persistent-exploration-rl/train.sh
+```
+
+Checkpoints are written under `$SAVE_PATH/checkpoints/`; `SAVE_PATH` defaults to `$ROOT_PATH/outputs`. The run has 200 optimizer updates, saves every ten steps, and resumes automatically when restarted with the same output directory. For a small launch validation, override `trainer.total_training_steps`, `data.train_batch_size`, and `actor_rollout_ref.rollout.n` on the command line.
+
+## Evaluate
+
+On a GPU machine, run the published Qwen checkpoint on a benchmark:
+
+```bash
+export ROOT_PATH=/path/to/runtime
+export HF_HOME=/path/to/hf_cache
+# Set VERO2_EVAL_CONDA_ENV only if evaluation uses a separate conda environment.
+bash persistent-exploration-eval/examples/evaluate_checkpoint.sh --task visual_probe \
+  --judge /path/to/Qwen3.5-27B --output /path/to/results
+```
+
+This downloads the linked Qwen checkpoint when needed. Use `--task all` to evaluate VisualProbe Easy, Medium, Hard, Pinpoint, VStar, and O3Bench, or choose one benchmark. See the [evaluation guide](persistent-exploration-eval/README.md) for setup and options. The linked Gemma checkpoint has a separate evaluation profile; this direct command currently runs Qwen only.
+
+## Implementation and license
+
+The implementation builds on Vero, verl, and lmms-eval. The `verl` and `lmms_eval` runtime trees provide the trainers, model adapters, tools, and benchmark tasks used by the entrypoints. Copyright and license notices are in [`LICENSE`](LICENSE), [`Notice.txt`](Notice.txt), and the [lmms-eval license notice](persistent-exploration-eval/LICENSE).

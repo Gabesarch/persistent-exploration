@@ -1,5 +1,0 @@
-# Use the selected200 benchmark/scorer with the established Gemma zoom protocol.
-include:
-  - ../_tool_templates/_toolset_zoom_gemma_yaml
-  - ../selected200_generalization/vstar_bench_selected200_zoom.yaml
-task: vstar_bench_gemma4_zoom

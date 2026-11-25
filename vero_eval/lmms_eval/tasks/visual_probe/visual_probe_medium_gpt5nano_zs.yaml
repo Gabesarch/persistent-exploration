@@ -1,2 +1,0 @@
-include: visual_probe_medium_qwen3_zs.yaml
-task: "visual_probe_medium_gpt5nano_zs"

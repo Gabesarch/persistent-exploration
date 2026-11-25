@@ -13,7 +13,7 @@
 # limitations under the License.
 """Drawing tools for training VLMs to annotate images.
 
-These tools mirror the MCP tools in vero_eval/lmms_eval/mcp/vero2_mcp.py exactly,
+These tools mirror the MCP tools in persistent-exploration-eval/lmms_eval/mcp/vero2_mcp.py exactly,
 so training and evaluation use identical tool interfaces.
 
 All coordinates use 0-1000 scale:
@@ -55,9 +55,16 @@ def _to_pixel(value: float, size: int) -> float:
 def _get_visualizer_cls():
     global _VISUALIZER_CLS
     if _VISUALIZER_CLS is None:
-        from vero_eval.lmms_eval.mcp.visualizer import Visualizer as _V
+        import importlib.util
+        from pathlib import Path
 
-        _VISUALIZER_CLS = _V
+        path = Path(__file__).resolve().parents[2] / "persistent-exploration-eval/lmms_eval/mcp/visualizer.py"
+        spec = importlib.util.spec_from_file_location("persistent_exploration_visualizer", path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Cannot load visualizer from {path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _VISUALIZER_CLS = module.Visualizer
     return _VISUALIZER_CLS
 
 

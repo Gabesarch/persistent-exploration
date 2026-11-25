@@ -207,7 +207,7 @@ class ImageZoomInTool(BaseTool):
         self.use_original_resolution_source = bool(config.get("use_original_resolution_source", False))
         self.original_source_unavailable_policy = config.get("original_source_unavailable_policy", "fallback")
         self.crop_cache_root = config.get("crop_cache_root")
-        # image_indexing mirrors the vero_eval per-task knob so training and eval stay
+        # image_indexing mirrors the persistent-exploration-eval per-task knob so training and eval stay
         # consistent. "training_faithful" (default) keeps the original tool-response wording.
         # "multi_index" additionally tells the model the crop is available as a NEW img_idx it
         # can zoom into; the crop is appended to agent_data.image_data, so that index resolves

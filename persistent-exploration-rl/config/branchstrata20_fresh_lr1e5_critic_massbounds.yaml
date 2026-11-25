@@ -1,0 +1,10 @@
+defaults:
+- branchstrata20_fresh_lr1e5_critic_recipe_massbounds
+- _self_
+
+algorithm:
+  gdpo_reward_weights: [0.8, 0.2, 0.1, 0.2]
+
+hydra:
+  searchpath:
+  - file://${oc.env:VERL_ROOT}/verl/trainer/config

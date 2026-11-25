@@ -1,6 +1,0 @@
-# Earlier includes take precedence: replace the Vero tool protocol with Gemma's.
-# Dataset, question construction, generation settings and scorer are inherited.
-include:
-  - ../_tool_templates/_toolset_zoom_gemma_yaml
-  - ../selected200_generalization/pinpoint_bench_selected200_zoom.yaml
-task: pinpoint_bench_gemma4_zoom

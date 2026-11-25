@@ -1,8 +1,0 @@
-group: mmmu_pro_drawing_thinking
-task:
-- mmmu_pro_vision_drawing_thinking
-- mmmu_pro_standard_drawing_thinking
-include:
-- ../../_tool_templates/_thinking/_toolset_draw_thinking_yaml
-generation_kwargs:
-  max_new_tokens: 16384

@@ -1,7 +1,0 @@
-# Full benchmark; retain the canonical dataset and scorer.
-include: ["../visual_probe/visual_probe_hard_reasoning.yaml"]
-task: visual_probe_hard_vero_qwen35_9b_no_tools
-generation_kwargs: {"max_new_tokens": 16384, "temperature": 0.6, "top_p": 1.0, "top_k": -1, "presence_penalty": 0.0, "repetition_penalty": 1.0, "do_sample": true}
-metadata: {"restore_assistant_forced_prefill": false, "show_initial_image_index_hint": false, "allowed_tools": [], "system_prompt_files": [], "tool_schema_overrides": {}, "image_indexing": null}
-lmms_eval_specific_kwargs:
-  default: {"pre_prompt": "", "post_prompt": ""}

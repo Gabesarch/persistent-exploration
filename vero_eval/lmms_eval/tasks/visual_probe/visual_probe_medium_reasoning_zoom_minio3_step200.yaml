@@ -1,5 +1,0 @@
-# Inherit recent-model generation settings; pin the checkpoint tool schema.
-include:
-  - ../_tool_templates/_toolset_zoom_minio3_step200_yaml
-  - visual_probe_medium_reasoning_zoom.yaml
-task: visual_probe_medium_reasoning_zoom_minio3_step200

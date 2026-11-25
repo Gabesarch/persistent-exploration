@@ -83,11 +83,10 @@ setup(
     version=__version__,
     package_dir={"": "."},
     packages=find_packages(where="."),
-    url="https://github.com/volcengine/verl",
     license="Apache 2.0",
     author="Bytedance - Seed - MLSys",
     author_email="zhangchi.usc1992@bytedance.com, gmsheng@connect.hku.hk",
-    description="verl: Volcano Engine Reinforcement Learning for LLM",
+    description="Persistent Exploration training on a fork of verl",
     install_requires=install_requires,
     extras_require=extras_require,
     package_data={

@@ -1,0 +1,26 @@
+# Published Qwen evaluation on VStar with the Vero zoom tool.
+include:
+  - _default_template_yaml
+  - ../_tool_templates/_toolset_zoom_vero_yaml
+task: "vstar_bench_reasoning_zoom"
+generation_kwargs:
+  # Sampling profile used for the published Qwen evaluation.
+  max_new_tokens: 16384
+  temperature: 0.7
+  top_p: 0.8
+  top_k: 20
+  repetition_penalty: 1.0
+  presence_penalty: 0.0
+  do_sample: True
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: ""
+    post_prompt: ""
+    strip_answer_instruction: true
+metric_list:
+  - metric: vstar_overall_acc
+    aggregation: !function utils.vstar_aggregate_results
+    higher_is_better: true
+metadata:
+  version: 0.0
+  image_indexing: training_faithful

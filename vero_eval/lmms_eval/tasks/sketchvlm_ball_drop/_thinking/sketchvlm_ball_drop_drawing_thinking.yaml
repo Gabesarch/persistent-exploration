@@ -1,6 +1,0 @@
-include:
-- ../sketchvlm_ball_drop.yaml
-- ../../_tool_templates/_thinking/_toolset_draw_thinking_yaml
-task: "sketchvlm_ball_drop_drawing_thinking"
-generation_kwargs:
-  max_new_tokens: 16384

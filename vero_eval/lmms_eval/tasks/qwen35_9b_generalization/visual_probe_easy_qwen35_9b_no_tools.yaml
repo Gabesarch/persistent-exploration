@@ -1,7 +1,0 @@
-# Full benchmark; retain the canonical dataset and scorer.
-include: ["../visual_probe/visual_probe_easy_reasoning.yaml"]
-task: visual_probe_easy_qwen35_9b_no_tools
-generation_kwargs: {"max_new_tokens": 16384, "temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5, "repetition_penalty": 1.0, "do_sample": true}
-metadata: {"restore_assistant_forced_prefill": false, "show_initial_image_index_hint": false, "allowed_tools": [], "system_prompt_files": [], "tool_schema_overrides": {}, "image_indexing": null}
-lmms_eval_specific_kwargs:
-  default: {"pre_prompt": "You are given an image. Search the picture to answer the question. Your final answer should be a short, specific phrase. ", "post_prompt": ""}

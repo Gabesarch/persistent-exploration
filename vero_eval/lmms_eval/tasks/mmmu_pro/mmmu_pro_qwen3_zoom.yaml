@@ -1,9 +1,0 @@
-# Base Qwen3-VL-Instruct multi-turn ZOOM group for mmmu_pro.
-#
-# Group over the per-config zoom leaves (vision + standard). Each leaf reuses the
-# generic _toolset_zoom_yaml (instruct model, no forced <think>, no Layer-A) and is
-# the baseline vs the Vero mmmu_pro_reasoning_zoom checkpoint eval.
-group: mmmu_pro_qwen3_zoom
-task:
-  - mmmu_pro_vision_qwen3_zoom
-  - mmmu_pro_standard_qwen3_zoom

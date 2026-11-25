@@ -1,8 +1,0 @@
-group: mmmu_pro_drawing_instruct
-task:
-- mmmu_pro_vision_drawing_instruct
-- mmmu_pro_standard_drawing_instruct
-include:
-- ../../_tool_templates/_instruct/_toolset_draw_instruct_yaml
-generation_kwargs:
-  max_new_tokens: 16384

@@ -1,0 +1,158 @@
+"""Opt-in validation extraction matching the external evaluator's answer helper.
+
+The four text helpers below mirror persistent-exploration-eval's pure answer_extraction module;
+Gemma adaptation removes environment/critic turns before extracting the answer.
+No rollout tokens, action parsing, format reward, or training accuracy are changed.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Any
+
+
+def _extract_last_boxed_content(text: str) -> str | None:
+    r"""Return content of the last balanced \boxed{...}, if present."""
+    last_content: str | None = None
+    start_idx = 0
+    while True:
+        idx = text.find("\\boxed{", start_idx)
+        if idx == -1:
+            break
+        start = idx + len("\\boxed{")
+        depth = 1
+        pos = start
+        while pos < len(text) and depth > 0:
+            if text[pos] == "{":
+                depth += 1
+            elif text[pos] == "}":
+                depth -= 1
+            pos += 1
+        if depth == 0:
+            last_content = text[start : pos - 1]
+            start_idx = pos
+        else:
+            break
+    return last_content
+
+
+def _strip_boxed(text: str) -> str:
+    r"""Remove \boxed{...} wrappers, keeping inner content. Handles nested braces."""
+    result = text
+    while True:
+        idx = result.find("\\boxed{")
+        if idx == -1:
+            break
+        start = idx + len("\\boxed{")
+        depth = 1
+        pos = start
+        while pos < len(result) and depth > 0:
+            if result[pos] == "{":
+                depth += 1
+            elif result[pos] == "}":
+                depth -= 1
+            pos += 1
+        if depth == 0:
+            inner = result[start : pos - 1]
+            result = result[:idx] + inner + result[pos:]
+        else:
+            break  # Unbalanced braces — stop
+    return result
+
+
+def _strip_tex_text_wrapper(text: str) -> str:
+    r"""If text is exactly \text{...}, unwrap it once (or repeatedly)."""
+    result = text.strip()
+    while result.startswith("\\text{") and result.endswith("}"):
+        start = len("\\text{")
+        depth = 1
+        pos = start
+        while pos < len(result) and depth > 0:
+            if result[pos] == "{":
+                depth += 1
+            elif result[pos] == "}":
+                depth -= 1
+            pos += 1
+        if depth != 0 or pos != len(result):
+            break
+        result = result[start : pos - 1].strip()
+    return result
+
+
+def extract_external_final_answer(
+    raw_response: Any,
+    parse_boxed: bool = True,
+    strip_latex_wrappers: bool = False,
+) -> str:
+    """Extract the final answer, removing thinking reasoning.
+
+    - If <answer>...</answer> exists, prefer its content.
+    - Otherwise, drop content up to </think> if present.
+    - Trim common answer prefixes.
+    - *parse_boxed*: extract content of the last \\boxed{...} (for math tasks).
+    - *strip_latex_wrappers*: remove \\boxed{...} and \\text{...} wrappers
+      inline, keeping surrounding text intact (for instruction-following tasks
+      where these are just noise from reasoning models).
+    """
+    if not isinstance(raw_response, str):
+        return "" if raw_response is None else str(raw_response)
+
+    text = raw_response.strip()
+    if not text:
+        return ""
+
+    # Multi-turn tool transcripts (async_openai): the final answer always follows
+    # the last tool response — everything before it is tool-loop history. A
+    # terminal answer-protocol call (e.g. screenspot's computer_use <tool_call>)
+    # comes after the last </tool_response>, so it survives this cut.
+    if "</tool_response>" in text:
+        text = text.rsplit("</tool_response>", 1)[-1].strip()
+    if "[MAX_TOOL_ITERATIONS_REACHED]" in text:
+        text = text.replace("[MAX_TOOL_ITERATIONS_REACHED]", "").strip()
+
+    if "</think>" in text and "<think>" not in text:
+        text = f"<think>\n{text}"
+    if "<answer>" in text and "</answer>" in text:
+        text = text.split("<answer>", 1)[1].split("</answer>", 1)[0].strip()
+    if "</think>" in text:
+        text = text.split("</think>", 1)[-1].strip()
+
+    # if "Answer:" in text:
+    #     text = text.rsplit("Answer:", 1)[-1].strip()
+    # elif "answer:" in text:
+    #     text = text.rsplit("answer:", 1)[-1].strip()
+
+    if parse_boxed:
+        boxed_content = _extract_last_boxed_content(text)
+        if boxed_content is not None:
+            text = boxed_content.strip()
+        else:
+            stripped = _strip_boxed(text)
+            if stripped != text:
+                text = stripped.strip()
+
+        text = _strip_tex_text_wrapper(text)
+    elif strip_latex_wrappers:
+        text = _strip_boxed(text)
+        text = _strip_tex_text_wrapper(text)
+
+    return text.strip()
+
+
+def extract_gemma4_validation_answer(text: str, *, critic_question: str = "") -> str | None:
+    """Project the final solver action to external-style assistant content.
+
+    History is deliberately not required to satisfy the strict reward parser.
+    Thoughts, tool feedback, image/user turns and critic sidecars are excluded.
+    """
+    if critic_question:
+        text = text.split("<|turn>user\n" + critic_question, 1)[0]
+    final_turn = text.rsplit("<|turn>model\n", 1)[-1].lstrip()
+    if final_turn.startswith("<|channel>thought\n"):
+        if "<channel|>" not in final_turn:
+            return None
+        final_turn = final_turn.split("<channel|>", 1)[1]
+    action = re.split(r"<\|tool_response>|<turn\|>|<eos>|<\|turn>(?:user|tool)\n", final_turn, maxsplit=1)[0].strip()
+    if not action or action.startswith("<|tool_call>"):
+        return None
+    return extract_external_final_answer(action) or None

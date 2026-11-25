@@ -196,6 +196,8 @@ class MultiTurnConfig(BaseConfig):
     llm_judge_temperature: float = 0.0
     llm_judge_top_p: float = 1.0
     llm_judge_partial_credit_score: float = 0.5
+    validation_accuracy_binary: bool = False
+    validation_final_answer_extraction: str = "strict"
     llm_judge_timeout_s: Optional[float] = None
     llm_judge_fallback_to_string_reward: bool = True
     llm_judge_assistant_prefill: str = "{"

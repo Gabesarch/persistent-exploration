@@ -1,0 +1,7 @@
+# Local config
+set_paths.sh
+.env
+logs/
+results/
+**/vllm_logs/
+**/__pycache__/

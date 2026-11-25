@@ -266,6 +266,15 @@ def compute_advantage(
         data.batch["returns"] = returns
         if adv_estimator in (AdvantageEstimator.GDPO, "gdpo") and gdpo_diagnostics:
             data.meta_info["gdpo_stability_metrics"] = gdpo_diagnostics
+    amplification = float(config.get("positive_advantage_amplification", 1.0)) if config is not None else 1.0
+    if amplification != 1.0:
+        from verl.trainer.ppo.advantage_amplification import amplify_positive_advantages
+
+        amplification_metrics = {}
+        data.batch["advantages"] = amplify_positive_advantages(
+            data.batch["advantages"], data.batch["response_mask"], amplification, amplification_metrics,
+        )
+        data.meta_info["positive_advantage_amplification_metrics"] = amplification_metrics
     return data
 
 
@@ -2193,6 +2202,8 @@ class RayPPOTrainer:
         return old_log_prob, old_log_prob_mfu
 
     def _update_actor(self, batch: DataProto) -> DataProto:
+        # Preserve the true trainer step for sampled diagnostics, including resume.
+        batch.meta_info["global_steps"] = self.global_steps
         rollout_config = self.config.actor_rollout_ref.rollout
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # TODO: Make "temperature" single source of truth from generation.
@@ -2587,6 +2598,8 @@ class RayPPOTrainer:
                                     norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                                     config=self.config.algorithm,
                                 )
+                            if "positive_advantage_amplification_metrics" in batch.meta_info:
+                                metrics.update(batch.meta_info["positive_advantage_amplification_metrics"])
                             if self._branch_strata_config().get("log_advantage_mass", False):
                                 metrics.update(compute_branch_advantage_mass_metrics(batch))
 

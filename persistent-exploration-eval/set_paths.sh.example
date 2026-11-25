@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Evaluation environment. Copy to set_paths.sh for local overrides or export values.
+export VERO_EVAL_DIR="${VERO_EVAL_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
+export REPO_ROOT="${REPO_ROOT:-$(cd -- "$VERO_EVAL_DIR/.." && pwd)}"
+export ROOT_PATH="${ROOT_PATH:-$REPO_ROOT/runtime}"
+export SAVE_PATH="${SAVE_PATH:-$ROOT_PATH/outputs}"
+export HF_HOME="${HF_HOME:-$ROOT_PATH/hf_cache}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$HF_HOME/datasets}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
+export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-$ROOT_PATH/vllm_cache}"
+export CHECKPOINT_PATH="${CHECKPOINT_PATH:-$HF_HOME/Qwen/Qwen3-VL-8B-Instruct}"
+export PORT="${PORT:-9001}"
+export MODEL_NAME="${MODEL_NAME:-qwen_vllm}"
+export API_KEY="${API_KEY:-qwen}"
+export NUM_GPUS="${NUM_GPUS:-1}"
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
+export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-0}"
+export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-0}"
+
+if [[ -n "${VERO2_EVAL_CONDA_ENV:-}" ]]; then
+  if ! command -v conda >/dev/null 2>&1; then
+    source "${CONDA_BASE:-$HOME/miniconda3}/etc/profile.d/conda.sh"
+  fi
+  conda activate "$VERO2_EVAL_CONDA_ENV"
+fi
+mkdir -p "$HF_HUB_CACHE" "$HF_DATASETS_CACHE" "$TRANSFORMERS_CACHE" "$VLLM_CACHE_ROOT"

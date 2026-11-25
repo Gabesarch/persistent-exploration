@@ -1,7 +1,0 @@
-include: _default_template_yaml
-task: "hrbench_8k"
-test_split: hrbench_8k
-metric_list:
-  - metric: hrbench_overall_acc
-    aggregation: !function utils.hrbench_aggregate_results
-    higher_is_better: true

@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional
 
 def _score_final_answer_bbox(doc: Dict[str, Any], response_text: str):
     repo_root = Path(__file__).resolve().parents[3]
-    task_dir = repo_root / "vero_eval/lmms_eval/tasks/hstarbench"
+    task_dir = repo_root / "persistent-exploration-eval/lmms_eval/tasks/hstarbench"
     if str(task_dir) not in sys.path:
         sys.path.insert(0, str(task_dir))
     from scoring import score_final_answer_bbox  # noqa: WPS433

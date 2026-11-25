@@ -1,2 +1,0 @@
-include: pinpoint_bench_qwen3_zs.yaml
-task: "pinpoint_bench_gpt5nano_zs"

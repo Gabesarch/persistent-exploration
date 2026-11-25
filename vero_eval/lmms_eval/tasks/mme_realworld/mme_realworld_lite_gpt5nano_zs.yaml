@@ -1,2 +1,0 @@
-include: mme_realworld_lite_qwen3_zs.yaml
-task: "mme_realworld_lite_gpt5nano_zs"

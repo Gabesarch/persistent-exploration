@@ -1,0 +1,25 @@
+# Published Qwen evaluation on VisualProbe Easy with the Vero zoom tool.
+include:
+  - visual_probe_easy.yaml
+  - ../_tool_templates/_toolset_zoom_vero_yaml
+task: "visual_probe_easy_reasoning_zoom"
+tag: visual_search
+generation_kwargs:
+  # Sampling profile used for the published Qwen evaluation.
+  max_new_tokens: 24576
+  temperature: 0.7
+  top_p: 0.8
+  top_k: 20
+  repetition_penalty: 1.0
+  presence_penalty: 0.0
+  do_sample: True
+lmms_eval_specific_kwargs:
+  default:
+    # Training's user turn is "<image>\n{question}", which decodes to "user\n\n{question}".
+    # The served chat template emits no newline after the image, so that separator newline
+    # must live in the text. pre_prompt "\n" reproduces training's user turn byte-for-byte.
+    # It does NOT add a final-answer instruction.
+    pre_prompt: "\n"
+    post_prompt: ""
+metadata:
+  image_indexing: training_faithful
