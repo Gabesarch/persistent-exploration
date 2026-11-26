@@ -1,4 +1,4 @@
-# Learning Persistent Exploration for Visual Search
+# Learning to Persist in Visual Search
 
 Persistent Exploration is a reinforcement learning method that teaches vision-language models to continue searching after unsuccessful attempts. Models learn from failed and recovered searches, and learn to decide when further exploration is needed.
 
